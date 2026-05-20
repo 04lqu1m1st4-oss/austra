@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v9 — pre-fetch aquece client + peer antes do fire (processo quente, conexão MTProto sempre viva)
+// v10 — remove getDialogs background do pool (race condition interna), adiciona lock de instância única
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -18,15 +18,81 @@ const RETRY_BUDGET_MS        = 50_000;
 const RELOAD_INTERVAL_MS     = 30_000;
 const LOOKAHEAD_MS           = 2 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS  = 45_000;
-const PREFETCH_BEFORE_MS     = 3_000; // pre-carrega schedule + aquece client/peer N ms antes do fire
+const PREFETCH_BEFORE_MS     = 3_000;
 
 // Monitoramento de posição
-const MONITOR_DELAY_CLOSED_MS     = 6_000;
-const MONITOR_MAX_OPEN_MS         = 5 * 60_000;
-const MONITOR_POLL_MS             = 5_000;
-const LISTEN_POLL_MS              = 400;
-const MONITOR_HISTORY_LIMIT       = 150;
+const MONITOR_DELAY_CLOSED_MS      = 6_000;
+const MONITOR_MAX_OPEN_MS          = 5 * 60_000;
+const MONITOR_POLL_MS              = 5_000;
+const LISTEN_POLL_MS               = 400;
+const MONITOR_HISTORY_LIMIT        = 150;
 const OPEN_GROUP_LISTEN_TIMEOUT_MS = 2 * 60 * 60_000;
+
+/* ─── Instance lock — evita AUTH_KEY_DUPLICATED com múltiplas réplicas ─── */
+// Cada instância registra um heartbeat. Se outra instância mais nova existir,
+// esta encerra para evitar duas conexões MTProto com a mesma auth_key.
+const INSTANCE_ID  = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const LOCK_KEY     = "worker_instance_lock";
+const LOCK_TTL_MS  = 20_000; // instância deve renovar a cada ~10s
+
+async function acquireInstanceLock(): Promise<boolean> {
+  try {
+    const { data, error } = await supabase
+      .from("worker_locks")
+      .upsert(
+        { key: LOCK_KEY, instance_id: INSTANCE_ID, updated_at: new Date().toISOString() },
+        { onConflict: "key" }
+      )
+      .select("instance_id")
+      .single();
+
+    if (error) {
+      // Tabela pode não existir — prossegue sem lock (modo degradado)
+      console.warn("[lock] Tabela worker_locks não encontrada — rodando sem lock de instância");
+      return true;
+    }
+
+    return data?.instance_id === INSTANCE_ID;
+  } catch {
+    return true; // modo degradado
+  }
+}
+
+async function renewInstanceLock(): Promise<void> {
+  try {
+    await supabase
+      .from("worker_locks")
+      .update({ instance_id: INSTANCE_ID, updated_at: new Date().toISOString() })
+      .eq("key", LOCK_KEY)
+      .eq("instance_id", INSTANCE_ID);
+  } catch {}
+}
+
+async function checkInstanceLock(): Promise<boolean> {
+  try {
+    const { data } = await supabase
+      .from("worker_locks")
+      .select("instance_id, updated_at")
+      .eq("key", LOCK_KEY)
+      .single();
+
+    if (!data) return true;
+
+    // Se outra instância tomou o lock recentemente, encerra esta
+    if (data.instance_id !== INSTANCE_ID) {
+      const age = Date.now() - new Date(data.updated_at).getTime();
+      if (age < LOCK_TTL_MS) {
+        console.warn(`[lock] Outra instância ativa detectada (${data.instance_id}) — encerrando esta instância (${INSTANCE_ID})`);
+        return false;
+      }
+      // Lock expirado — tenta roubar
+      await acquireInstanceLock();
+    }
+    return true;
+  } catch {
+    return true; // modo degradado
+  }
+}
 
 /* ─── Tipos ─── */
 interface Account {
@@ -248,15 +314,13 @@ class TelegramClientPool {
         }
       );
 
+      // Suprime update loop — sem handlers de updates, evita conexões extras
       (client as any)._updateLoop = () => Promise.resolve();
 
       await client.connect();
 
-      client.getDialogs({ limit: 100 }).then(() => {
-        console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`);
-      }).catch((err: any) => {
-        console.warn(`[pool] getDialogs falhou no warm-up de ${account.phone_number}: ${err.message}`);
-      });
+      // NÃO faz getDialogs em background aqui — causava race condition interna
+      // O peer é resolvido sob demanda via getOrResolvePeer
 
       this.clients.set(account.id, client);
       this.sessions.set(account.id, account.session_string);
@@ -506,7 +570,6 @@ async function trySendMember(
     );
   }
 
-  // Insert em background — não bloqueia o caminho crítico de envio
   supabase.from("dispatch_logs").insert({
     user_id:             schedule.user_id,
     group_id:            group.id,
@@ -542,64 +605,6 @@ async function processMembersOf(
   );
 
   return parallel;
-}
-
-async function waitForAdminSignal(
-  client: TelegramClient,
-  telegramChatId: string,
-  timeoutMs: number = 30 * 60_000
-): Promise<boolean> {
-  const deadline    = Date.now() + timeoutMs;
-  const startUnix   = Math.floor((Date.now() - 10_000) / 1000);
-  let lastSeenMsgId = 0;
-
-  try { await getOrResolvePeer(client, telegramChatId, client.session.toString()); } catch {}
-
-  console.log(`[admin-signal] Aguardando OK do admin em ${telegramChatId}...`);
-
-  while (Date.now() < deadline) {
-    try {
-      const peer = await getOrResolvePeer(client, telegramChatId, client.session.toString());
-
-      const result = await client.invoke(
-        new Api.messages.GetHistory({
-          peer:       peer as any,
-          limit:      10,
-          offsetDate: 0,
-          offsetId:   0,
-          maxId:      0,
-          minId:      0,
-          hash:       bigInt(0),
-          addOffset:  0,
-        })
-      ) as any;
-
-      const recentMsgs: any[] = (result.messages ?? [])
-        .filter((m: any) => (m.className === "Message" || m._ === "message") && m.date >= startUnix && m.id > lastSeenMsgId);
-
-      if (recentMsgs.length > 0) {
-        lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
-      }
-
-      const signal = recentMsgs.some((m: any) => {
-        const isOk    = typeof m.message === "string" && m.message.trim().toLowerCase() === "ok";
-        const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
-        return isOk || isMedia;
-      });
-
-      if (signal) {
-        console.log(`[admin-signal] ✓ Sinal do admin detectado em ${telegramChatId}`);
-        return true;
-      }
-    } catch (err: any) {
-      console.warn(`[admin-signal] Erro ao buscar histórico: ${err.message}`);
-    }
-
-    await new Promise((r) => setTimeout(r, LISTEN_POLL_MS));
-  }
-
-  console.warn(`[admin-signal] Timeout — nenhum sinal do admin em ${telegramChatId}`);
-  return false;
 }
 
 async function monitorPositions(
@@ -889,7 +894,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
   const now    = new Date();
   const nowISO = now.toISOString();
 
-  // Usa dados pré-carregados (caminho 0-latência) — fallback para busca ao vivo
   let prefetched = schedulePrefetchCache.get(scheduleId);
   schedulePrefetchCache.delete(scheduleId);
 
@@ -959,8 +963,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     return;
   }
 
-  // Em ciclos frescos (sem retry_until) não há nada enviado ainda —
-  // skip da query de dedup elimina ~100ms do caminho crítico.
   const alreadySent = schedule.retry_until
     ? await getAlreadySentAccountIds(schedule)
     : new Set<string>();
@@ -1014,7 +1016,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       return;
     }
 
-    // Update do schedule em background — mensagem já foi enviada, isso não é crítico
     supabase.from("schedules").update({
       next_run_at:         nextRun,
       last_run_at:         nowISO,
@@ -1083,14 +1084,11 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
   const existing = scheduledTimers.get(scheduleId);
   if (existing) clearTimeout(existing);
 
-  // Limpa pre-fetch anterior se houver
   const existingPrefetch = prefetchTimers.get(scheduleId);
   if (existingPrefetch) { clearTimeout(existingPrefetch); prefetchTimers.delete(scheduleId); }
 
   const effectiveDelay = Math.max(0, delay);
 
-  // Pre-fetch: carrega o schedule no cache PREFETCH_BEFORE_MS antes do fire.
-  // Quando fireSchedule rodar, não há nenhuma query bloqueante no caminho crítico.
   if (effectiveDelay > PREFETCH_BEFORE_MS) {
     const pt = setTimeout(async () => {
       prefetchTimers.delete(scheduleId);
@@ -1106,7 +1104,6 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
           return;
         }
         const s = data as unknown as Schedule;
-        // Injeta contas do accountCache (mais frescos)
         if (s.groups?.group_members) {
           s.groups.group_members = s.groups.group_members.map((m) => ({
             ...m,
@@ -1116,8 +1113,6 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
         schedulePrefetchCache.set(scheduleId, s);
         console.log(`[prefetch] ✅ Schedule ${scheduleId} pré-carregado`);
 
-        // Aquece client + peer de todas as contas do grupo em paralelo
-        // Garante MTProto vivo e peer resolvido antes do fire — 0ms no caminho crítico
         const chatId  = s.groups?.telegram_chat_id;
         const members = (s.groups?.group_members ?? [])
           .filter((m) => m.is_active && m.accounts?.is_active && m.accounts?.session_string)
@@ -1328,10 +1323,10 @@ const httpServer = http.createServer(async (req, res) => {
       const chats   = dialogs
         .filter((d) => d.isGroup || d.isChannel)
         .map((d) => ({
-          id:          String(d.id),
-          name:        d.title ?? d.name ?? "Sem nome",
-          type:        d.isChannel ? "channel" : "group",
-          accessHash:  null,
+          id:         String(d.id),
+          name:       d.title ?? d.name ?? "Sem nome",
+          type:       d.isChannel ? "channel" : "group",
+          accessHash: null,
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
 
@@ -1441,8 +1436,8 @@ const httpServer = http.createServer(async (req, res) => {
     const chatId    = url.searchParams.get("chat_id");
     const account   = accountCache.get(accountId);
 
-    if (!chatId)    return jsonResponse(res, 400, { error: "chat_id é obrigatório" });
-    if (!account)   return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
+    if (!chatId)  return jsonResponse(res, 400, { error: "chat_id é obrigatório" });
+    if (!account) return jsonResponse(res, 404, { error: "Conta não encontrada no cache do worker" });
 
     type MemberOut = { id: string; name: string | null; username: string | null; phone: string | null };
 
@@ -1729,14 +1724,38 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 httpServer.listen(WORKER_PORT, () => {
-  console.log(`[worker] HTTP interno escutando na porta ${WORKER_PORT}`);
+  console.log(`[worker] HTTP interno escutando na porta ${WORKER_PORT} (instância ${INSTANCE_ID})`);
 });
 
 /* ─── Inicialização ─── */
 async function init(): Promise<void> {
-  console.log("[worker] Iniciando...");
+  console.log(`[worker] Iniciando instância ${INSTANCE_ID}...`);
+
+  // Tenta adquirir lock de instância única
+  const locked = await acquireInstanceLock();
+  if (!locked) {
+    console.error("[worker] Outra instância já está rodando. Encerrando para evitar AUTH_KEY_DUPLICATED.");
+    process.exit(1);
+  }
+
+  console.log(`[worker] Lock adquirido — instância ${INSTANCE_ID} é a ativa.`);
+
   await prewarmAccounts();
   await reloadSchedules();
+
+  // Renova o lock a cada 10s e verifica se outra instância roubou o lock
+  setInterval(async () => {
+    await renewInstanceLock();
+  }, 10_000);
+
+  // Verifica periodicamente se ainda é a instância ativa
+  setInterval(async () => {
+    const stillActive = await checkInstanceLock();
+    if (!stillActive) {
+      console.error("[worker] Lock perdido para outra instância — encerrando.");
+      process.exit(1);
+    }
+  }, 15_000);
 
   setInterval(async () => {
     try {
