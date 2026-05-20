@@ -1720,6 +1720,95 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
+  // ── POST /groups/:id/dispatch ─────────────────────────────────────────────
+  const dispatchMatch = url.pathname.match(/^\/groups\/([^/]+)\/dispatch$/);
+  if (req.method === "POST" && dispatchMatch) {
+    const groupId = dispatchMatch[1];
+
+    let body: { user_id?: string } = {};
+    try {
+      const raw = await new Promise<string>((resolve) => {
+        let data = "";
+        req.on("data", (chunk) => { data += chunk; });
+        req.on("end", () => resolve(data));
+      });
+      body = JSON.parse(raw || "{}");
+    } catch {}
+
+    try {
+      const { data: grpRow } = await supabase
+        .from("groups")
+        .select(`
+          id, name, telegram_chat_id, telegram_chat_name, group_type, user_id,
+          group_members(id, message_text, position, is_active,
+            accounts(id, name, phone_number, api_id, api_hash, session_string, is_active))
+        `)
+        .eq("id", groupId)
+        .single();
+
+      if (!grpRow || !grpRow.telegram_chat_id) {
+        return jsonResponse(res, 404, { error: "Grupo não encontrado ou sem chat_id" });
+      }
+
+      const members: GroupMember[] = (grpRow.group_members ?? []).map((m: any) => ({
+        ...m,
+        accounts: Array.isArray(m.accounts) ? (m.accounts[0] ?? null) : (m.accounts ?? null),
+      }));
+
+      const scheduleStub = {
+        id:                         `manual-dispatch-${groupId}-${Date.now()}`,
+        user_id:                    body.user_id ?? grpRow.user_id ?? "",
+        group_id:                   groupId,
+        cron_expression:            "0 0 * * 0",
+        next_run_at:                new Date().toISOString(),
+        retry_window_seconds:       60,
+        retry_interval_seconds:     5,
+        retry_interval_max_seconds: 30,
+        retry_count:                0,
+        retry_until:                null,
+        last_attempt_at:            null,
+        groups: {
+          id:                 groupId,
+          name:               grpRow.name,
+          telegram_chat_id:   String(grpRow.telegram_chat_id),
+          telegram_chat_name: grpRow.telegram_chat_name ?? null,
+          group_type:         (grpRow.group_type ?? "closed") as "open" | "closed",
+          group_members:      members,
+        },
+      };
+
+      const dispatchedAt = new Date();
+      const alreadySent  = new Set<string>();
+      const results      = await processMembersOf(scheduleStub as any, alreadySent);
+
+      const sentForMonitor = results
+        .filter((r) => r.status === "sent")
+        .map((r) => {
+          const member = members.find((m) => m.accounts?.id === r.account_id);
+          return { account_id: r.account_id, message_text: member?.message_text ?? "" };
+        })
+        .filter((r) => r.message_text);
+
+      if (sentForMonitor.length > 0) {
+        monitorPositions(
+          String(grpRow.telegram_chat_id),
+          sentForMonitor,
+          scheduleStub.id,
+          dispatchedAt,
+          scheduleStub.groups.group_type
+        ).catch((err: any) => console.error("[dispatch] Erro no monitoramento:", err.message));
+      }
+
+      const sent   = results.filter((r) => r.status === "sent").length;
+      const failed = results.filter((r) => r.status === "failed").length;
+      console.log(`[http] /dispatch ✓ grupo ${groupId}: ${sent} enviadas, ${failed} falhas`);
+      return jsonResponse(res, 200, { ok: true, sent, failed, results });
+    } catch (err: any) {
+      console.error("[http] /dispatch erro:", err.message);
+      return jsonResponse(res, 500, { error: err.message });
+    }
+  }
+
   jsonResponse(res, 404, { error: "Not found" });
 });
 
