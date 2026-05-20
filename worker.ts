@@ -18,7 +18,7 @@ const RETRY_BUDGET_MS        = 50_000;
 const RELOAD_INTERVAL_MS     = 30_000;
 const LOOKAHEAD_MS           = 2 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS  = 45_000;
-const PREFETCH_BEFORE_MS     = 3_000;
+const PREFETCH_BEFORE_MS     = 10_000;
 
 // Monitoramento de posição
 const MONITOR_DELAY_CLOSED_MS      = 6_000;
