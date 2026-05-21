@@ -1,6 +1,6 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v9 — POLL→PUSH via addEventHandler, pools separadas listener/sender,
-//      chatId normalize correto, jitter + timeout escalonado
+// v10 — timer de duas fases (coarse setTimeout + precision loop 10ms),
+//       prefetch com prewarm antecipado de conexão, keepalive 25s
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { NewMessage, NewMessageEvent } from "telegram/events";
@@ -20,8 +20,9 @@ const SEND_TIMEOUT_MS_MAX       = 15_000;
 const RETRY_BUDGET_MS           = 50_000;
 const RELOAD_INTERVAL_MS        = 30_000;
 const LOOKAHEAD_MS              = 2 * 60 * 1000;
-const KEEPALIVE_INTERVAL_MS     = 45_000;
-const PREFETCH_BEFORE_MS        = 800;
+const KEEPALIVE_INTERVAL_MS     = 25_000;  // reduzido: detecta queda mais rápido
+const PREFETCH_BEFORE_MS        = 2_000;   // 2s: tempo suficiente pra query + prewarm
+const TIMER_PRECISION_WINDOW_MS = 150;     // troca pra loop 10ms nos últimos 150ms
 
 // Monitoramento de posição
 const MONITOR_DELAY_CLOSED_MS      = 6_000;
@@ -1116,26 +1117,34 @@ async function fireSchedule(scheduleId: string): Promise<void> {
   }
 }
 
-/* ─── Precision timers ─── */
+/* ─── Precision timers ───
+   Duas fases:
+     1. Coarse setTimeout acorda TIMER_PRECISION_WINDOW_MS antes do alvo
+     2. Loop de 10ms garante disparó dentro de ~10ms do target
+   Elimina o drift de event loop que causava variância no fire.
+*/
 function scheduleTimer(scheduleId: string, nextRunAt: string): void {
-  const delay = new Date(nextRunAt).getTime() - Date.now();
+  const targetMs = new Date(nextRunAt).getTime();
+  const delay    = targetMs - Date.now();
 
   if (delay < -5_000) {
     console.warn(`[timer] Schedule ${scheduleId} ignorado — next_run_at muito no passado (${nextRunAt})`);
     return;
   }
 
+  // Limpa timers anteriores
   const existing = scheduledTimers.get(scheduleId);
   if (existing) clearTimeout(existing);
-
   const existingPrefetch = prefetchTimers.get(scheduleId);
   if (existingPrefetch) { clearTimeout(existingPrefetch); prefetchTimers.delete(scheduleId); }
 
   const effectiveDelay = Math.max(0, delay);
 
+  // ─ Fase de prefetch: busca dados + prewarm de conexão com antecedência ─
   if (effectiveDelay > PREFETCH_BEFORE_MS) {
     const pt = setTimeout(async () => {
       prefetchTimers.delete(scheduleId);
+      const fetchStart = Date.now();
       try {
         const { data, error } = await supabase
           .from("schedules")
@@ -1155,7 +1164,18 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
           }));
         }
         schedulePrefetchCache.set(scheduleId, s);
-        console.log(`[prefetch] ✅ Schedule ${scheduleId} pré-carregado (${PREFETCH_BEFORE_MS}ms antes do fire)`);
+        const fetchMs = Date.now() - fetchStart;
+        console.log(`[prefetch] ✅ Schedule ${scheduleId} pré-carregado em ${fetchMs}ms`);
+
+        // Prewarm de conexão: garante que senderPool já está conectado no fire
+        const activeMembers = (s.groups?.group_members ?? [])
+          .filter((m) => m.is_active && m.accounts?.is_active)
+          .map((m) => m.accounts!);
+        if (activeMembers.length > 0) {
+          Promise.allSettled(activeMembers.map((acc) => senderPool.get(acc)))
+            .then(() => console.log(`[prefetch] ⚡ Prewarm sender concluído para schedule ${scheduleId}`))
+            .catch(() => {});
+        }
       } catch (err: any) {
         console.warn(`[prefetch] Falha ao pré-carregar schedule ${scheduleId}: ${err.message}`);
       }
@@ -1163,18 +1183,32 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
     prefetchTimers.set(scheduleId, pt);
   }
 
-  const timer = setTimeout(async () => {
-    scheduledTimers.delete(scheduleId);
-    try {
-      await fireSchedule(scheduleId);
-    } catch (err) {
-      console.error(`[timer] Erro inesperado ao disparar schedule ${scheduleId}:`, err);
+  // ─ Fase coarse: acorda perto do target ─
+  const coarseDelay = Math.max(0, effectiveDelay - TIMER_PRECISION_WINDOW_MS);
+
+  function armPrecisionFire(): void {
+    const remaining = targetMs - Date.now();
+    if (remaining <= 0) {
+      scheduledTimers.delete(scheduleId);
+      fireSchedule(scheduleId).catch((err) =>
+        console.error(`[timer] Erro inesperado ao disparar schedule ${scheduleId}:`, err)
+      );
+      return;
     }
-  }, effectiveDelay);
+    // Loop de 10ms até bater o target
+    const t = setTimeout(armPrecisionFire, Math.min(remaining, 10));
+    scheduledTimers.set(scheduleId, t);
+  }
 
-  scheduledTimers.set(scheduleId, timer);
+  if (coarseDelay <= 0) {
+    // Já estamos dentro da janela de precisão
+    armPrecisionFire();
+  } else {
+    const coarseTimer = setTimeout(armPrecisionFire, coarseDelay);
+    scheduledTimers.set(scheduleId, coarseTimer);
+  }
 
-  const fireAt = new Date(Date.now() + effectiveDelay).toISOString();
+  const fireAt = new Date(targetMs).toISOString();
   console.log(`[timer] ⏰ Schedule ${scheduleId} — dispara em ${Math.round(effectiveDelay / 1000)}s (${fireAt})`);
 }
 
