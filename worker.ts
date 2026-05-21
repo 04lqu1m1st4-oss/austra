@@ -1,4 +1,4 @@
-// worker.ts — high-precision Telegram dispatch worker
+// worker.ts — high-precision Telegram dispatch workers
 // v11 — poll paralelo 100ms (todas as contas), prewarm de peers paralelo, FloodWait com freshClient, monitorPositions multi-account
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
