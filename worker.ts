@@ -21,7 +21,7 @@ const RETRY_BUDGET_MS           = 50_000;
 const RELOAD_INTERVAL_MS        = 30_000;
 const LOOKAHEAD_MS              = 2 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS     = 25_000;  // reduzido: detecta queda mais rápido
-const PREFETCH_BEFORE_MS        = 2_000;   // 2s: tempo suficiente pra query + prewarm
+const PREFETCH_BEFORE_MS        = 3_000;   // 3s: tempo suficiente pra query + prewarm + peer cache
 const TIMER_PRECISION_WINDOW_MS = 150;     // troca pra loop 10ms nos últimos 150ms
 
 // Monitoramento de posição
@@ -253,6 +253,10 @@ class TelegramClientPool {
     this.clients.delete(accountId);
   }
 
+  isConnected(accountId: string): boolean {
+    return this.clients.get(accountId)?.connected ?? false;
+  }
+
   async get(account: Account): Promise<TelegramClient> {
     const existing       = this.clients.get(account.id);
     const sessionInUse   = this.sessions.get(account.id);
@@ -447,9 +451,11 @@ async function sendAggressively(
   const budgetEnd = Date.now() + RETRY_BUDGET_MS;
   let attempt     = 0;
 
-  // Jitter ±500ms para evitar thundering herd em disparos paralelos
-  const jitter = (Math.random() - 0.5) * 1_000;
-  await new Promise((r) => setTimeout(r, Math.max(0, jitter)));
+  // Garante conexão antes de entrar no loop — evita reconexão no meio do retry
+  if (!senderPool.isConnected(account.id)) {
+    console.warn(`[send] Conexão caída para ${account.phone_number} — reconectando antes do envio`);
+    try { await senderPool.get(account); } catch { /* loop vai reconectar */ }
+  }
 
   while (Date.now() < budgetEnd) {
     attempt++;
@@ -1167,14 +1173,25 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
         const fetchMs = Date.now() - fetchStart;
         console.log(`[prefetch] ✅ Schedule ${scheduleId} pré-carregado em ${fetchMs}ms`);
 
-        // Prewarm de conexão: garante que senderPool já está conectado no fire
+        // Prewarm de conexão + peer cache: tudo pronto antes do fire
+        const chatId       = s.groups?.telegram_chat_id ?? null;
         const activeMembers = (s.groups?.group_members ?? [])
           .filter((m) => m.is_active && m.accounts?.is_active)
           .map((m) => m.accounts!);
         if (activeMembers.length > 0) {
-          Promise.allSettled(activeMembers.map((acc) => senderPool.get(acc)))
-            .then(() => console.log(`[prefetch] ⚡ Prewarm sender concluído para schedule ${scheduleId}`))
-            .catch(() => {});
+          // 1) Conecta todos
+          await Promise.allSettled(activeMembers.map((acc) => senderPool.get(acc)));
+          console.log(`[prefetch] ⚡ Prewarm sender concluído para schedule ${scheduleId}`);
+          // 2) Pre-resolve peers → getOrResolvePeer() retorna do cache no fire (0ms)
+          if (chatId) {
+            await Promise.allSettled(activeMembers.map(async (acc) => {
+              try {
+                const client = await senderPool.get(acc);
+                await getOrResolvePeer(client, chatId, acc.id);
+              } catch {}
+            }));
+            console.log(`[prefetch] ⚡ Peer cache warm para schedule ${scheduleId}`);
+          }
         }
       } catch (err: any) {
         console.warn(`[prefetch] Falha ao pré-carregar schedule ${scheduleId}: ${err.message}`);
