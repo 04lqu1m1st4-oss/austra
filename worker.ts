@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v12 — ping MTProto nativo 500ms antes do fire (era getMe 200ms): menor overhead, conexão garantida
+// v8 — 0ms dispatch: pre-fetch de schedule 800ms antes do fire + skip alreadySent em ciclos frescos
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -14,17 +14,17 @@ const supabase = createClient(
 
 /* ─── Constantes ─── */
 const SEND_TIMEOUT_MS        = 15_000;
-const RETRY_BUDGET_MS        = 50_000;
+const RETRY_BUDGET_MS        = 25_000;
 const RELOAD_INTERVAL_MS     = 30_000;
 const LOOKAHEAD_MS           = 2 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS  = 45_000;
-const PREFETCH_BEFORE_MS     = 800;   // pre-carrega schedule N ms antes do fire
+const PREFETCH_BEFORE_MS     = 1000;   // pre-carrega schedule N ms antes do fire
 
 // Monitoramento de posição
 const MONITOR_DELAY_CLOSED_MS     = 6_000;
 const MONITOR_MAX_OPEN_MS         = 5 * 60_000;
-const MONITOR_POLL_MS             = 5_000;
-const LISTEN_POLL_MS              = 400;
+const MONITOR_POLL_MS             = 100;
+const LISTEN_POLL_MS              = 10;
 const MONITOR_HISTORY_LIMIT       = 150;
 const OPEN_GROUP_LISTEN_TIMEOUT_MS = 2 * 60 * 60_000;
 
@@ -165,9 +165,6 @@ class TelegramClientPool {
   private sessions           = new Map<string, string>();
   private keepaliveTimers    = new Map<string, ReturnType<typeof setInterval>>();
   private connectingPromises = new Map<string, Promise<TelegramClient>>();
-  // Rastreia quando getDialogs do warm-up terminou por conta.
-  // Permite que o prefetch aguarde o entity cache estar populado antes do fire.
-  private dialogsPromises    = new Map<string, Promise<void>>();
 
   private startKeepalive(accountId: string, client: TelegramClient): void {
     const existing = this.keepaliveTimers.get(accountId);
@@ -213,7 +210,6 @@ class TelegramClientPool {
     if (interval) clearInterval(interval);
     this.keepaliveTimers.delete(accountId);
     this.clients.delete(accountId);
-    this.dialogsPromises.delete(accountId);
   }
 
   async get(account: Account): Promise<TelegramClient> {
@@ -256,12 +252,11 @@ class TelegramClientPool {
 
       await client.connect();
 
-      // Armazena a promise de dialogs para que awaitDialogsReady() possa sinalizá-la.
-      // O entity cache fica populado quando ela resolve, eliminando getDialogs no caminho crítico.
-      const dp = client.getDialogs({ limit: 100 })
-        .then(() => { console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`); })
-        .catch((err: any) => { console.warn(`[pool] getDialogs falhou no warm-up de ${account.phone_number}: ${err.message}`); });
-      this.dialogsPromises.set(account.id, dp as Promise<void>);
+      client.getDialogs({ limit: 100 }).then(() => {
+        console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`);
+      }).catch((err: any) => {
+        console.warn(`[pool] getDialogs falhou no warm-up de ${account.phone_number}: ${err.message}`);
+      });
 
       this.clients.set(account.id, client);
       this.sessions.set(account.id, account.session_string);
@@ -292,21 +287,6 @@ class TelegramClientPool {
     console.log(`[pool] Pre-warming ${accounts.length} conta(s)...`);
     await Promise.allSettled(accounts.map((a) => this.get(a)));
     console.log(`[pool] Pre-warm concluído.`);
-  }
-
-  /**
-   * Aguarda o getDialogs de warm-up terminar para a conta informada.
-   * Limita a espera a timeoutMs (padrão 600ms) para não atrasar o prefetch.
-   * Quando resolve, o entity cache do client já está populado →
-   * getInputEntity funciona sem round-trip adicional.
-   */
-  async awaitDialogsReady(accountId: string, timeoutMs = 600): Promise<void> {
-    const p = this.dialogsPromises.get(accountId);
-    if (!p) return;
-    await Promise.race([
-      p,
-      new Promise<void>((r) => setTimeout(r, timeoutMs)),
-    ]).catch(() => {});
   }
 
   async disconnectAll(): Promise<void> {
@@ -432,14 +412,7 @@ async function sendAggressively(
         (async () => {
           const peer = await getOrResolvePeer(client, telegramChatId, account.id);
           try {
-            await client.invoke(
-              new Api.messages.SendMessage({
-                peer:      peer as any,
-                message:   messageText,
-                randomId:  bigInt(Math.floor(Math.random() * 0x7fffffff)),
-                noWebpage: true,
-              })
-            );
+            await client.sendMessage(peer as any, { message: messageText });
           } catch (err: any) {
             const errMsg = String(err?.message ?? "");
 
@@ -469,14 +442,7 @@ async function sendAggressively(
                 await new Promise((r) => setTimeout(r, waitMs));
                 peerCache.delete(`${account.id}:${telegramChatId}`);
                 const freshPeer = await getOrResolvePeer(client, telegramChatId, account.id);
-                await client.invoke(
-                  new Api.messages.SendMessage({
-                    peer:      freshPeer as any,
-                    message:   messageText,
-                    randomId:  bigInt(Math.floor(Math.random() * 0x7fffffff)),
-                    noWebpage: true,
-                  })
-                );
+                await client.sendMessage(freshPeer as any, { message: messageText });
                 return;
               }
               throw new Error(`FLOOD_WAIT_${waitSecs}_EXCEEDS_BUDGET`);
@@ -1148,67 +1114,7 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
           }));
         }
         schedulePrefetchCache.set(scheduleId, s);
-        console.log(`[prefetch] ✅ Schedule ${scheduleId} pré-carregado — iniciando peer pre-warm`);
-
-        // Pre-aquece conexão TCP + entity cache (dialogs) + peer cache para cada conta ativa.
-        const chatId      = s.groups?.telegram_chat_id;
-        const activeAccts = (s.groups?.group_members ?? []).filter(
-          (m) => m.is_active && m.accounts?.is_active && m.accounts?.session_string
-        );
-        if (chatId && activeAccts.length > 0) {
-          Promise.allSettled(
-            activeAccts.map(async (m) => {
-              const acct = m.accounts!;
-              try {
-                // 1. Garante client conectado
-                const cli = await clientPool.get(acct);
-                // 2. Aguarda getDialogs terminar (até 600ms) — popula entity cache interno do client
-                await clientPool.awaitDialogsReady(acct.id, 600);
-                // 3. Resolve e cacheia o peer — hit garantido no fire path
-                await getOrResolvePeer(cli, chatId, acct.id);
-                console.log(`[prefetch] 🔌 ${acct.phone_number} → peer ${chatId} pre-aquecido`);
-              } catch (e: any) {
-                console.warn(`[prefetch] Pre-warm falhou ${acct.phone_number}: ${e.message}`);
-              }
-            })
-          ).then(() => {
-            console.log(`[prefetch] 🔌 Peer pre-warm concluído para schedule ${scheduleId}`);
-
-            // Ping MTProto nativo 500ms antes do fire.
-            //
-            // Motivação: servidores Telegram podem fechar conexões ociosas entre dois keepalives
-            // (intervalo de 45s). O ping garante que a conexão está viva imediatamente antes do
-            // disparo, eliminando a reconexão (~200ms) que aparecia nos logs como:
-            //   [connection closed] / [Connection closed while receiving data]
-            //
-            // Usamos Api.Ping (MTProto layer) em vez de getMe() por ser um pacote mínimo
-            // sem serialização de objeto — menor overhead, resposta mais rápida.
-            // Aumentado de 200ms para 500ms para dar margem em links com maior RTT
-            // (Railway Amsterdam → Telegram DC).
-            const msUntilFire = new Date(s.next_run_at).getTime() - Date.now();
-            const pingDelay   = Math.max(0, msUntilFire - 500);
-            setTimeout(async () => {
-              await Promise.allSettled(
-                activeAccts.map(async (m) => {
-                  try {
-                    const cli = await clientPool.get(m.accounts!);
-                    // Ping MTProto nativo — pacote mínimo, sem overhead de objeto
-                    await cli.invoke(new Api.Ping({ pingId: bigInt(Date.now()) }));
-                    console.log(`[prefetch] 🏓 Ping MTProto OK ${m.accounts!.phone_number}`);
-                  } catch {
-                    // Se o ping falhar, tenta reconectar proativamente para não pegar
-                    // a reconexão no caminho crítico do fire
-                    try {
-                      await clientPool.reload(m.accounts!);
-                      console.log(`[prefetch] 🔄 Reconectado proativamente ${m.accounts!.phone_number}`);
-                    } catch {}
-                  }
-                })
-              );
-            }, pingDelay);
-          });
-        }
-
+        console.log(`[prefetch] ✅ Schedule ${scheduleId} pré-carregado (${PREFETCH_BEFORE_MS}ms antes do fire)`);
       } catch (err: any) {
         console.warn(`[prefetch] Falha ao pré-carregar schedule ${scheduleId}: ${err.message}`);
       }
