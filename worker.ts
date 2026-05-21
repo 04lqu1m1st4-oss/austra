@@ -1,4 +1,4 @@
-// worker.ts — high-precision Telegram dispatch workers
+// worker.ts — high-precision Telegram dispatch worker
 // v11 — poll paralelo 100ms (todas as contas), prewarm de peers paralelo, FloodWait com freshClient, monitorPositions multi-account
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -17,7 +17,7 @@ const SEND_TIMEOUT_MS        = 15_000;
 const RETRY_BUDGET_MS        = 50_000;
 const RELOAD_INTERVAL_MS     = 30_000;
 const LOOKAHEAD_MS           = 2 * 60 * 1000;
-const KEEPALIVE_INTERVAL_MS  = 45_000;
+const KEEPALIVE_INTERVAL_MS  = 20_000;
 const PREFETCH_BEFORE_MS     = 10_000;
 
 // Monitoramento de posição
@@ -30,7 +30,7 @@ const OPEN_GROUP_LISTEN_TIMEOUT_MS = 2 * 60 * 60_000;
 
 /* ─── Instance lock — evita AUTH_KEY_DUPLICATED com múltiplas réplicas ─── */
 const INSTANCE_ID  = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-const LOCK_KEY     = "worker_instance_lock";
+const LOCK_KEY     = process.env.WORKER_LOCK_KEY ?? "worker_instance_lock";
 const LOCK_TTL_MS  = 20_000;
 
 async function acquireInstanceLock(): Promise<boolean> {
@@ -259,7 +259,7 @@ class TelegramClientPool {
       }
       try {
         await Promise.race([
-          client.getMe(),
+          client.invoke(new Api.Ping({ pingId: bigInt(Date.now()) })),
           new Promise<never>((_, r) =>
             setTimeout(() => r(new Error("keepalive timeout")), 10_000)
           ),
@@ -968,7 +968,12 @@ function startScheduledGroupListener(
 
 /* ─── Dispara um schedule ─── */
 async function fireSchedule(scheduleId: string): Promise<void> {
-  const now    = new Date();
+  if (firingSchedules.has(scheduleId)) {
+    console.warn(`[timer] Schedule ${scheduleId} já em execução — ignorando disparo duplicado`);
+    return;
+  }
+  firingSchedules.add(scheduleId);
+  try {
   const nowISO = now.toISOString();
 
   const prefetched = schedulePrefetchCache.get(scheduleId);
@@ -1143,10 +1148,14 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       scheduleTimer(scheduleId, retryAt.toISOString());
     }
   }
+  } finally {
+    firingSchedules.delete(scheduleId);
+  }
 }
 
 /* ─── Precision timers ─── */
-const scheduledTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const scheduledTimers  = new Map<string, ReturnType<typeof setTimeout>>();
+const firingSchedules  = new Set<string>(); // evita double dispatch por race condition
 
 function scheduleTimer(scheduleId: string, nextRunAt: string): void {
   const delay = new Date(nextRunAt).getTime() - Date.now();
