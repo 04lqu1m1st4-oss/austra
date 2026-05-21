@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v11 — ping TCP 200ms antes do fire: mantém conexão viva entre keepalives, elimina reconexão no caminho crítico
+// v12 — ping MTProto nativo 500ms antes do fire (era getMe 200ms): menor overhead, conexão garantida
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -1151,8 +1151,6 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
         console.log(`[prefetch] ✅ Schedule ${scheduleId} pré-carregado — iniciando peer pre-warm`);
 
         // Pre-aquece conexão TCP + entity cache (dialogs) + peer cache para cada conta ativa.
-        // Objetivo: quando fireSchedule rodar, getOrResolvePeer retorna do cache local sem
-        // nenhum round-trip de rede — elimina a principal fonte de latência variável no fire path.
         const chatId      = s.groups?.telegram_chat_id;
         const activeAccts = (s.groups?.group_members ?? []).filter(
           (m) => m.is_active && m.accounts?.is_active && m.accounts?.session_string
@@ -1176,18 +1174,35 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
           ).then(() => {
             console.log(`[prefetch] 🔌 Peer pre-warm concluído para schedule ${scheduleId}`);
 
-            // Ping TCP ~200ms antes do fire — garante que a conexão está viva entre dois keepalives.
-            // Sem isso, o servidor Telegram pode fechar a conexão ociosa e o fire pega reconexão (~200ms).
+            // Ping MTProto nativo 500ms antes do fire.
+            //
+            // Motivação: servidores Telegram podem fechar conexões ociosas entre dois keepalives
+            // (intervalo de 45s). O ping garante que a conexão está viva imediatamente antes do
+            // disparo, eliminando a reconexão (~200ms) que aparecia nos logs como:
+            //   [connection closed] / [Connection closed while receiving data]
+            //
+            // Usamos Api.Ping (MTProto layer) em vez de getMe() por ser um pacote mínimo
+            // sem serialização de objeto — menor overhead, resposta mais rápida.
+            // Aumentado de 200ms para 500ms para dar margem em links com maior RTT
+            // (Railway Amsterdam → Telegram DC).
             const msUntilFire = new Date(s.next_run_at).getTime() - Date.now();
-            const pingDelay   = Math.max(0, msUntilFire - 200);
+            const pingDelay   = Math.max(0, msUntilFire - 500);
             setTimeout(async () => {
               await Promise.allSettled(
                 activeAccts.map(async (m) => {
                   try {
                     const cli = await clientPool.get(m.accounts!);
-                    await cli.getMe();
-                    console.log(`[prefetch] 🏓 Ping OK ${m.accounts!.phone_number}`);
-                  } catch {}
+                    // Ping MTProto nativo — pacote mínimo, sem overhead de objeto
+                    await cli.invoke(new Api.Ping({ pingId: bigInt(Date.now()) }));
+                    console.log(`[prefetch] 🏓 Ping MTProto OK ${m.accounts!.phone_number}`);
+                  } catch {
+                    // Se o ping falhar, tenta reconectar proativamente para não pegar
+                    // a reconexão no caminho crítico do fire
+                    try {
+                      await clientPool.reload(m.accounts!);
+                      console.log(`[prefetch] 🔄 Reconectado proativamente ${m.accounts!.phone_number}`);
+                    } catch {}
+                  }
                 })
               );
             }, pingDelay);
