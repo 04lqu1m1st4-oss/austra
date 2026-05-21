@@ -2,7 +2,7 @@
 // v9 — POLL→PUSH via addEventHandler, pools separadas listener/sender,
 //      chatId normalize correto, jitter + timeout escalonado
 import { createClient } from "@supabase/supabase-js";
-import { TelegramClient, Api, events } from "telegram";
+import { TelegramClient, Api } from "telegram";
 import { NewMessage, NewMessageEvent } from "telegram/events";
 import { StringSession } from "telegram/sessions";
 import bigInt from "big-integer";
@@ -768,7 +768,7 @@ async function monitorPositions(
         continue;
       }
 
-      const updates: Promise<unknown>[] = [];
+      const updates: PromiseLike<unknown>[] = [];
       const cutoff = new Date(dispatchedAt.getTime() - 60_000).toISOString();
 
       for (const sm of sentMembers) {
