@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v9 — peer pre-warm: dialogs + peer cache aquecidos 800ms antes do fire → RTT eliminado do caminho crítico
+// v11 — ping TCP 200ms antes do fire: mantém conexão viva entre keepalives, elimina reconexão no caminho crítico
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -432,7 +432,14 @@ async function sendAggressively(
         (async () => {
           const peer = await getOrResolvePeer(client, telegramChatId, account.id);
           try {
-            await client.sendMessage(peer as any, { message: messageText });
+            await client.invoke(
+              new Api.messages.SendMessage({
+                peer:      peer as any,
+                message:   messageText,
+                randomId:  bigInt(Math.floor(Math.random() * 0x7fffffff)),
+                noWebpage: true,
+              })
+            );
           } catch (err: any) {
             const errMsg = String(err?.message ?? "");
 
@@ -462,7 +469,14 @@ async function sendAggressively(
                 await new Promise((r) => setTimeout(r, waitMs));
                 peerCache.delete(`${account.id}:${telegramChatId}`);
                 const freshPeer = await getOrResolvePeer(client, telegramChatId, account.id);
-                await client.sendMessage(freshPeer as any, { message: messageText });
+                await client.invoke(
+                  new Api.messages.SendMessage({
+                    peer:      freshPeer as any,
+                    message:   messageText,
+                    randomId:  bigInt(Math.floor(Math.random() * 0x7fffffff)),
+                    noWebpage: true,
+                  })
+                );
                 return;
               }
               throw new Error(`FLOOD_WAIT_${waitSecs}_EXCEEDS_BUDGET`);
@@ -1161,6 +1175,22 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
             })
           ).then(() => {
             console.log(`[prefetch] 🔌 Peer pre-warm concluído para schedule ${scheduleId}`);
+
+            // Ping TCP ~200ms antes do fire — garante que a conexão está viva entre dois keepalives.
+            // Sem isso, o servidor Telegram pode fechar a conexão ociosa e o fire pega reconexão (~200ms).
+            const msUntilFire = new Date(s.next_run_at).getTime() - Date.now();
+            const pingDelay   = Math.max(0, msUntilFire - 200);
+            setTimeout(async () => {
+              await Promise.allSettled(
+                activeAccts.map(async (m) => {
+                  try {
+                    const cli = await clientPool.get(m.accounts!);
+                    await cli.getMe();
+                    console.log(`[prefetch] 🏓 Ping OK ${m.accounts!.phone_number}`);
+                  } catch {}
+                })
+              );
+            }, pingDelay);
           });
         }
 
