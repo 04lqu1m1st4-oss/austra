@@ -1,5 +1,5 @@
 // worker.ts — high-precision Telegram dispatch worker
-// v8 — 0ms dispatch: pre-fetch de schedule 800ms antes do fire + skip alreadySent em ciclos frescos
+// v9 — peer pre-warm: dialogs + peer cache aquecidos 800ms antes do fire → RTT eliminado do caminho crítico
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -165,6 +165,9 @@ class TelegramClientPool {
   private sessions           = new Map<string, string>();
   private keepaliveTimers    = new Map<string, ReturnType<typeof setInterval>>();
   private connectingPromises = new Map<string, Promise<TelegramClient>>();
+  // Rastreia quando getDialogs do warm-up terminou por conta.
+  // Permite que o prefetch aguarde o entity cache estar populado antes do fire.
+  private dialogsPromises    = new Map<string, Promise<void>>();
 
   private startKeepalive(accountId: string, client: TelegramClient): void {
     const existing = this.keepaliveTimers.get(accountId);
@@ -210,6 +213,7 @@ class TelegramClientPool {
     if (interval) clearInterval(interval);
     this.keepaliveTimers.delete(accountId);
     this.clients.delete(accountId);
+    this.dialogsPromises.delete(accountId);
   }
 
   async get(account: Account): Promise<TelegramClient> {
@@ -252,11 +256,12 @@ class TelegramClientPool {
 
       await client.connect();
 
-      client.getDialogs({ limit: 100 }).then(() => {
-        console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`);
-      }).catch((err: any) => {
-        console.warn(`[pool] getDialogs falhou no warm-up de ${account.phone_number}: ${err.message}`);
-      });
+      // Armazena a promise de dialogs para que awaitDialogsReady() possa sinalizá-la.
+      // O entity cache fica populado quando ela resolve, eliminando getDialogs no caminho crítico.
+      const dp = client.getDialogs({ limit: 100 })
+        .then(() => { console.log(`[pool] ✓ Dialogs sincronizados: ${account.phone_number}`); })
+        .catch((err: any) => { console.warn(`[pool] getDialogs falhou no warm-up de ${account.phone_number}: ${err.message}`); });
+      this.dialogsPromises.set(account.id, dp as Promise<void>);
 
       this.clients.set(account.id, client);
       this.sessions.set(account.id, account.session_string);
@@ -287,6 +292,21 @@ class TelegramClientPool {
     console.log(`[pool] Pre-warming ${accounts.length} conta(s)...`);
     await Promise.allSettled(accounts.map((a) => this.get(a)));
     console.log(`[pool] Pre-warm concluído.`);
+  }
+
+  /**
+   * Aguarda o getDialogs de warm-up terminar para a conta informada.
+   * Limita a espera a timeoutMs (padrão 600ms) para não atrasar o prefetch.
+   * Quando resolve, o entity cache do client já está populado →
+   * getInputEntity funciona sem round-trip adicional.
+   */
+  async awaitDialogsReady(accountId: string, timeoutMs = 600): Promise<void> {
+    const p = this.dialogsPromises.get(accountId);
+    if (!p) return;
+    await Promise.race([
+      p,
+      new Promise<void>((r) => setTimeout(r, timeoutMs)),
+    ]).catch(() => {});
   }
 
   async disconnectAll(): Promise<void> {
@@ -1114,7 +1134,36 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
           }));
         }
         schedulePrefetchCache.set(scheduleId, s);
-        console.log(`[prefetch] ✅ Schedule ${scheduleId} pré-carregado (${PREFETCH_BEFORE_MS}ms antes do fire)`);
+        console.log(`[prefetch] ✅ Schedule ${scheduleId} pré-carregado — iniciando peer pre-warm`);
+
+        // Pre-aquece conexão TCP + entity cache (dialogs) + peer cache para cada conta ativa.
+        // Objetivo: quando fireSchedule rodar, getOrResolvePeer retorna do cache local sem
+        // nenhum round-trip de rede — elimina a principal fonte de latência variável no fire path.
+        const chatId      = s.groups?.telegram_chat_id;
+        const activeAccts = (s.groups?.group_members ?? []).filter(
+          (m) => m.is_active && m.accounts?.is_active && m.accounts?.session_string
+        );
+        if (chatId && activeAccts.length > 0) {
+          Promise.allSettled(
+            activeAccts.map(async (m) => {
+              const acct = m.accounts!;
+              try {
+                // 1. Garante client conectado
+                const cli = await clientPool.get(acct);
+                // 2. Aguarda getDialogs terminar (até 600ms) — popula entity cache interno do client
+                await clientPool.awaitDialogsReady(acct.id, 600);
+                // 3. Resolve e cacheia o peer — hit garantido no fire path
+                await getOrResolvePeer(cli, chatId, acct.id);
+                console.log(`[prefetch] 🔌 ${acct.phone_number} → peer ${chatId} pre-aquecido`);
+              } catch (e: any) {
+                console.warn(`[prefetch] Pre-warm falhou ${acct.phone_number}: ${e.message}`);
+              }
+            })
+          ).then(() => {
+            console.log(`[prefetch] 🔌 Peer pre-warm concluído para schedule ${scheduleId}`);
+          });
+        }
+
       } catch (err: any) {
         console.warn(`[prefetch] Falha ao pré-carregar schedule ${scheduleId}: ${err.message}`);
       }
