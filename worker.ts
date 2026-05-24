@@ -609,12 +609,15 @@ async function getAlreadySentIds(schedule: Schedule): Promise<Set<string>> {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    MONITORAMENTO DE POSIÇÃO
+   Posição real = quantas mensagens chegaram no grupo ANTES da mensagem do robô,
+   contando desde o momento do disparo (abertura do grupo).
+   Inclui mensagens de qualquer pessoa, não só das contas do robô.
    ───────────────────────────────────────────────────────────────────────────── */
 async function monitorPositions(
   telegramChatId: string,
   sentMembers: Array<{ account_id: string; message_text: string }>,
   scheduleId: string,
-  dispatchedAt: Date,
+  dispatchedAt: Date,   // momento exato do disparo (abertura detectada)
   groupType: "open" | "closed"
 ): Promise<void> {
   if (sentMembers.length === 0) return;
@@ -625,15 +628,19 @@ async function monitorPositions(
   const client = await getClient(account).catch(() => null);
   if (!client) { console.warn("[monitor] Sem client — ignorando monitoramento"); return; }
 
-  const windowStartUnix = Math.floor((dispatchedAt.getTime() - 15_000) / 1000);
-  const deadline        = Date.now() + (groupType === "closed"
+  // windowStartUnix: janela começa no momento exato do disparo (sem margem negativa)
+  // Mensagens anteriores ao disparo não entram na contagem de posição
+  const windowStartUnix = Math.floor(dispatchedAt.getTime() / 1000);
+
+  const ourTexts = new Set(sentMembers.map(m => m.message_text).filter(Boolean));
+  const deadline = Date.now() + (groupType === "closed"
     ? MONITOR_DELAY_CLOSED_MS + 10_000
     : MONITOR_MAX_OPEN_MS);
-  const ourTexts = new Set(sentMembers.map(m => m.message_text).filter(Boolean));
 
+  // Grupo fechado: aguarda um tempo para as mensagens chegarem antes de ler
   if (groupType === "closed") await new Promise(r => setTimeout(r, MONITOR_DELAY_CLOSED_MS));
 
-  console.log(`[monitor] Iniciando para schedule ${scheduleId} (${groupType})`);
+  console.log(`[monitor] Iniciando para schedule ${scheduleId} (${groupType}) — janela desde ${dispatchedAt.toISOString()}`);
 
   while (Date.now() < deadline) {
     try {
@@ -647,46 +654,75 @@ async function monitorPositions(
         })
       ) as any;
 
-      const windowMsgs = (result.messages ?? [])
-        .filter((m: any) => m._ === "message" && m.date >= windowStartUnix)
-        .reverse();
+      // Todas as mensagens desde o disparo, em ordem cronológica (mais antiga primeiro)
+      // Inclui mensagens de qualquer remetente — é isso que forma a fila real do grupo
+      const windowMsgs: any[] = (result.messages ?? [])
+        .filter((m: any) =>
+          (m._ === "message" || m.className === "Message") &&
+          m.date >= windowStartUnix
+        )
+        .reverse(); // reverse: GetHistory vem do mais novo; queremos cronológico
 
       if (windowMsgs.length === 0) {
         if (groupType === "closed") {
-          console.warn("[monitor] Sem mensagens na janela (grupo fechado) — abortando");
-          return;
+          console.warn("[monitor] Sem mensagens na janela (grupo fechado) — aguardando mais");
+          await new Promise(r => setTimeout(r, MONITOR_POLL_MS));
+          continue;
         }
         await new Promise(r => setTimeout(r, MONITOR_POLL_MS));
         continue;
       }
 
+      // Para grupo aberto: aguarda até nossas mensagens aparecerem
       if (groupType === "open" && !windowMsgs.some((m: any) => ourTexts.has(m.message))) {
         await new Promise(r => setTimeout(r, MONITOR_POLL_MS));
         continue;
       }
 
+      // Para grupo fechado: se nossas mensagens ainda não apareceram, aguarda
+      if (groupType === "closed" && !windowMsgs.some((m: any) => ourTexts.has(m.message))) {
+        await new Promise(r => setTimeout(r, MONITOR_POLL_MS));
+        continue;
+      }
+
+      // Calcula posição real de cada conta:
+      // posição = índice da mensagem na lista cronológica completa do grupo (desde o disparo)
+      // Ex: se chegaram 3 mensagens de outros antes da nossa → posição = 4
       const cutoff = new Date(dispatchedAt.getTime() - 60_000).toISOString();
       await Promise.allSettled(sentMembers.map(sm => {
         if (!sm.message_text) return;
+
+        // Encontra o índice da mensagem desta conta na lista cronológica completa
         const idx = windowMsgs.findIndex((m: any) => m.message === sm.message_text);
-        if (idx < 0) return;
-        const rank = idx + 1;
-        console.log(`[monitor] ${sm.account_id}: posição #${rank} em ${telegramChatId}`);
+        if (idx < 0) {
+          console.warn(`[monitor] Mensagem não encontrada na janela para account ${sm.account_id}`);
+          return;
+        }
+
+        // posição real = quantas mensagens chegaram antes + 1 (1-based)
+        const realPosition = idx + 1;
+        const totalInWindow = windowMsgs.length;
+
+        console.log(
+          `[monitor] ${sm.account_id}: posição #${realPosition} de ${totalInWindow} ` +
+          `mensagens na janela — ${telegramChatId}`
+        );
+
         return supabase.from("dispatch_logs")
-          .update({ position_rank: rank })
+          .update({ position_rank: realPosition })
           .eq("schedule_id", scheduleId)
           .eq("account_id", sm.account_id)
           .eq("status", "sent")
           .gte("sent_at", cutoff);
       }));
 
-      console.log(`[monitor] ✓ Posições salvas para schedule ${scheduleId}`);
+      console.log(`[monitor] ✓ Posições salvas para schedule ${scheduleId} (${windowMsgs.length} msgs na janela)`);
       return;
 
     } catch (err: any) {
       console.warn(`[monitor] Erro ao buscar histórico: ${err.message}`);
-      if (groupType === "closed") return;
       await new Promise(r => setTimeout(r, MONITOR_POLL_MS));
+      if (groupType === "closed" && Date.now() >= deadline) return;
     }
   }
 
@@ -1030,17 +1066,48 @@ function startClosedGroupListener(schedule: Schedule, group: Group, account: Acc
 
           if (!restricted && !ctrl.signal.aborted) {
             // Grupo abriu — dispara imediatamente
-            const detectedAt = new Date();
+            const detectedAt   = new Date();
+            const detectedMs   = detectedAt.getTime();
+            const scheduleMs   = new Date(schedule.next_run_at).getTime();
+            const openedAfterMs = detectedMs - scheduleMs; // ms após o horário programado
+
             console.log(
-              `[closed-listen] 🔓 Abertura detectada em ${detectedAt.toISOString()} ` +
-              `(schedule ${schedule.id}) — disparando`
+              `[closed-listen] 🔓 ABERTURA DETECTADA\n` +
+              `  schedule_id  : ${schedule.id}\n` +
+              `  horário prog : ${schedule.next_run_at}\n` +
+              `  detectado em : ${detectedAt.toISOString()}\n` +
+              `  Δ abertura   : +${openedAfterMs}ms após horário programado`
             );
+
             listenMap.delete(group.id);
 
             const alreadySent  = schedule.retry_until
               ? await getAlreadySentIds(schedule)
               : new Set<string>();
-            const results      = await dispatchToGroup(schedule, group, alreadySent);
+
+            const dispatchStart = Date.now();
+            const results       = await dispatchToGroup(schedule, group, alreadySent);
+            const dispatchEndMs = Date.now();
+
+            // O que importa: detectedAt → fim do envio
+            // Esse é o tempo real que separa você do primeiro lugar
+            const totalMs   = dispatchEndMs - detectedMs;
+            const waitMs    = dispatchStart - detectedMs;  // detecção → início do dispatch
+            const sendMs    = dispatchEndMs - dispatchStart; // dispatch em si
+
+            const sentCount = results.filter(r => r.status === "sent").length;
+            const failCount = results.filter(r => r.status === "failed").length;
+
+            console.log(
+              `[closed-listen] ✅ DISPARO CONCLUÍDO\n` +
+              `  schedule_id      : ${schedule.id}\n` +
+              `  detectado em     : ${detectedAt.toISOString()}\n` +
+              `  detecção→dispatch: ${waitMs}ms\n` +
+              `  dispatch (envios): ${sendMs}ms\n` +
+              `  ──────────────────────────────\n` +
+              `  TOTAL abertura→fim: ${totalMs}ms  ← esse é o número\n` +
+              `  enviadas: ${sentCount} | falhas: ${failCount}`
+            );
 
             const sentForMonitor = results
               .filter(r => r.status === "sent")
@@ -1051,7 +1118,7 @@ function startClosedGroupListener(schedule: Schedule, group: Group, account: Acc
                 group.telegram_chat_id!,
                 sentForMonitor,
                 schedule.id,
-                detectedAt,
+                detectedAt,  // janela começa no momento da abertura
                 "closed"
               ).catch(err => console.error("[closed-listen] Erro no monitor:", err.message));
             }
