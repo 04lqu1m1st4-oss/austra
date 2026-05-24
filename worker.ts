@@ -1038,7 +1038,7 @@ function startClosedGroupListener(schedule: Schedule, group: Group, account: Acc
         const loopStart = Date.now();
 
         try {
-          const rawId    = group.telegram_chat_id!.replace(/^-/, "");
+          const rawId     = String(group.telegram_chat_id!).replace(/^-/, "");
           const channelId = rawId.startsWith("100") ? rawId.slice(3) : rawId;
 
           // GetFullChannel: query leve de metadata, não conta como envio
