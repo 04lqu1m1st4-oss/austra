@@ -1028,7 +1028,15 @@ function startClosedGroupListener(schedule: Schedule, group: Group, account: Acc
       }
 
       // Pre-resolve peer antes de entrar no loop crítico
-      try { await resolvePeer(client, group.telegram_chat_id!, account.id); } catch {}
+      // CRÍTICO: precisa do peer resolvido com accessHash real — accessHash=0 retorna CHANNEL_INVALID
+      let peer: unknown;
+      try {
+        peer = await resolvePeer(client, String(group.telegram_chat_id!), account.id);
+      } catch (err: any) {
+        console.warn(`[closed-listen] Não conseguiu resolver peer para ${group.telegram_chat_id} — abortando: ${err.message}`);
+        listenMap.delete(group.id);
+        return;
+      }
 
       const deadline  = Date.now() + CLOSED_GROUP_WATCH_WINDOW_MS;
       let pollMs      = CLOSED_GROUP_POLL_MS;
@@ -1038,21 +1046,15 @@ function startClosedGroupListener(schedule: Schedule, group: Group, account: Acc
         const loopStart = Date.now();
 
         try {
-          const rawId     = String(group.telegram_chat_id!).replace(/^-/, "");
-          const channelId = rawId.startsWith("100") ? rawId.slice(3) : rawId;
-
-          // GetFullChannel: query leve de metadata, não conta como envio
+          // GetFullChannel com peer já resolvido (accessHash real do peerCache)
           // Retorna defaultBannedRights com os bits de restrição atuais do grupo
           const result = await client.invoke(
             new Api.channels.GetFullChannel({
-              channel: new Api.InputChannel({
-                channelId: bigInt(channelId),
-                accessHash: bigInt(0),
-              }),
+              channel: peer as any,
             })
           ) as any;
 
-          const banned   = result?.fullChat?.chat?.defaultBannedRights;
+          const banned     = result?.fullChat?.chat?.defaultBannedRights;
           // sendMessages=true significa PROIBIDO; false ou ausente significa LIBERADO
           const restricted = banned?.sendMessages === true;
 
@@ -1153,13 +1155,14 @@ function startClosedGroupListener(schedule: Schedule, group: Group, account: Acc
             continue;
           }
 
-          // Erro transitório (network, timeout) — tenta reconectar e continua
+          // Erro transitório (network, timeout) — tenta reconectar e re-resolve peer
           console.warn(`[closed-listen] Erro no poll (${schedule.id}): ${err.message}`);
           try {
             if (!client.connected) {
               await getClient(account);
-              await resolvePeer(client, group.telegram_chat_id!, account.id);
             }
+            // Re-resolve peer após reconexão — accessHash pode ter mudado
+            peer = await resolvePeer(client, String(group.telegram_chat_id!), account.id);
           } catch {}
         }
 
