@@ -1046,17 +1046,34 @@ function startClosedGroupListener(schedule: Schedule, group: Group, account: Acc
         const loopStart = Date.now();
 
         try {
-          // GetFullChannel com peer já resolvido (accessHash real do peerCache)
-          // Retorna defaultBannedRights com os bits de restrição atuais do grupo
-          const result = await client.invoke(
-            new Api.channels.GetFullChannel({
-              channel: peer as any,
-            })
-          ) as any;
+          // Detecta tipo de peer para usar a API correta:
+          // InputPeerChannel → channels.GetFullChannel (supergroup/channel)
+          // InputPeerChat    → messages.GetFullChat (grupo comum)
+          const peerObj = peer as any;
+          const isChannel =
+            peerObj?.className === "InputPeerChannel" ||
+            peerObj?.CONSTRUCTOR_ID === 0x20adaef8 ||
+            peerObj?.channelId != null;
 
-          const banned     = result?.fullChat?.chat?.defaultBannedRights;
-          // sendMessages=true significa PROIBIDO; false ou ausente significa LIBERADO
-          const restricted = banned?.sendMessages === true;
+          let restricted: boolean;
+
+          if (isChannel) {
+            const result = await client.invoke(
+              new Api.channels.GetFullChannel({ channel: peer as any })
+            ) as any;
+            const banned = result?.fullChat?.chat?.defaultBannedRights;
+            restricted   = banned?.sendMessages === true;
+          } else {
+            // Chat comum: verifica se o bot/conta consegue enviar
+            // messages.GetFullChat retorna participants — usa SendMessage de teste não,
+            // em vez disso verifica default_banned_rights via GetChat
+            const chatId  = peerObj?.chatId ?? peerObj?.chat_id;
+            const result  = await client.invoke(
+              new Api.messages.GetFullChat({ chatId: bigInt(String(chatId)) })
+            ) as any;
+            const banned  = result?.fullChat?.defaultBannedRights;
+            restricted    = banned?.sendMessages === true;
+          }
 
           if (lastRestricted === null) {
             // Primeira leitura — só loga estado inicial
