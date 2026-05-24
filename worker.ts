@@ -288,17 +288,32 @@ async function getClient(account: Account): Promise<TelegramClient> {
       autoReconnect: true,
       floodSleepThreshold: 60,
       requestRetries: 3,
-      // FIX #1: Usar receiveUpdates:false em vez de monkeypatchar _updateLoop.
-      // A supressão manual de _updateLoop impedia a sincronização de estado
-      // após reconexão, causando o loop "Not connected" → reconnect → "Not connected".
-      // receiveUpdates:false é a flag nativa do GramJS para desativar o update loop
-      // sem interferir no fluxo de reconexão.
-      receiveUpdates: false,
     }
   );
 
-  // REMOVIDO: (client as any)._updateLoop = () => Promise.resolve();
-  // Era a causa raiz do reconnect loop (Bug #1).
+  // FIX #1: Suprimir o update loop sem quebrar o fluxo de reconexão.
+  //
+  // Abordagem descartada — (client as any)._updateLoop = () => Promise.resolve():
+  //   Substituía a função inteira, mas o GramJS chama _updateLoop(client) passando
+  //   o client como argumento (não como método). O monkey-patch no objeto não
+  //   interceptava a chamada no módulo updates.js, que mantinha sua própria
+  //   referência. Resultado: o loop subia mesmo com o patch, e quando o sender
+  //   ficava instável o _recvLoop lançava "Not connected" sem ter o loop para
+  //   processar o estado → reconnect → "Not connected" infinito.
+  //
+  // Abordagem descartada — receiveUpdates: false no construtor:
+  //   Não existe em TelegramClientParams. Causa TS2353 com strict mode.
+  //
+  // Solução correta — _loopStarted = true antes de connect():
+  //   O GramJS declara _loopStarted em telegramBaseClient (linha 176 do .d.ts)
+  //   e inicializa como false. Em TelegramClient.connect(), ambos os pontos
+  //   que chamam _updateLoop são guardados por `if (!this._loopStarted)`.
+  //   Setar true antes do connect() faz os dois guards falharem → loop nunca
+  //   sobe. O flag já é typed como `protected boolean`, então o cast para `any`
+  //   é necessário apenas para acesso externo — não há risco de TS2353.
+  //   O fluxo de reconexão (autoReconnect, _handleReconnect) não depende desse
+  //   flag, então continua funcionando normalmente.
+  (client as any)._loopStarted = true;
 
   await client.connect();
 
