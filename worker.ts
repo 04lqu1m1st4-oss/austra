@@ -48,6 +48,18 @@
 //     noWebpage evita que o Telegram tente gerar preview (RTT extra).
 //     randomId diferente em cada tentativa evita que o Telegram dedup uma
 //     mensagem que falhou e está sendo reenviada.
+//
+// Fix v5 (2025-05) — sniper loop para grupos fechados:
+//
+//   OPT #5 — sniperFireClosed():
+//     Para grupos do tipo "closed", scheduleTimer agenda um segundo timer
+//     SNIPER_BEFORE_MS=20ms antes do horário exato. Esse timer inicia o
+//     sniperFireClosed(), que tenta enviar a mensagem da primeira conta em
+//     loop ultra-agressivo: 1ms entre tentativas, pausa de 5ms a cada 10
+//     tentativas consecutivas sem sucesso. Assim que a primeira conta envia,
+//     as demais disparam em sequência com 1ms de delay entre elas.
+//     O fireSchedule() normal é bloqueado via sniperFiringNow enquanto o
+//     sniper estiver no controle, evitando duplo disparo.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -106,6 +118,30 @@ const OPEN_GROUP_LISTEN_TIMEOUT_MS = 2 * 60 * 60_000; // 2 horas
 
 // Backoff máximo entre tentativas de envio (ms)
 const SEND_RETRY_BACKOFF_MAX_MS = 8_000;
+
+// OPT #5 — SNIPER: quantos ms antes do horário exato iniciar o loop agressivo
+const SNIPER_BEFORE_MS = 20;
+
+// OPT #5 — SNIPER: timeout por tentativa individual no loop agressivo.
+// Deve ser curto o suficiente para não bloquear o gap de 1ms entre tentativas,
+// mas longo o suficiente para o MTProto responder em condições normais.
+const SNIPER_SEND_TIMEOUT_MS = 800;
+
+// OPT #5 — SNIPER: intervalo entre tentativas consecutivas (ms)
+const SNIPER_ATTEMPT_INTERVAL_MS = 1;
+
+// OPT #5 — SNIPER: após este número de tentativas sem sucesso, pausa brevemente
+const SNIPER_PAUSE_EVERY_N = 10;
+
+// OPT #5 — SNIPER: duração da pausa após SNIPER_PAUSE_EVERY_N tentativas (ms)
+const SNIPER_PAUSE_MS = 5;
+
+// OPT #5 — SNIPER: delay entre envios sequenciais de contas do mesmo grupo (ms)
+const SNIPER_INTER_ACCOUNT_DELAY_MS = 1;
+
+// OPT #5 — SNIPER: budget total do loop agressivo antes de desistir e deixar
+// o fireSchedule normal assumir (evita loop eterno se o grupo nunca abrir)
+const SNIPER_BUDGET_MS = RETRY_BUDGET_MS;
 
 const WORKER_PORT   = parseInt(process.env.PORT ?? "3001", 10);
 const WORKER_SECRET = process.env.WORKER_SECRET ?? "";
@@ -189,6 +225,9 @@ const scheduledTimers = new Map<string, ReturnType<typeof setTimeout>>();
 // OPT #2: timers de pre-fetch: scheduleId → setTimeout handle
 const prefetchTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+// OPT #5: timers do sniper: scheduleId → setTimeout handle
+const sniperTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 // OPT #2: schedules pre-carregados prontos para uso instantâneo no fire
 const schedulePrefetchCache = new Map<string, Schedule>();
 
@@ -197,6 +236,9 @@ const listenMap = new Map<string, AbortController>();
 
 // FIX v1: schedules atualmente em execução — previne duplo disparo
 const firingNow = new Set<string>();
+
+// OPT #5: schedules em execução no sniper — bloqueia fireSchedule normal
+const sniperFiringNow = new Set<string>();
 
 // FIX BUG #5: mutex de conexão por account — previne AUTH_KEY_DUPLICATED
 const connectingPromises = new Map<string, Promise<TelegramClient>>();
@@ -572,6 +614,282 @@ async function sendMessage(
   }
 
   throw new Error(`BUDGET_EXCEEDED após ${attempt} tentativa(s) em ${RETRY_BUDGET_MS / 1000}s`);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   SNIPER — ENVIO ÚNICO COM TIMEOUT CURTO (sem retry interno)
+   Usado pelo sniperFireClosed para cada tentativa individual do loop agressivo.
+   Não faz backoff — o loop externo controla o ritmo de 1ms.
+   Lança exceção em qualquer falha para que o loop decida o que fazer.
+   ───────────────────────────────────────────────────────────────────────────── */
+async function sniperSendOnce(
+  client: TelegramClient,
+  account: Account,
+  telegramChatId: string,
+  messageText: string
+): Promise<void> {
+  const peer = await resolvePeer(client, telegramChatId, account.id);
+
+  await Promise.race([
+    client.invoke(new Api.messages.SendMessage({
+      peer:      peer as any,
+      message:   messageText,
+      randomId:  makeRandomId(),
+      noWebpage: true,
+    })),
+    new Promise<never>((_, r) =>
+      setTimeout(() => r(new Error("SNIPER_TIMEOUT")), SNIPER_SEND_TIMEOUT_MS)
+    ),
+  ]);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   SNIPER LOOP — GRUPOS FECHADOS
+   Tenta enviar a mensagem da primeira conta em loop ultra-agressivo:
+     - 1ms entre tentativas consecutivas
+     - a cada SNIPER_PAUSE_EVERY_N tentativas sem sucesso, pausa SNIPER_PAUSE_MS
+     - quando a primeira conta envia, as demais disparam em sequência com
+       SNIPER_INTER_ACCOUNT_DELAY_MS entre elas
+     - budget total de SNIPER_BUDGET_MS antes de desistir
+   ───────────────────────────────────────────────────────────────────────────── */
+async function sniperFireClosed(scheduleId: string): Promise<void> {
+  if (sniperFiringNow.has(scheduleId)) {
+    console.warn(`[sniper] Schedule ${scheduleId} já em execução — ignorando disparo duplicado`);
+    return;
+  }
+  sniperFiringNow.add(scheduleId);
+
+  try {
+    const now = new Date();
+
+    // Consome o prefetch cache (populado 800ms antes pelo scheduleTimer)
+    let schedule = schedulePrefetchCache.get(scheduleId);
+    if (schedule) {
+      schedulePrefetchCache.delete(scheduleId);
+      console.log(`[sniper] ⚡ Schedule ${scheduleId} servido do pre-fetch cache`);
+    } else {
+      const { data, error } = await supabase
+        .from("schedules")
+        .select(SCHEDULE_SELECT)
+        .eq("id", scheduleId)
+        .eq("is_active", true)
+        .single();
+      if (error || !data) {
+        console.warn(`[sniper] Schedule ${scheduleId} não encontrado ou inativo.`);
+        return;
+      }
+      schedule = data as unknown as Schedule;
+    }
+
+    const group = schedule.groups;
+
+    if (!group?.telegram_chat_id) {
+      console.warn(`[sniper] Schedule ${scheduleId}: sem telegram_chat_id — pulando.`);
+      return;
+    }
+
+    // Injeta contas frescas do accountCache
+    if (group.group_members) {
+      group.group_members = group.group_members.map(m => ({
+        ...m,
+        accounts: m.accounts ? (accountCache.get(m.accounts.id) ?? m.accounts) : null,
+      }));
+    }
+
+    // Membros ativos, ordenados por posição
+    const members = (group.group_members ?? [])
+      .filter(m => m.is_active && m.accounts?.is_active && m.accounts?.session_string)
+      .sort((a, b) => a.position - b.position);
+
+    if (members.length === 0) {
+      console.warn(`[sniper] Nenhuma conta ativa no schedule ${scheduleId} — abortando.`);
+      return;
+    }
+
+    const chatId    = group.telegram_chat_id;
+    const budgetEnd = Date.now() + SNIPER_BUDGET_MS;
+    const results:  DispatchResult[] = [];
+
+    console.log(`[sniper] 🎯 Iniciando loop agressivo para schedule ${scheduleId} — ${members.length} conta(s)`);
+
+    // ── FASE 1: loop agressivo na primeira conta ──────────────────────────
+    const firstMember  = members[0];
+    const firstAccount = firstMember.accounts!;
+    const firstText    = firstMember.message_text ?? "";
+
+    let firstClient: TelegramClient;
+    try {
+      firstClient = await getClient(firstAccount);
+    } catch (err: any) {
+      console.error(`[sniper] Falha ao conectar ${firstAccount.phone_number}: ${err.message}`);
+      results.push({
+        account_id:   firstAccount.id,
+        message_text: firstMember.message_text,
+        status:       "failed",
+        retryable:    isRetryableError(err.message),
+        error:        err.message,
+      });
+      // Sem a primeira conta, não há como determinar quando o grupo abriu —
+      // faz fallback para o fireSchedule normal via retry do banco.
+      await updateScheduleAfterDispatch(schedule, results, now);
+      return;
+    }
+
+    let attempt        = 0;
+    let firstSentAt: Date | null = null;
+
+    while (Date.now() < budgetEnd) {
+      attempt++;
+
+      try {
+        await sniperSendOnce(firstClient, firstAccount, chatId, firstText);
+        firstSentAt = new Date();
+        console.log(`[sniper] ✓ Primeira conta ${firstAccount.phone_number} enviou na tentativa ${attempt} (${firstSentAt.toISOString()})`);
+        results.push({
+          account_id:   firstAccount.id,
+          message_text: firstMember.message_text,
+          status:       "sent",
+          retryable:    false,
+        });
+        break;
+      } catch (err: any) {
+        const errMsg = String(err?.message ?? "");
+        const isFatal =
+          errMsg.includes("AUTH_KEY_UNREGISTERED") ||
+          errMsg.includes("USER_DEACTIVATED")      ||
+          errMsg.includes("SESSION_REVOKED");
+
+        if (isFatal) {
+          console.error(`[sniper] Erro fatal na conta ${firstAccount.phone_number}: ${errMsg}`);
+          results.push({
+            account_id:   firstAccount.id,
+            message_text: firstMember.message_text,
+            status:       "failed",
+            retryable:    false,
+            error:        errMsg,
+          });
+          await updateScheduleAfterDispatch(schedule, results, now);
+          return;
+        }
+
+        // Invalida peer cache em erros de peer para forçar re-resolução na próxima tentativa
+        if (
+          errMsg.includes("PEER_ID_INVALID") ||
+          errMsg.includes("CHANNEL_INVALID") ||
+          errMsg.includes("CHANNEL_PRIVATE")
+        ) {
+          peerCache.delete(`${firstAccount.id}:${chatId}`);
+        }
+
+        // A cada SNIPER_PAUSE_EVERY_N tentativas sem sucesso, pausa SNIPER_PAUSE_MS
+        // para evitar saturar a fila de I/O do Node e dar um respiro ao MTProto.
+        if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
+          await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
+        } else {
+          await new Promise(r => setTimeout(r, SNIPER_ATTEMPT_INTERVAL_MS));
+        }
+      }
+    }
+
+    // Log da primeira conta em background
+    supabase.from("dispatch_logs").insert({
+      user_id:             schedule.user_id,
+      group_id:            group.id,
+      account_id:          firstAccount.id,
+      schedule_id:         schedule.id,
+      status:              firstSentAt ? "sent" : "failed",
+      message_text:        firstMember.message_text,
+      position_rank:       1,
+      group_name_snapshot: group.name,
+      chat_name_snapshot:  group.telegram_chat_name,
+      sent_at:             firstSentAt ? firstSentAt.toISOString() : null,
+      error_message:       firstSentAt ? null : `BUDGET_EXCEEDED após ${attempt} tentativas`,
+    }).then(({ error: e }) => {
+      if (e) console.error(`[sniper][log] Falha ao inserir log para ${firstAccount.id}:`, e.message);
+    });
+
+    if (!firstSentAt) {
+      // Budget esgotado sem sucesso — delega ao mecanismo de retry normal do banco
+      console.warn(`[sniper] Budget esgotado para schedule ${scheduleId} após ${attempt} tentativas`);
+      results.push({
+        account_id:   firstAccount.id,
+        message_text: firstMember.message_text,
+        status:       "failed",
+        retryable:    true,
+        error:        `SNIPER_BUDGET_EXCEEDED após ${attempt} tentativas`,
+      });
+      await updateScheduleAfterDispatch(schedule, results, now);
+      return;
+    }
+
+    // ── FASE 2: demais contas em sequência com delay de 1ms ──────────────
+    for (let i = 1; i < members.length; i++) {
+      await new Promise(r => setTimeout(r, SNIPER_INTER_ACCOUNT_DELAY_MS));
+
+      const member  = members[i];
+      const account = member.accounts!;
+      const text    = member.message_text ?? "";
+      let   sentAt: Date | null = null;
+      let   error: string | undefined;
+
+      try {
+        const client = await getClient(account);
+        await sniperSendOnce(client, account, chatId, text);
+        sentAt = new Date();
+        console.log(`[sniper] ✓ Conta ${i + 1}/${members.length} ${account.phone_number} enviou`);
+        results.push({
+          account_id:   account.id,
+          message_text: member.message_text,
+          status:       "sent",
+          retryable:    false,
+        });
+      } catch (err: any) {
+        error = String(err?.message ?? "");
+        console.error(`[sniper] ✗ Conta ${i + 1}/${members.length} ${account.phone_number}: ${error}`);
+        results.push({
+          account_id:   account.id,
+          message_text: member.message_text,
+          status:       "failed",
+          retryable:    isRetryableError(error),
+          error,
+        });
+      }
+
+      // Log em background
+      supabase.from("dispatch_logs").insert({
+        user_id:             schedule.user_id,
+        group_id:            group.id,
+        account_id:          account.id,
+        schedule_id:         schedule.id,
+        status:              sentAt ? "sent" : "failed",
+        message_text:        member.message_text,
+        position_rank:       i + 1,
+        group_name_snapshot: group.name,
+        chat_name_snapshot:  group.telegram_chat_name,
+        sent_at:             sentAt ? sentAt.toISOString() : null,
+        error_message:       error ?? null,
+      }).then(({ error: e }) => {
+        if (e) console.error(`[sniper][log] Falha ao inserir log para ${account.id}:`, e.message);
+      });
+    }
+
+    // ── FASE 3: monitoramento de posições ─────────────────────────────────
+    const sentForMonitor = results
+      .filter(r => r.status === "sent")
+      .map(r => ({ account_id: r.account_id, message_text: r.message_text ?? "" }))
+      .filter(r => r.message_text);
+
+    if (sentForMonitor.length > 0) {
+      monitorPositions(chatId, sentForMonitor, scheduleId, firstSentAt, "closed")
+        .catch(err => console.error("[sniper][monitor] Erro:", err.message));
+    }
+
+    // ── FASE 4: atualiza schedule no banco ────────────────────────────────
+    await updateScheduleAfterDispatch(schedule, results, firstSentAt);
+
+  } finally {
+    sniperFiringNow.delete(scheduleId);
+  }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -955,9 +1273,15 @@ async function updateScheduleAfterDispatch(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   DISPARO DE SCHEDULE
+   DISPARO DE SCHEDULE (grupos abertos + fallback para fechados sem sniper)
    ───────────────────────────────────────────────────────────────────────────── */
 async function fireSchedule(scheduleId: string): Promise<void> {
+  // OPT #5: se o sniper já assumiu o controle deste schedule, não duplica.
+  if (sniperFiringNow.has(scheduleId)) {
+    console.warn(`[fire] Schedule ${scheduleId} em execução no sniper — ignorando fireSchedule`);
+    return;
+  }
+
   if (firingNow.has(scheduleId)) {
     console.warn(`[fire] Schedule ${scheduleId} já em execução — ignorando disparo duplicado`);
     return;
@@ -968,14 +1292,11 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     const now = new Date();
 
     // OPT #2: tenta consumir o pre-fetch cache primeiro.
-    // Se o prefetch chegou a tempo (800ms antes), a query Supabase não está
-    // no caminho crítico — o schedule já está em memória.
     let schedule = schedulePrefetchCache.get(scheduleId);
     if (schedule) {
       schedulePrefetchCache.delete(scheduleId);
       console.log(`[fire] ⚡ Schedule ${scheduleId} servido do pre-fetch cache`);
     } else {
-      // Fallback: busca ao vivo (primeiro boot, retry imediato, etc.)
       const { data, error } = await supabase
         .from("schedules")
         .select(SCHEDULE_SELECT)
@@ -997,7 +1318,7 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       return;
     }
 
-    // Injeta contas frescas do accountCache (podem ter sido atualizadas desde o pre-fetch)
+    // Injeta contas frescas do accountCache
     if (group.group_members) {
       group.group_members = group.group_members.map(m => ({
         ...m,
@@ -1033,8 +1354,8 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       return;
     }
 
-    // Em ciclos frescos (sem retry_until) não há nada enviado ainda —
-    // skip da query de dedup elimina ~50-100ms do caminho crítico.
+    // Grupo fechado chegou aqui sem sniper (retry via banco, boot tardio, etc.)
+    // Usa o caminho normal com dedup.
     const alreadySent = schedule.retry_until
       ? await getAlreadySentIds(schedule)
       : new Set<string>();
@@ -1067,9 +1388,9 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   TIMER DE PRECISÃO + PRE-FETCH
+   TIMER DE PRECISÃO + PRE-FETCH + SNIPER
    ───────────────────────────────────────────────────────────────────────────── */
-function scheduleTimer(scheduleId: string, nextRunAt: string): void {
+function scheduleTimer(scheduleId: string, nextRunAt: string, groupType?: "open" | "closed"): void {
   const delay = new Date(nextRunAt).getTime() - Date.now();
 
   if (delay < -5_000) {
@@ -1077,17 +1398,17 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
     return;
   }
 
-  // Cancela timers anteriores (fire + prefetch)
+  // Cancela timers anteriores (fire + prefetch + sniper)
   const prev = scheduledTimers.get(scheduleId);
   if (prev) clearTimeout(prev);
   const prevPrefetch = prefetchTimers.get(scheduleId);
   if (prevPrefetch) { clearTimeout(prevPrefetch); prefetchTimers.delete(scheduleId); }
+  const prevSniper = sniperTimers.get(scheduleId);
+  if (prevSniper) { clearTimeout(prevSniper); sniperTimers.delete(scheduleId); }
 
   const effectiveDelay = Math.max(0, delay);
 
   // OPT #2: pre-fetch do schedule PREFETCH_BEFORE_MS antes do fire.
-  // Carrega o schedule do banco enquanto ainda há tempo, e guarda em
-  // schedulePrefetchCache. Quando fireSchedule rodar, consome instantaneamente.
   if (effectiveDelay > PREFETCH_BEFORE_MS) {
     const prefetchDelay = effectiveDelay - PREFETCH_BEFORE_MS;
     const pt = setTimeout(async () => {
@@ -1106,7 +1427,6 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
         }
 
         const s = data as unknown as Schedule;
-        // Injeta contas frescas do accountCache no pre-fetch
         if (s.groups?.group_members) {
           s.groups.group_members = s.groups.group_members.map(m => ({
             ...m,
@@ -1121,6 +1441,31 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
       }
     }, prefetchDelay);
     prefetchTimers.set(scheduleId, pt);
+  }
+
+  // OPT #5: para grupos fechados, agenda o sniper SNIPER_BEFORE_MS antes do horário.
+  // O sniper assume o controle e o fireSchedule normal fica bloqueado via sniperFiringNow.
+  // groupType pode não estar disponível na primeira chamada de scheduleTimer (vindo do
+  // reloadSchedules com apenas id + next_run_at), por isso o sniper só é agendado quando
+  // temos certeza que é "closed" — o prefetch já resolveu o tipo antes do sniper disparar.
+  if (groupType === "closed" && effectiveDelay > SNIPER_BEFORE_MS) {
+    const sniperDelay = effectiveDelay - SNIPER_BEFORE_MS;
+    const st = setTimeout(async () => {
+      sniperTimers.delete(scheduleId);
+      // Verifica o tipo no prefetch cache (mais fresco) antes de entrar no sniper
+      const cached = schedulePrefetchCache.get(scheduleId);
+      if (cached && cached.groups?.group_type !== "closed") {
+        console.log(`[sniper] Schedule ${scheduleId} não é closed — pulando sniper`);
+        return;
+      }
+      try {
+        await sniperFireClosed(scheduleId);
+      } catch (err) {
+        console.error(`[sniper] Erro inesperado ao disparar ${scheduleId}:`, err);
+      }
+    }, sniperDelay);
+    sniperTimers.set(scheduleId, st);
+    console.log(`[sniper] ⏰ Sniper agendado para schedule ${scheduleId} em ${Math.round(sniperDelay / 1000)}s`);
   }
 
   const timer = setTimeout(async () => {
@@ -1151,8 +1496,9 @@ async function reloadSchedules(): Promise<void> {
     { data: retrySchedules },
     { data: expiredRetries },
   ] = await Promise.all([
+    // Inclui group_type para passar ao scheduleTimer e ativar o sniper nos grupos fechados
     supabase.from("schedules")
-      .select("id, next_run_at")
+      .select("id, next_run_at, groups(group_type)")
       .eq("is_active", true)
       .is("retry_until", null)
       .lte("next_run_at", lookaheadISO),
@@ -1204,7 +1550,9 @@ async function reloadSchedules(): Promise<void> {
 
   for (const s of futureSchedules ?? []) {
     if (!scheduledTimers.has(s.id)) {
-      scheduleTimer(s.id, s.next_run_at);
+      // Passa o group_type para o scheduleTimer ativar o sniper nos grupos fechados
+      const gType = (s as any).groups?.group_type as "open" | "closed" | undefined;
+      scheduleTimer(s.id, s.next_run_at, gType);
     }
   }
 
@@ -1216,7 +1564,8 @@ async function reloadSchedules(): Promise<void> {
     if (
       isRetryDue(schedule, now) &&
       !scheduledTimers.has(schedule.id) &&
-      !firingNow.has(schedule.id)
+      !firingNow.has(schedule.id) &&
+      !sniperFiringNow.has(schedule.id)
     ) {
       console.log(`[reload] Schedule ${schedule.id} em retry — disparando agora.`);
       fireSchedule(schedule.id).catch(err =>
@@ -1267,9 +1616,6 @@ async function prewarmAccounts(): Promise<void> {
     }));
 
     // OPT #3: pre-resolve de peers para todos os grupos ativos.
-    // Após getDialogs(), popula peerCache com os telegram_chat_id conhecidos.
-    // Garante que resolvePeer() vai pelo caminho rápido (Estratégia 1: cache local)
-    // no primeiro disparo, sem cair na Estratégia 3 (getDialogs 200 itens).
     try {
       const { data: groups } = await supabase
         .from("groups")
@@ -1293,7 +1639,7 @@ async function prewarmAccounts(): Promise<void> {
           resolvePromises.push(
             resolvePeer(cl, chatId, acc.id)
               .then(() => console.log(`[prewarm] ✓ Peer pré-resolvido: ${chatId} via ${acc.phone_number}`))
-              .catch(() => {}) // silencia — só otimização, não crítico
+              .catch(() => {})
           );
         }
       }
@@ -1690,6 +2036,9 @@ async function shutdown() {
   for (const t of prefetchTimers.values()) clearTimeout(t);
   prefetchTimers.clear();
 
+  for (const t of sniperTimers.values()) clearTimeout(t);
+  sniperTimers.clear();
+
   for (const t of scheduledTimers.values()) clearTimeout(t);
   scheduledTimers.clear();
 
@@ -1716,7 +2065,8 @@ process.on("SIGINT",  shutdown);
       pre-resolve peers de todos os grupos ativos (OPT #3),
       popula accountCache e peerCache
    2. reloadSchedules: lê o banco e cria os timers iniciais
-      (cada timer agenda também um pre-fetch — OPT #2)
+      (cada timer agenda também um pre-fetch — OPT #2 — e um sniper se
+      group_type === "closed" — OPT #5)
    3. setInterval: mantém o ciclo de reload a cada 30s
    ───────────────────────────────────────────────────────────────────────────── */
 async function init(): Promise<void> {
