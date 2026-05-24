@@ -1002,9 +1002,10 @@ async function updateScheduleAfterDispatch(
 /* ─────────────────────────────────────────────────────────────────────────────
    LISTENER DE GRUPO FECHADO
    Estratégia: polling leve de GetFullChannel a cada CLOSED_GROUP_POLL_MS (10ms)
-   para detectar o momento exato em que o admin remove a restrição de envio.
-   Quando defaultBannedRights.sendMessages passar a false → dispara imediatamente.
-   Nunca tenta enviar antes da detecção — zero tentativas desperdiçadas.
+   Estratégia: retry agressivo de SendMessage a cada CLOSED_GROUP_POLL_MS.
+   CHAT_WRITE_FORBIDDEN = ainda fechado → tenta de novo imediatamente.
+   Sucesso na primeira conta = grupo abriu → dispara todas em paralelo.
+   Zero overhead de verificação — a detecção É o envio.
    ───────────────────────────────────────────────────────────────────────────── */
 function startClosedGroupListener(schedule: Schedule, group: Group, account: Account): void {
   const existing = listenMap.get(group.id);
@@ -1015,7 +1016,7 @@ function startClosedGroupListener(schedule: Schedule, group: Group, account: Acc
 
   console.log(
     `[closed-listen] 🔒 Aguardando abertura de ${group.telegram_chat_id} ` +
-    `(schedule ${schedule.id}) — polling ${CLOSED_GROUP_POLL_MS}ms`
+    `(schedule ${schedule.id}) — retry agressivo ${CLOSED_GROUP_POLL_MS}ms`
   );
 
   (async () => {
@@ -1028,166 +1029,195 @@ function startClosedGroupListener(schedule: Schedule, group: Group, account: Acc
       }
 
       // Pre-resolve peer antes de entrar no loop crítico
-      // CRÍTICO: precisa do peer resolvido com accessHash real — accessHash=0 retorna CHANNEL_INVALID
       let peer: unknown;
       try {
         peer = await resolvePeer(client, String(group.telegram_chat_id!), account.id);
       } catch (err: any) {
-        console.warn(`[closed-listen] Não conseguiu resolver peer para ${group.telegram_chat_id} — abortando: ${err.message}`);
+        console.warn(`[closed-listen] Peer não resolvido para ${group.telegram_chat_id} — abortando: ${err.message}`);
         listenMap.delete(group.id);
         return;
       }
 
-      const deadline  = Date.now() + CLOSED_GROUP_WATCH_WINDOW_MS;
-      let pollMs      = CLOSED_GROUP_POLL_MS;
-      let lastRestricted: boolean | null = null;
+      // Pega o primeiro membro ativo para usar como sonda
+      const members = (group.group_members ?? [])
+        .filter(m => m.is_active && m.accounts?.is_active)
+        .sort((a, b) => a.position - b.position);
+
+      if (members.length === 0) {
+        console.warn(`[closed-listen] Sem membros ativos — abortando para ${schedule.id}`);
+        listenMap.delete(group.id);
+        return;
+      }
+
+      const probeAccount  = members[0].accounts as Account;
+      const probeText     = members[0].message_text ?? "";
+      const probeClient   = await getClient(probeAccount).catch(() => null);
+      let   probePeer: unknown;
+      try {
+        probePeer = probeClient
+          ? await resolvePeer(probeClient!, String(group.telegram_chat_id!), probeAccount.id)
+          : peer;
+      } catch { probePeer = peer; }
+
+      const deadline = Date.now() + CLOSED_GROUP_WATCH_WINDOW_MS;
+      let attempts   = 0;
+
+      console.log(`[closed-listen] 🔒 Iniciando retry agressivo — conta sonda: ${probeAccount.phone_number}`);
 
       while (Date.now() < deadline && !ctrl.signal.aborted) {
         const loopStart = Date.now();
+        attempts++;
 
         try {
-          // Detecta tipo de peer para usar a API correta:
-          // InputPeerChannel → channels.GetFullChannel (supergroup/channel)
-          // InputPeerChat    → messages.GetFullChat (grupo comum)
-          const peerObj = peer as any;
-          const isChannel =
-            peerObj?.className === "InputPeerChannel" ||
-            peerObj?.CONSTRUCTOR_ID === 0x20adaef8 ||
-            peerObj?.channelId != null;
+          // Tenta enviar direto — se passar, grupo abriu
+          // randomId único por tentativa evita dedup do Telegram
+          await probeClient!.invoke(new Api.messages.SendMessage({
+            peer:      probePeer as any,
+            message:   probeText,
+            randomId:  makeRandomId(),
+            noWebpage: true,
+          }));
 
-          let restricted: boolean;
+          // ✅ ENVIOU — grupo abriu, dispara todas as outras contas imediatamente
+          const detectedAt  = new Date();
+          const detectedMs  = detectedAt.getTime();
+          listenMap.delete(group.id);
 
-          if (isChannel) {
-            const result = await client.invoke(
-              new Api.channels.GetFullChannel({ channel: peer as any })
-            ) as any;
-            const banned = result?.fullChat?.chat?.defaultBannedRights;
-            restricted   = banned?.sendMessages === true;
-          } else {
-            // Chat comum: verifica se o bot/conta consegue enviar
-            // messages.GetFullChat retorna participants — usa SendMessage de teste não,
-            // em vez disso verifica default_banned_rights via GetChat
-            const chatId  = peerObj?.chatId ?? peerObj?.chat_id;
-            const result  = await client.invoke(
-              new Api.messages.GetFullChat({ chatId: bigInt(String(chatId)) })
-            ) as any;
-            const banned  = result?.fullChat?.defaultBannedRights;
-            restricted    = banned?.sendMessages === true;
+          console.log(
+            `[closed-listen] 🔓 ABERTO — detectado via envio bem-sucedido\n` +
+            `  schedule_id  : ${schedule.id}\n` +
+            `  detectado em : ${detectedAt.toISOString()}\n` +
+            `  tentativas   : ${attempts}`
+          );
+
+          // Conta sonda já enviou — marca como enviada para o dedup
+          const alreadySent = schedule.retry_until
+            ? await getAlreadySentIds(schedule)
+            : new Set<string>();
+          alreadySent.add(probeAccount.id);
+
+          // Dispara as demais contas em paralelo
+          const dispatchStart = Date.now();
+          const results       = await dispatchToGroup(schedule, group, alreadySent);
+          const dispatchEndMs = Date.now();
+
+          // Insere log manual da conta sonda (que não passou pelo dispatchToGroup)
+          supabase.from("dispatch_logs").insert({
+            user_id:             schedule.user_id,
+            group_id:            group.id,
+            account_id:          probeAccount.id,
+            schedule_id:         schedule.id,
+            status:              "sent",
+            message_text:        probeText,
+            position_rank:       1,
+            group_name_snapshot: group.name,
+            chat_name_snapshot:  group.telegram_chat_name,
+            sent_at:             detectedAt.toISOString(),
+            error_message:       null,
+          }).then(({ error: e }) => {
+            if (e) console.error(`[closed-listen] Falha ao logar conta sonda:`, e.message);
+          });
+
+          // Inclui conta sonda nos resultados para o updateScheduleAfterDispatch
+          const probeResult: DispatchResult = {
+            account_id:   probeAccount.id,
+            message_text: probeText,
+            status:       "sent",
+            retryable:    false,
+          };
+          const allResults = [probeResult, ...results];
+
+          const sentCount = allResults.filter(r => r.status === "sent").length;
+          const failCount = allResults.filter(r => r.status === "failed").length;
+          const sendMs    = dispatchEndMs - dispatchStart;
+          const totalMs   = dispatchEndMs - detectedMs;
+
+          console.log(
+            `[closed-listen] ✅ DISPARO CONCLUÍDO\n` +
+            `  schedule_id        : ${schedule.id}\n` +
+            `  detectado em       : ${detectedAt.toISOString()}\n` +
+            `  dispatch restantes : ${sendMs}ms\n` +
+            `  ──────────────────────────────────\n` +
+            `  TOTAL abertura→fim : ${totalMs}ms  ← esse é o número\n` +
+            `  enviadas: ${sentCount} | falhas: ${failCount}`
+          );
+
+          const sentForMonitor = allResults
+            .filter(r => r.status === "sent")
+            .map(r => ({ account_id: r.account_id, message_text: r.message_text ?? "" }))
+            .filter(r => r.message_text);
+          if (sentForMonitor.length > 0) {
+            monitorPositions(
+              group.telegram_chat_id!,
+              sentForMonitor,
+              schedule.id,
+              detectedAt,
+              "closed"
+            ).catch(err => console.error("[closed-listen] Erro no monitor:", err.message));
           }
 
-          if (lastRestricted === null) {
-            // Primeira leitura — só loga estado inicial
-            console.log(
-              `[closed-listen] Estado inicial: ${restricted ? "🔒 fechado" : "🔓 já aberto"} ` +
-              `— ${group.telegram_chat_id}`
-            );
-          }
-
-          if (!restricted && !ctrl.signal.aborted) {
-            // Grupo abriu — dispara imediatamente
-            const detectedAt   = new Date();
-            const detectedMs   = detectedAt.getTime();
-            const scheduleMs   = new Date(schedule.next_run_at).getTime();
-            const openedAfterMs = detectedMs - scheduleMs; // ms após o horário programado
-
-            console.log(
-              `[closed-listen] 🔓 ABERTURA DETECTADA\n` +
-              `  schedule_id  : ${schedule.id}\n` +
-              `  horário prog : ${schedule.next_run_at}\n` +
-              `  detectado em : ${detectedAt.toISOString()}\n` +
-              `  Δ abertura   : +${openedAfterMs}ms após horário programado`
-            );
-
-            listenMap.delete(group.id);
-
-            const alreadySent  = schedule.retry_until
-              ? await getAlreadySentIds(schedule)
-              : new Set<string>();
-
-            const dispatchStart = Date.now();
-            const results       = await dispatchToGroup(schedule, group, alreadySent);
-            const dispatchEndMs = Date.now();
-
-            // O que importa: detectedAt → fim do envio
-            // Esse é o tempo real que separa você do primeiro lugar
-            const totalMs   = dispatchEndMs - detectedMs;
-            const waitMs    = dispatchStart - detectedMs;  // detecção → início do dispatch
-            const sendMs    = dispatchEndMs - dispatchStart; // dispatch em si
-
-            const sentCount = results.filter(r => r.status === "sent").length;
-            const failCount = results.filter(r => r.status === "failed").length;
-
-            console.log(
-              `[closed-listen] ✅ DISPARO CONCLUÍDO\n` +
-              `  schedule_id      : ${schedule.id}\n` +
-              `  detectado em     : ${detectedAt.toISOString()}\n` +
-              `  detecção→dispatch: ${waitMs}ms\n` +
-              `  dispatch (envios): ${sendMs}ms\n` +
-              `  ──────────────────────────────\n` +
-              `  TOTAL abertura→fim: ${totalMs}ms  ← esse é o número\n` +
-              `  enviadas: ${sentCount} | falhas: ${failCount}`
-            );
-
-            const sentForMonitor = results
-              .filter(r => r.status === "sent")
-              .map(r => ({ account_id: r.account_id, message_text: r.message_text ?? "" }))
-              .filter(r => r.message_text);
-            if (sentForMonitor.length > 0) {
-              monitorPositions(
-                group.telegram_chat_id!,
-                sentForMonitor,
-                schedule.id,
-                detectedAt,  // janela começa no momento da abertura
-                "closed"
-              ).catch(err => console.error("[closed-listen] Erro no monitor:", err.message));
-            }
-
-            await updateScheduleAfterDispatch(schedule, results, detectedAt);
-            return;
-          }
-
-          lastRestricted = restricted;
-          // Restaura poll normal após eventual fallback
-          if (pollMs !== CLOSED_GROUP_POLL_MS) pollMs = CLOSED_GROUP_POLL_MS;
+          await updateScheduleAfterDispatch(schedule, allResults, detectedAt);
+          return;
 
         } catch (err: any) {
           if (ctrl.signal.aborted) return;
 
+          const errMsg = String(err?.message ?? "");
+
+          // Grupo ainda fechado — erro esperado, continua tentando
+          if (
+            errMsg.includes("CHAT_WRITE_FORBIDDEN") ||
+            errMsg.includes("USER_BANNED_IN_CHANNEL") ||
+            errMsg.includes("CHAT_SEND_PLAIN_FORBIDDEN")
+          ) {
+            // Silencioso — só loga de 500 em 500 tentativas para não poluir
+            if (attempts % 500 === 0) {
+              console.log(`[closed-listen] 🔒 Ainda fechado — ${attempts} tentativas (${schedule.id})`);
+            }
+            const elapsed = Date.now() - loopStart;
+            const wait    = Math.max(0, CLOSED_GROUP_POLL_MS - elapsed);
+            if (wait > 0) await new Promise(r => setTimeout(r, wait));
+            continue;
+          }
+
+          // FloodWait — pausa obrigatória
           const isFlood =
             err?.seconds != null ||
             err?.constructor?.name === "FloodWaitError" ||
-            /flood/i.test(String(err?.message ?? ""));
+            /flood/i.test(errMsg);
 
           if (isFlood) {
-            // Flood no polling de verificação — cai para fallback e continua
-            pollMs = CLOSED_GROUP_POLL_FLOOD_FALLBACK_MS;
-            const waitSecs: number = typeof err.seconds === "number"
+            const waitSecs = typeof err.seconds === "number"
               ? err.seconds
-              : parseInt(String(err?.message ?? "").match(/(\d+)/)?.[1] ?? "1", 10);
-            console.warn(
-              `[closed-listen] FloodWait ${waitSecs}s no polling — ` +
-              `fallback para ${CLOSED_GROUP_POLL_FLOOD_FALLBACK_MS}ms`
-            );
+              : parseInt(errMsg.match(/(\d+)/)?.[1] ?? "1", 10);
+            console.warn(`[closed-listen] ⚠ FloodWait ${waitSecs}s — pausando (${schedule.id})`);
             await new Promise(r => setTimeout(r, Math.min(waitSecs * 1000, deadline - Date.now())));
             continue;
           }
 
-          // Erro transitório (network, timeout) — tenta reconectar e re-resolve peer
-          console.warn(`[closed-listen] Erro no poll (${schedule.id}): ${err.message}`);
-          try {
-            if (!client.connected) {
-              await getClient(account);
-            }
-            // Re-resolve peer após reconexão — accessHash pode ter mudado
-            peer = await resolvePeer(client, String(group.telegram_chat_id!), account.id);
-          } catch {}
-        }
+          // Erro de peer — re-resolve e continua
+          if (errMsg.includes("PEER_ID_INVALID") || errMsg.includes("CHANNEL_INVALID")) {
+            try {
+              probePeer = await resolvePeer(probeClient!, String(group.telegram_chat_id!), probeAccount.id);
+            } catch {}
+            continue;
+          }
 
-        // Espera o restante do intervalo descontando o tempo gasto na chamada
-        const elapsed = Date.now() - loopStart;
-        const wait    = Math.max(0, pollMs - elapsed);
-        if (wait > 0 && !ctrl.signal.aborted) {
-          await new Promise(r => setTimeout(r, wait));
+          // Reconexão necessária
+          if (!probeClient!.connected) {
+            console.warn(`[closed-listen] Client desconectou — reconectando (${schedule.id})`);
+            try {
+              await getClient(probeAccount);
+              probePeer = await resolvePeer(probeClient!, String(group.telegram_chat_id!), probeAccount.id);
+            } catch {}
+            continue;
+          }
+
+          // Erro desconhecido — loga e continua
+          console.warn(`[closed-listen] Erro inesperado na tentativa ${attempts}: ${errMsg}`);
+          const elapsed = Date.now() - loopStart;
+          const wait    = Math.max(0, CLOSED_GROUP_POLL_MS - elapsed);
+          if (wait > 0) await new Promise(r => setTimeout(r, wait));
         }
       }
 
