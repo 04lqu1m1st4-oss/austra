@@ -1,7 +1,29 @@
 // worker-flat.ts — dispatch worker Telegram, sem camadas de abstração
+//
 // Fix v1: firingNow Set previne duplo disparo quando reloadSchedules
 //         roda enquanto fireSchedule ainda está executando (race condition
 //         entre RETRY_BUDGET_MS=50s e RELOAD_INTERVAL_MS=30s)
+//
+// Fix v2 (2025-05):
+//   BUG #1 — reconnect loop infinito:
+//     _updateLoop substituído por receiveUpdates:false (flag nativa do GramJS).
+//     A supressão manual quebrava o fluxo de sync de estado pós-reconexão,
+//     causando "Not connected" em loop no _recvLoop.
+//
+//   BUG #2 — peerCache stale após reconexão:
+//     Ao desconectar/reconectar um account, todos os peers desse account
+//     são removidos do cache. accessHash gerado com sessão anterior é inválido.
+//
+//   BUG #3 — sem delay entre tentativas no sendMessage:
+//     Loop de retry sem espera causava dezenas de tentativas por segundo
+//     quando o client estava instável. Adicionado backoff exponencial
+//     (1s → 2s → 4s → 8s) entre tentativas.
+//
+//   BUG #4 — getDialogs warm-up não era awaited:
+//     getDialogs() disparado com .then() dentro de getClient() corria
+//     em paralelo com o primeiro resolvePeer(), que encontrava cache vazio
+//     e ia para a estratégia lenta (getDialogs de 200 itens) no caminho
+//     crítico. Warm-up movido para prewarmAccounts() com await.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -57,6 +79,9 @@ const MONITOR_HISTORY_LIMIT = 150;
 
 // Quanto tempo o listener de grupo aberto espera o sinal do admin antes de desistir
 const OPEN_GROUP_LISTEN_TIMEOUT_MS = 2 * 60 * 60_000; // 2 horas
+
+// FIX #3: Backoff máximo entre tentativas de envio (ms)
+const SEND_RETRY_BACKOFF_MAX_MS = 8_000;
 
 const WORKER_PORT   = parseInt(process.env.PORT ?? "3001", 10);
 const WORKER_SECRET = process.env.WORKER_SECRET ?? "";
@@ -119,7 +144,6 @@ interface DispatchResult {
 /* ─────────────────────────────────────────────────────────────────────────────
    ESTADO GLOBAL
    Tudo que precisa viver entre chamadas fica em Maps no topo.
-   Antes estava escondido dentro de TelegramClientPool (classe).
    ───────────────────────────────────────────────────────────────────────────── */
 
 // Conexões Telegram ativas: accountId → TelegramClient conectado
@@ -137,27 +161,19 @@ const keepaliveTimers = new Map<string, ReturnType<typeof setInterval>>();
 const peerCache = new Map<string, unknown>();
 
 // Cache de contas do banco: accountId → Account
-// Preenchido no prewarm e atualizado via /reload. Evita joins repetidos.
 const accountCache = new Map<string, Account>();
 
 // Timers de disparo agendado: scheduleId → setTimeout handle
-// Usado para detectar se um schedule já tem timer ativo e evitar duplicatas
 const scheduledTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 // Listeners de grupos abertos: groupId → AbortController
-// Permite cancelar um listener em andamento (ex: quando o retry expira)
 const listenMap = new Map<string, AbortController>();
 
-// FIX: schedules atualmente em execução.
-// Resolve o bug de duplo disparo: quando fireSchedule demora mais de
-// RELOAD_INTERVAL_MS (30s), o reloadSchedules tentava disparar de novo
-// porque scheduledTimers não tinha o ID (foi deletado ao iniciar) e
-// last_attempt_at no banco ainda era antigo (update só ocorre no final).
+// FIX v1: schedules atualmente em execução — previne duplo disparo
 const firingNow = new Set<string>();
 
 /* ─────────────────────────────────────────────────────────────────────────────
    QUERY REUTILIZADA
-   Seleciona o schedule com todos os dados relacionados em um único join.
    ───────────────────────────────────────────────────────────────────────────── */
 const SCHEDULE_SELECT = `
   id, cron_expression, user_id, group_id, next_run_at,
@@ -173,11 +189,9 @@ const SCHEDULE_SELECT = `
 `.trim();
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   HELPERS PUROS (sem side effects)
+   HELPERS PUROS
    ───────────────────────────────────────────────────────────────────────────── */
 
-// Erros de autenticação morta não valem retry — a sessão precisa ser
-// renovada manualmente. Qualquer outro erro (flood, timeout, rede) é retryável.
 function isRetryableError(msg: string): boolean {
   const u = msg.toUpperCase();
   return !u.includes("AUTH_KEY_UNREGISTERED") &&
@@ -185,14 +199,11 @@ function isRetryableError(msg: string): boolean {
          !u.includes("SESSION_REVOKED");
 }
 
-// Calcula o próximo horário semanal a partir de um cron simplificado.
-// Só suporta o subconjunto "minuto hora * * dia_da_semana" (5 campos).
-// Exemplos: "30 14 * * 2" = toda terça às 14:30 UTC
 function nextWeeklyOccurrence(cron: string): string {
   const parts = cron.trim().split(/\s+/);
   const mi    = parseInt(parts[0], 10);
   const h     = parseInt(parts[1], 10);
-  const dow   = parseInt(parts[4], 10); // 0=domingo, 6=sábado
+  const dow   = parseInt(parts[4], 10);
 
   if (
     parts.length < 5 ||
@@ -205,8 +216,6 @@ function nextWeeklyOccurrence(cron: string): string {
   const now = new Date();
   let daysUntil = (dow - now.getUTCDay() + 7) % 7;
 
-  // Se é o mesmo dia da semana, verifica se o horário já passou.
-  // Se passou, agenda para daqui 7 dias.
   if (daysUntil === 0) {
     const nowMins  = now.getUTCHours() * 60 + now.getUTCMinutes();
     const targMins = h * 60 + mi;
@@ -219,14 +228,10 @@ function nextWeeklyOccurrence(cron: string): string {
   return next.toISOString();
 }
 
-// Backoff exponencial com teto: base * 2^count, limitado a max.
-// count=0 → base, count=1 → 2*base, count=2 → 4*base, ...
 function calcRetryInterval(count: number, base: number, max: number): number {
   return Math.min(base * Math.pow(2, count), max);
 }
 
-// Verifica se já é hora de tentar de novo, comparando last_attempt_at
-// com o intervalo calculado pelo backoff.
 function isRetryDue(schedule: Schedule, now: Date): boolean {
   if (!schedule.last_attempt_at) return true;
   const last     = new Date(schedule.last_attempt_at);
@@ -239,14 +244,24 @@ function isRetryDue(schedule: Schedule, now: Date): boolean {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   GERENCIAMENTO DE CONEXÕES TELEGRAM
-   Antes era a classe TelegramClientPool com métodos get/reload/prewarm/_evict.
-   Agora são funções soltas operando nos Maps globais acima.
+   HELPERS INTERNOS DE PEER CACHE
    ───────────────────────────────────────────────────────────────────────────── */
 
-// Retorna um client Telegram conectado para a conta.
-// Reutiliza o existente se já conectado e com a mesma sessão.
-// Reconecta automaticamente se a sessão mudou ou o client caiu.
+// FIX #2: Limpa todos os peers de um account do cache.
+// Chamado sempre que o client é desconectado/reconectado, porque
+// o accessHash do peer é vinculado à sessão anterior e fica inválido.
+function evictPeersForAccount(accountId: string): void {
+  for (const key of peerCache.keys()) {
+    if (key.startsWith(`${accountId}:`)) {
+      peerCache.delete(key);
+    }
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   GERENCIAMENTO DE CONEXÕES TELEGRAM
+   ───────────────────────────────────────────────────────────────────────────── */
+
 async function getClient(account: Account): Promise<TelegramClient> {
   const existing      = clients.get(account.id);
   const sessionInUse  = sessions.get(account.id);
@@ -254,10 +269,11 @@ async function getClient(account: Account): Promise<TelegramClient> {
 
   if (existing?.connected && !sessionChanged) return existing;
 
-  // Se existe mas está morto ou a sessão mudou, derruba e reconecta
   if (existing) {
     try { await existing.disconnect(); } catch {}
     clients.delete(account.id);
+    // FIX #2: limpa peers do account ao desconectar
+    evictPeersForAccount(account.id);
     const t = keepaliveTimers.get(account.id);
     if (t) { clearInterval(t); keepaliveTimers.delete(account.id); }
   }
@@ -272,35 +288,37 @@ async function getClient(account: Account): Promise<TelegramClient> {
       autoReconnect: true,
       floodSleepThreshold: 60,
       requestRetries: 3,
+      // FIX #1: Usar receiveUpdates:false em vez de monkeypatchar _updateLoop.
+      // A supressão manual de _updateLoop impedia a sincronização de estado
+      // após reconexão, causando o loop "Not connected" → reconnect → "Not connected".
+      // receiveUpdates:false é a flag nativa do GramJS para desativar o update loop
+      // sem interferir no fluxo de reconexão.
+      receiveUpdates: false,
     }
   );
 
-  // Desativa o update loop padrão do GramJS.
-  // Não precisamos receber updates em tempo real (usamos polling manual),
-  // e o loop consome recursos e pode causar reconexões desnecessárias.
-  (client as any)._updateLoop = () => Promise.resolve();
+  // REMOVIDO: (client as any)._updateLoop = () => Promise.resolve();
+  // Era a causa raiz do reconnect loop (Bug #1).
 
   await client.connect();
-
-  // Warm-up em background: sincroniza os dialogs do Telegram.
-  // Isso popula o cache interno do GramJS com os peers dos grupos,
-  // acelerando resolvePeer nas próximas chamadas.
-  client.getDialogs({ limit: 100 }).then(() => {
-    console.log(`[client] ✓ Dialogs warm-up: ${account.phone_number}`);
-  }).catch((err: any) => {
-    console.warn(`[client] Dialogs warm-up falhou para ${account.phone_number}: ${err.message}`);
-  });
 
   clients.set(account.id, client);
   sessions.set(account.id, account.session_string);
 
+  // FIX #4: getDialogs NÃO é chamado aqui.
+  // Antes ficava aqui como .then() (fire-and-forget), correndo em paralelo
+  // com o primeiro resolvePeer(). Isso causava cache miss na estratégia 1
+  // (getInputEntity) e forçava a estratégia 3 (getDialogs 200 itens) no
+  // caminho crítico de disparo.
+  // O warm-up agora é feito em prewarmAccounts() com await, antes de qualquer disparo.
+
   // Keepalive: pinga a conta a cada 45s para manter a conexão viva.
-  // O Telegram fecha conexões ociosas após alguns minutos.
-  // Se o ping falhar, remove do pool para forçar reconexão no próximo uso.
   const interval = setInterval(async () => {
     if (!client.connected) {
       console.warn(`[keepalive] ${account.phone_number} desconectou — removendo do pool`);
       clients.delete(account.id);
+      // FIX #2: limpa peers ao detectar desconexão no keepalive
+      evictPeersForAccount(account.id);
       keepaliveTimers.delete(account.id);
       clearInterval(interval);
       return;
@@ -316,11 +334,11 @@ async function getClient(account: Account): Promise<TelegramClient> {
       console.warn(`[keepalive] Ping falhou para ${account.phone_number}: ${err.message}`);
       try { await client.disconnect(); } catch {}
       clients.delete(account.id);
+      // FIX #2: limpa peers ao detectar falha no keepalive
+      evictPeersForAccount(account.id);
       keepaliveTimers.delete(account.id);
       clearInterval(interval);
 
-      // Sessões mortas (ban, logout remoto) nunca vão funcionar novamente.
-      // Desativa no banco para não desperdiçar recursos tentando reconectar.
       const authDead =
         err.message?.includes("AUTH_KEY_UNREGISTERED") ||
         err.message?.includes("USER_DEACTIVATED") ||
@@ -339,13 +357,13 @@ async function getClient(account: Account): Promise<TelegramClient> {
   return client;
 }
 
-// Força reconexão descartando o client atual.
-// Chamado pela rota HTTP /reload quando a sessão foi atualizada no banco.
 async function reloadClient(account: Account): Promise<TelegramClient> {
   const existing = clients.get(account.id);
   if (existing) {
     try { await existing.disconnect(); } catch {}
     clients.delete(account.id);
+    // FIX #2: limpa peers ao fazer reload manual
+    evictPeersForAccount(account.id);
     const t = keepaliveTimers.get(account.id);
     if (t) { clearInterval(t); keepaliveTimers.delete(account.id); }
   }
@@ -354,10 +372,6 @@ async function reloadClient(account: Account): Promise<TelegramClient> {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    RESOLUÇÃO DE PEER TELEGRAM
-   Um "peer" é o identificador que o MTProto usa internamente para um chat.
-   O ID numérico que temos no banco não é diretamente aceito — precisa ser
-   "resolvido" para um InputPeer com accessHash.
-   Tentamos 3 estratégias em ordem de custo crescente.
    ───────────────────────────────────────────────────────────────────────────── */
 async function resolvePeer(
   client: TelegramClient,
@@ -371,7 +385,7 @@ async function resolvePeer(
   if (isNaN(chatIdNum)) throw new Error(`telegram_chat_id inválido: "${telegramChatId}"`);
 
   // Estratégia 1: getInputEntity — usa o cache interno do GramJS.
-  // Funciona se o cliente já sincronizou os dialogs (warm-up acima).
+  // Funciona se o cliente já sincronizou os dialogs (warm-up em prewarmAccounts).
   try {
     const peer = await client.getInputEntity(chatIdNum);
     peerCache.set(key, peer);
@@ -379,9 +393,6 @@ async function resolvePeer(
   } catch {}
 
   // Estratégia 2: GetChannels via MTProto direto.
-  // IDs de supergrupos/canais seguem o padrão -100XXXXXXXXXX.
-  // Subtraímos 1_000_000_000_000 para obter o channelId real.
-  // O accessHash=0 funciona para canais públicos.
   const absId     = Math.abs(chatIdNum);
   const channelId = absId > 1_000_000_000_000 ? absId - 1_000_000_000_000 : absId;
   try {
@@ -399,8 +410,8 @@ async function resolvePeer(
   } catch {}
 
   // Estratégia 3: sincroniza todos os dialogs e tenta de novo.
-  // Mais lento (pode levar alguns segundos), mas resolve casos onde
-  // a conta é membro mas o grupo não estava nos dialogs em cache.
+  // Mais lento, mas resolve casos onde a conta é membro mas o grupo
+  // não estava nos dialogs em cache.
   await client.getDialogs({ limit: 200 });
   try {
     const peer = await client.getInputEntity(chatIdNum);
@@ -416,9 +427,6 @@ async function resolvePeer(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    ENVIO COM RETRY INTERNO
-   Tenta enviar a mensagem repetidamente dentro de um budget de tempo (50s).
-   Cada tentativa tem um timeout próprio (15s).
-   Trata FloodWait (Telegram rate limit) esperando o tempo indicado.
    ───────────────────────────────────────────────────────────────────────────── */
 async function sendMessage(
   client: TelegramClient,
@@ -443,7 +451,6 @@ async function sendMessage(
           } catch (err: any) {
             const errMsg = String(err?.message ?? "");
 
-            // Peer inválido: limpa do cache para forçar nova resolução na próxima tentativa
             if (
               errMsg.includes("PEER_ID_INVALID") ||
               errMsg.includes("CHANNEL_INVALID") ||
@@ -452,9 +459,6 @@ async function sendMessage(
               peerCache.delete(`${account.id}:${telegramChatId}`);
             }
 
-            // FloodWait: o Telegram pediu para esperar N segundos antes de enviar de novo.
-            // Se o tempo de espera cabe no budget restante, esperamos e tentamos de novo.
-            // Caso contrário, jogamos o erro para cima.
             const isFlood =
               err?.seconds != null ||
               err?.constructor?.name === "FloodWaitError" ||
@@ -473,7 +477,7 @@ async function sendMessage(
                 peerCache.delete(`${account.id}:${telegramChatId}`);
                 const freshPeer = await resolvePeer(client, telegramChatId, account.id);
                 await client.sendMessage(freshPeer as any, { message: messageText });
-                return; // sucesso após FloodWait
+                return;
               }
               throw new Error(`FLOOD_WAIT_${waitSecs}_EXCEEDS_BUDGET`);
             }
@@ -481,7 +485,6 @@ async function sendMessage(
             throw err;
           }
         })(),
-        // Race com timeout por tentativa: se demorar mais de 15s, cancela e tenta de novo
         new Promise<never>((_, r) =>
           setTimeout(
             () => r(new Error(`TIMEOUT tentativa ${attempt}`)),
@@ -490,14 +493,24 @@ async function sendMessage(
         ),
       ]);
 
-      // Chegou aqui = enviou com sucesso
       if (attempt > 1) console.log(`[send] ✓ ${account.phone_number} — enviou na tentativa ${attempt}`);
       return;
 
     } catch (err: any) {
       const remaining = budgetEnd - Date.now();
       if (remaining > 500) {
-        console.warn(`[send] tentativa ${attempt} falhou (${Math.round(remaining / 1000)}s restantes): ${err.message}`);
+        // FIX #3: backoff exponencial entre tentativas.
+        // Antes: tentava de novo imediatamente → dezenas de req/s com client instável.
+        // Agora: 1s → 2s → 4s → 8s (teto), sempre respeitando o budget restante.
+        const backoffMs = Math.min(1_000 * Math.pow(2, attempt - 1), SEND_RETRY_BACKOFF_MAX_MS);
+        const safeBackoff = Math.min(backoffMs, remaining - 500);
+        console.warn(
+          `[send] tentativa ${attempt} falhou — aguardando ${safeBackoff}ms ` +
+          `(${Math.round(remaining / 1000)}s restantes): ${err.message}`
+        );
+        if (safeBackoff > 0) {
+          await new Promise(r => setTimeout(r, safeBackoff));
+        }
       }
     }
   }
@@ -507,13 +520,8 @@ async function sendMessage(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    DEDUPLICAÇÃO
-   Antes de enviar, verifica quais accounts já enviaram neste ciclo.
-   Um "ciclo" começa em next_run_at e termina em retry_until (ou agora,
-   se não houve falha). Evita reenviar em caso de retry parcial.
    ───────────────────────────────────────────────────────────────────────────── */
 async function getAlreadySentIds(schedule: Schedule): Promise<Set<string>> {
-  // O início do ciclo é: retry_until - retry_window_seconds.
-  // Se não há retry_until, o ciclo começou em next_run_at.
   const cycleStart = schedule.retry_until
     ? new Date(
         new Date(schedule.retry_until).getTime() - schedule.retry_window_seconds * 1000
@@ -529,16 +537,13 @@ async function getAlreadySentIds(schedule: Schedule): Promise<Set<string>> {
 
   if (error) {
     console.warn(`[dedup] Falha ao buscar enviados do schedule ${schedule.id}:`, error.message);
-    return new Set(); // em caso de falha, não bloqueia o envio
+    return new Set();
   }
   return new Set((data ?? []).map(r => r.account_id as string));
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
    MONITORAMENTO DE POSIÇÃO
-   Após o envio, lê o histórico do chat para saber em qual posição cada
-   mensagem apareceu (ranking por chegada). Salva position_rank no log.
-   Isso é feito em background — não bloqueia o fluxo principal.
    ───────────────────────────────────────────────────────────────────────────── */
 async function monitorPositions(
   telegramChatId: string,
@@ -549,21 +554,18 @@ async function monitorPositions(
 ): Promise<void> {
   if (sentMembers.length === 0) return;
 
-  // Usa a primeira conta que enviou para ler o histórico
   const account = accountCache.get(sentMembers[0].account_id);
   if (!account) { console.warn("[monitor] Conta não encontrada no cache — ignorando"); return; }
 
   const client = await getClient(account).catch(() => null);
   if (!client) { console.warn("[monitor] Sem client — ignorando monitoramento"); return; }
 
-  // Janela: 15s antes do disparo até agora (margem para mensagens pré-existentes)
   const windowStartUnix = Math.floor((dispatchedAt.getTime() - 15_000) / 1000);
   const deadline        = Date.now() + (groupType === "closed"
     ? MONITOR_DELAY_CLOSED_MS + 10_000
     : MONITOR_MAX_OPEN_MS);
   const ourTexts = new Set(sentMembers.map(m => m.message_text).filter(Boolean));
 
-  // Grupos fechados: aguarda alguns segundos para o Telegram processar a ordem
   if (groupType === "closed") await new Promise(r => setTimeout(r, MONITOR_DELAY_CLOSED_MS));
 
   console.log(`[monitor] Iniciando para schedule ${scheduleId} (${groupType})`);
@@ -580,10 +582,9 @@ async function monitorPositions(
         })
       ) as any;
 
-      // Filtra mensagens dentro da janela de tempo, em ordem cronológica
       const windowMsgs = (result.messages ?? [])
         .filter((m: any) => m._ === "message" && m.date >= windowStartUnix)
-        .reverse(); // GetHistory retorna do mais novo para o mais antigo
+        .reverse();
 
       if (windowMsgs.length === 0) {
         if (groupType === "closed") {
@@ -594,19 +595,17 @@ async function monitorPositions(
         continue;
       }
 
-      // Grupos abertos: espera até nossas mensagens aparecerem no histórico
       if (groupType === "open" && !windowMsgs.some((m: any) => ourTexts.has(m.message))) {
         await new Promise(r => setTimeout(r, MONITOR_POLL_MS));
         continue;
       }
 
-      // Para cada membro que enviou, encontra a posição no histórico e salva
       const cutoff = new Date(dispatchedAt.getTime() - 60_000).toISOString();
       await Promise.allSettled(sentMembers.map(sm => {
         if (!sm.message_text) return;
         const idx = windowMsgs.findIndex((m: any) => m.message === sm.message_text);
         if (idx < 0) return;
-        const rank = idx + 1; // posição 1-indexed no chat
+        const rank = idx + 1;
         console.log(`[monitor] ${sm.account_id}: posição #${rank} em ${telegramChatId}`);
         return supabase.from("dispatch_logs")
           .update({ position_rank: rank })
@@ -631,15 +630,8 @@ async function monitorPositions(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    LISTENER DE GRUPO ABERTO
-   Grupos "open" não disparam no horário — ficam aguardando um sinal do admin
-   no chat (mensagem "ok" ou qualquer mídia). Quando o sinal chega, envia
-   as mensagens de todos os membros e atualiza o schedule.
-
-   O listener roda em background (IIFE async sem await no chamador).
-   É cancelável via AbortController (listenMap).
    ───────────────────────────────────────────────────────────────────────────── */
 function startGroupListener(schedule: Schedule, group: Group, account: Account): void {
-  // Cancela listener anterior do mesmo grupo, se existir
   const existing = listenMap.get(group.id);
   if (existing) existing.abort();
 
@@ -647,8 +639,8 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
   listenMap.set(group.id, ctrl);
 
   const deadline    = Date.now() + OPEN_GROUP_LISTEN_TIMEOUT_MS;
-  const startUnix   = Math.floor((Date.now() - 10_000) / 1000); // 10s de margem
-  let lastSeenMsgId = 0; // evita reprocessar mensagens já vistas
+  const startUnix   = Math.floor((Date.now() - 10_000) / 1000);
+  let lastSeenMsgId = 0;
 
   console.log(`[listen] 👂 Aguardando sinal do admin em ${group.telegram_chat_id} para schedule ${schedule.id}`);
 
@@ -661,12 +653,10 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
         return;
       }
 
-      // Pré-resolve o peer para não atrasar o primeiro poll
       try { await resolvePeer(client, group.telegram_chat_id!, account.id); } catch {}
 
       while (Date.now() < deadline && !ctrl.signal.aborted) {
         try {
-          // Reconecta se o client caiu durante a espera
           if (!client.connected) {
             console.warn(`[listen] Client desconectou — reconectando para ${schedule.id}`);
             client = await getClient(account);
@@ -682,7 +672,6 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
             })
           ) as any;
 
-          // Filtra mensagens novas (posteriores ao início do listener e não vistas antes)
           const recentMsgs = (result.messages ?? []).filter(
             (m: any) =>
               (m.className === "Message" || m._ === "message") &&
@@ -693,7 +682,6 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
             lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
           }
 
-          // Sinal válido: mensagem de texto "ok" (case-insensitive) OU qualquer mídia
           const gotSignal = recentMsgs.some((m: any) => {
             const isOk    = typeof m.message === "string" && m.message.trim().toLowerCase() === "ok";
             const isMedia = m.media != null && m.media.className !== "MessageMediaEmpty";
@@ -708,7 +696,6 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
             const alreadySent  = await getAlreadySentIds(schedule);
             const results      = await dispatchToGroup(schedule, group, alreadySent);
 
-            // Monitoramento de posição em background
             const sentForMonitor = results
               .filter(r => r.status === "sent")
               .map(r => ({ account_id: r.account_id, message_text: r.message_text ?? "" }))
@@ -739,7 +726,6 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
         return;
       }
 
-      // Timeout de 2h: nenhum sinal chegou. Avança para próxima semana.
       console.warn(`[listen] ⏰ Timeout 2h — nenhum sinal para schedule ${schedule.id}`);
       const nowISO = new Date().toISOString();
       let nextRun: string;
@@ -767,19 +753,12 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
 
 /* ─────────────────────────────────────────────────────────────────────────────
    DESPACHO PARA O GRUPO
-   Envia a mensagem de cada membro ativo em paralelo.
-   Retorna o resultado de cada envio para que fireSchedule decida
-   se foi sucesso total ou se precisa agendar retry.
-
-   Antes estava dividido em processMembersOf + trySendMember (dois níveis).
-   Agora é uma única função.
    ───────────────────────────────────────────────────────────────────────────── */
 async function dispatchToGroup(
   schedule: Schedule,
   group: Group,
   alreadySent: Set<string>
 ): Promise<DispatchResult[]> {
-  // Filtra membros ativos com conta válida, ordenados por posição configurada
   const members = (group.group_members ?? [])
     .filter(m => m.is_active && m.accounts?.is_active && m.accounts?.session_string)
     .sort((a, b) => a.position - b.position);
@@ -788,8 +767,6 @@ async function dispatchToGroup(
     const account      = member.accounts!;
     const positionRank = i + 1;
 
-    // Deduplicação: se essa conta já enviou neste ciclo (mesmo que em execução anterior),
-    // pula sem enviar de novo
     if (alreadySent.has(account.id)) {
       console.log(`[dispatch] ↷ ${account.phone_number} — já enviou neste ciclo`);
       return {
@@ -808,7 +785,7 @@ async function dispatchToGroup(
       const client = await getClient(account);
       await sendMessage(client, account, group.telegram_chat_id!, member.message_text ?? "");
       status = "sent";
-      alreadySent.add(account.id); // marca para dedup dentro desta mesma execução
+      alreadySent.add(account.id);
       console.log(`[dispatch] ✓ ${account.phone_number}`);
     } catch (err) {
       error     = err instanceof Error ? err.message : String(err);
@@ -818,7 +795,6 @@ async function dispatchToGroup(
       );
     }
 
-    // Insere log em background — não bloqueia o caminho crítico de envio
     supabase.from("dispatch_logs").insert({
       user_id:             schedule.user_id,
       group_id:            group.id,
@@ -841,10 +817,6 @@ async function dispatchToGroup(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    ATUALIZAÇÃO DO SCHEDULE APÓS DISPARO
-   Decide se o ciclo foi bem-sucedido (avança para próxima semana) ou
-   se precisa de retry (agenda nova tentativa com backoff exponencial).
-
-   Extraída de fireSchedule e startGroupListener para não duplicar lógica.
    ───────────────────────────────────────────────────────────────────────────── */
 async function updateScheduleAfterDispatch(
   schedule: Schedule,
@@ -858,8 +830,6 @@ async function updateScheduleAfterDispatch(
   const retryableFails = results.filter(r => r.status === "failed" && r.retryable);
   const permanentFails = results.filter(r => r.status === "failed" && !r.retryable);
 
-  // Considera sucesso se: há membros ativos, sem falhas retryáveis,
-  // sem falhas permanentes, e pelo menos um enviou ou foi pulado (já enviou antes)
   const hasActiveMembers = results.length > 0;
   const allOk =
     hasActiveMembers &&
@@ -877,7 +847,6 @@ async function updateScheduleAfterDispatch(
       return;
     }
 
-    // Update em background — as mensagens já foram enviadas, isso não é crítico
     supabase.from("schedules").update({
       next_run_at:         nextRun,
       last_run_at:         nowISO,
@@ -895,8 +864,6 @@ async function updateScheduleAfterDispatch(
 
   } else {
     const newRetryCount = schedule.retry_count + 1;
-    // Se é a primeira falha do ciclo, define retry_until a partir de agora.
-    // Se já está em retry, mantém o retry_until original (janela não se expande).
     const retryUntil    = schedule.retry_until ??
       new Date(now.getTime() + schedule.retry_window_seconds * 1000).toISOString();
     const interval      = calcRetryInterval(
@@ -914,7 +881,6 @@ async function updateScheduleAfterDispatch(
       `${permanentFails.length} permanente(s). Retry #${newRetryCount} em ~${interval}s`
     );
 
-    // Aqui o update é awaited porque determina se/quando haverá próximo retry
     await supabase.from("schedules").update({
       retry_until:         retryUntil,
       retry_count:         newRetryCount,
@@ -924,7 +890,6 @@ async function updateScheduleAfterDispatch(
     }).eq("id", schedule.id);
 
     const retryAt = new Date(now.getTime() + interval * 1000);
-    // Só agenda retry se ainda cabe dentro da janela
     if (retryAt < new Date(retryUntil)) {
       scheduleTimer(schedule.id, retryAt.toISOString());
     }
@@ -933,15 +898,8 @@ async function updateScheduleAfterDispatch(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    DISPARO DE SCHEDULE
-   Função central: busca os dados, decide o tipo de grupo e executa.
-   Protegida pelo firingNow Set contra execuções paralelas do mesmo ID.
    ───────────────────────────────────────────────────────────────────────────── */
 async function fireSchedule(scheduleId: string): Promise<void> {
-  // FIX: Proteção contra duplo disparo.
-  // Sem isso: reloadSchedules rodava a cada 30s e, se fireSchedule ainda estivesse
-  // executando (pode demorar até 50s por membro), disparava uma segunda vez porque
-  // scheduledTimers não tinha mais o ID (deletado ao iniciar) e last_attempt_at
-  // no banco ainda estava desatualizado (é gravado só no final).
   if (firingNow.has(scheduleId)) {
     console.warn(`[fire] Schedule ${scheduleId} já em execução — ignorando disparo duplicado`);
     return;
@@ -951,7 +909,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
   try {
     const now = new Date();
 
-    // Busca o schedule com todos os dados relacionados em um único join
     const { data, error } = await supabase
       .from("schedules")
       .select(SCHEDULE_SELECT)
@@ -972,8 +929,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       return;
     }
 
-    // Substitui os dados de conta pelo cache local, que é mais fresco que o join do banco
-    // (o /reload atualiza o accountCache sem precisar recarregar todos os schedules)
     if (group.group_members) {
       group.group_members = group.group_members.map(m => ({
         ...m,
@@ -983,8 +938,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
     console.log(`[fire] ⚡ Disparando schedule ${scheduleId} às ${now.toISOString()}`);
 
-    // ── Grupos ABERTOS: inicia listener e retorna imediatamente ──────────────
-    // O envio só ocorre quando o admin mandar o sinal no chat.
     if (group.group_type === "open") {
       if (listenMap.has(group.id)) {
         console.log(`[fire] Listener já ativo para grupo ${group.id} — ignorando`);
@@ -1002,7 +955,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
       startGroupListener(schedule, group, firstAccount as Account);
 
-      // Marca no banco que estamos aguardando, com janela de 2h
       await supabase.from("schedules").update({
         retry_until:         new Date(now.getTime() + OPEN_GROUP_LISTEN_TIMEOUT_MS).toISOString(),
         last_attempt_at:     now.toISOString(),
@@ -1012,9 +964,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       return;
     }
 
-    // ── Grupos FECHADOS: envia imediatamente ─────────────────────────────────
-    // Em ciclos frescos (retry_until é null) não há nada enviado ainda —
-    // pula a query de dedup para economizar ~100ms no caminho crítico.
     const alreadySent = schedule.retry_until
       ? await getAlreadySentIds(schedule)
       : new Set<string>();
@@ -1025,7 +974,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
     const results = await dispatchToGroup(schedule, group, alreadySent);
 
-    // Monitora posições em background (não bloqueia atualização do schedule)
     const sentForMonitor = results
       .filter(r => r.status === "sent")
       .map(r => ({ account_id: r.account_id, message_text: r.message_text ?? "" }))
@@ -1043,39 +991,27 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     await updateScheduleAfterDispatch(schedule, results, now);
 
   } finally {
-    // Sempre remove do Set, mesmo em caso de exceção
     firingNow.delete(scheduleId);
   }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
    TIMER DE PRECISÃO
-   Calcula o delay até next_run_at e cria um setTimeout.
-   Registra em scheduledTimers para que reloadSchedules saiba que
-   já existe um timer ativo e não crie um segundo.
    ───────────────────────────────────────────────────────────────────────────── */
 function scheduleTimer(scheduleId: string, nextRunAt: string): void {
   const delay = new Date(nextRunAt).getTime() - Date.now();
 
-  // Schedules muito no passado (>5s) são ignorados.
-  // Isso acontece quando next_run_at já passou e o worker estava offline.
-  // O reloadSchedules vai detectar e tratar esses casos separadamente.
   if (delay < -5_000) {
     console.warn(`[timer] Schedule ${scheduleId} ignorado — muito no passado (${nextRunAt})`);
     return;
   }
 
-  // Cancela timer anterior se existir (evita timers duplicados ao reagendar)
-  const existing = scheduledTimers.get(scheduledTimers.has(scheduleId) ? scheduleId : "");
   const prev = scheduledTimers.get(scheduleId);
   if (prev) clearTimeout(prev);
 
   const effectiveDelay = Math.max(0, delay);
 
   const timer = setTimeout(async () => {
-    // Remove do Map antes de executar para que reloadSchedules possa
-    // detectar que não há timer (só relevante se fireSchedule falhar
-    // antes de criar o próximo timer)
     scheduledTimers.delete(scheduleId);
     try {
       await fireSchedule(scheduleId);
@@ -1092,21 +1028,16 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    RELOAD PERIÓDICO
-   Roda a cada 30s. Responsável por três coisas:
-   1. Detectar schedules futuros e criar timers para eles
-   2. Detectar schedules em retry que já é hora de tentar de novo
-   3. Detectar retries que expiraram e avançar para próxima semana
    ───────────────────────────────────────────────────────────────────────────── */
 async function reloadSchedules(): Promise<void> {
   const now          = new Date();
   const nowISO       = now.toISOString();
   const lookaheadISO = new Date(now.getTime() + LOOKAHEAD_MS).toISOString();
 
-  // Busca os três tipos de schedules em paralelo para minimizar latência
   const [
-    { data: futureSchedules },   // schedules normais que disparam nos próximos 2 min
-    { data: retrySchedules },    // schedules em retry (retry_until no futuro)
-    { data: expiredRetries },    // schedules em retry cujo prazo expirou
+    { data: futureSchedules },
+    { data: retrySchedules },
+    { data: expiredRetries },
   ] = await Promise.all([
     supabase.from("schedules")
       .select("id, next_run_at")
@@ -1127,11 +1058,9 @@ async function reloadSchedules(): Promise<void> {
       .lte("retry_until", nowISO),
   ]);
 
-  // ── 1. Retries expirados: desiste e avança para próxima semana ───────────
   await Promise.all((expiredRetries ?? []).map(async expired => {
     console.warn(`[reload] Schedule ${expired.id}: retry expirou sem sucesso. Avançando.`);
 
-    // Cancela listener de grupo aberto se estiver ativo
     const expGroupId = (expired as any).group_id as string | undefined;
     if (expGroupId) {
       const ctrl = listenMap.get(expGroupId);
@@ -1161,25 +1090,21 @@ async function reloadSchedules(): Promise<void> {
     scheduleTimer(expired.id, nextRun);
   }));
 
-  // ── 2. Schedules futuros: cria timers para os que ainda não têm ──────────
   for (const s of futureSchedules ?? []) {
     if (!scheduledTimers.has(s.id)) {
       scheduleTimer(s.id, s.next_run_at);
     }
   }
 
-  // ── 3. Schedules em retry: dispara agora se for a hora ───────────────────
   for (const s of retrySchedules ?? []) {
     const schedule = s as unknown as Schedule;
 
-    // Se há um listener ativo para o grupo (grupo aberto aguardando admin), não interfere
     if (listenMap.has(schedule.group_id)) continue;
 
-    // FIX: verifica firingNow além de scheduledTimers
     if (
       isRetryDue(schedule, now) &&
       !scheduledTimers.has(schedule.id) &&
-      !firingNow.has(schedule.id)  // ← proteção contra duplo disparo
+      !firingNow.has(schedule.id)
     ) {
       console.log(`[reload] Schedule ${schedule.id} em retry — disparando agora.`);
       fireSchedule(schedule.id).catch(err =>
@@ -1191,15 +1116,10 @@ async function reloadSchedules(): Promise<void> {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    PRE-WARM DE CONTAS
-   Ao iniciar (e periodicamente), conecta todas as contas ativas.
-   Objetivos:
-   - Ter os clients prontos antes do primeiro disparo (sem latência de conexão)
-   - Detectar e desativar sessões mortas antes de tentar enviar
-   - Popular o accountCache para que fireSchedule não precise ir ao banco
    ───────────────────────────────────────────────────────────────────────────── */
 let prewarmRunning = false;
 async function prewarmAccounts(): Promise<void> {
-  if (prewarmRunning) return; // evita execuções paralelas
+  if (prewarmRunning) return;
   prewarmRunning = true;
   try {
     const { data, error } = await supabase
@@ -1214,7 +1134,15 @@ async function prewarmAccounts(): Promise<void> {
 
     await Promise.allSettled(accounts.map(async account => {
       try {
-        await getClient(account);
+        const client = await getClient(account);
+
+        // FIX #4: getDialogs é awaited aqui, no prewarm, antes de qualquer disparo.
+        // Antes ficava dentro de getClient() como .then() (fire-and-forget),
+        // correndo em paralelo com o primeiro resolvePeer() e causando cache miss.
+        // Agora o warm-up completa antes de reloadSchedules() criar os timers.
+        await client.getDialogs({ limit: 100 });
+        console.log(`[prewarm] ✓ Dialogs prontos: ${account.phone_number}`);
+
       } catch (err: any) {
         const authDead =
           err.message?.includes("AUTH_KEY_UNREGISTERED") ||
@@ -1223,6 +1151,8 @@ async function prewarmAccounts(): Promise<void> {
         if (authDead) {
           console.warn(`[prewarm] Sessão morta: ${account.phone_number} — desativando.`);
           await supabase.from("accounts").update({ is_active: false }).eq("id", account.id);
+        } else {
+          console.warn(`[prewarm] Falha ao conectar ${account.phone_number}: ${err.message}`);
         }
       }
     }));
@@ -1233,8 +1163,6 @@ async function prewarmAccounts(): Promise<void> {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    HTTP SERVER — 5 ROTAS DE GERENCIAMENTO
-   Permite que o backend (Next.js/API) interaja com o worker em runtime
-   sem reiniciá-lo. Autenticado via header x-worker-secret.
    ───────────────────────────────────────────────────────────────────────────── */
 function jsonResponse(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -1249,8 +1177,6 @@ const httpServer = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://localhost:${WORKER_PORT}`);
 
   // ── GET /accounts/:id/chats ──────────────────────────────────────────────
-  // Lista todos os grupos e canais que a conta participa.
-  // Usado no frontend para o usuário escolher o telegram_chat_id do grupo.
   const chatsMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chats$/);
   if (req.method === "GET" && chatsMatch) {
     const account = accountCache.get(chatsMatch[1]);
@@ -1275,8 +1201,6 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   // ── GET /accounts/:id/chat-count?chat_id=XXXX ───────────────────────────
-  // Retorna o número de participantes de um chat.
-  // Tenta três estratégias em ordem de confiabilidade.
   const chatCountMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-count$/);
   if (req.method === "GET" && chatCountMatch) {
     const chatId  = url.searchParams.get("chat_id");
@@ -1289,7 +1213,6 @@ const httpServer = http.createServer(async (req, res) => {
       const rawId  = chatId.replace(/^-100/, "").replace(/^-/, "");
       let count: number | null = null;
 
-      // Estratégia 1: GetFullChannel (supergrupos e canais)
       try {
         const result = await client.invoke(
           new Api.channels.GetFullChannel({
@@ -1301,7 +1224,6 @@ const httpServer = http.createServer(async (req, res) => {
         }
       } catch {}
 
-      // Estratégia 2: dialog.entity (mais lento, mas funciona para qualquer tipo)
       if (count === null) {
         try {
           const dialogs = await client.getDialogs({ limit: 500 });
@@ -1324,7 +1246,6 @@ const httpServer = http.createServer(async (req, res) => {
         } catch {}
       }
 
-      // Estratégia 3: GetFullChat (grupos legados)
       if (count === null) {
         try {
           const full = await client.invoke(
@@ -1346,8 +1267,6 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   // ── GET /accounts/:id/chat-members?chat_id=XXXX ─────────────────────────
-  // Lista os participantes de um chat (sem bots).
-  // Usado para associar membros do Telegram a contas no sistema.
   const membersMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-members$/);
   if (req.method === "GET" && membersMatch) {
     const chatId  = url.searchParams.get("chat_id");
@@ -1363,7 +1282,6 @@ const httpServer = http.createServer(async (req, res) => {
       const isSupergroup = chatId.startsWith("-100");
       let members: MemberOut[] = [];
 
-      // Estratégia 1: GetParticipants (supergrupos/canais via MTProto)
       if (isSupergroup) {
         try {
           const dialogs = await client.getDialogs({ limit: 500 });
@@ -1394,7 +1312,6 @@ const httpServer = http.createServer(async (req, res) => {
         } catch {}
       }
 
-      // Estratégia 2: GetFullChat (grupos legados)
       if (members.length === 0) {
         try {
           const full     = await client.invoke(new Api.messages.GetFullChat({ chatId: bigInt(rawId) }));
@@ -1430,8 +1347,6 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   // ── POST /accounts/:id/reload ────────────────────────────────────────────
-  // Força reconexão de uma conta específica. Chamado quando a sessão
-  // é atualizada no banco (ex: re-login via QR code).
   const reloadMatch = url.pathname.match(/^\/accounts\/([^/]+)\/reload$/);
   if (req.method === "POST" && reloadMatch) {
     const accountId = reloadMatch[1];
@@ -1444,14 +1359,16 @@ const httpServer = http.createServer(async (req, res) => {
     if (error || !row) return jsonResponse(res, 404, { error: "Conta não encontrada" });
 
     const account = row as Account;
-    accountCache.set(accountId, account); // atualiza cache local
+    accountCache.set(accountId, account);
 
     if (!account.is_active || !account.session_string) {
       return jsonResponse(res, 200, { ok: true, skipped: true, reason: "conta inativa ou sem sessão" });
     }
 
     try {
-      await reloadClient(account);
+      const client = await reloadClient(account);
+      // FIX #4: warm-up dos dialogs após reload manual também
+      await client.getDialogs({ limit: 100 });
       console.log(`[http] /reload ✓ ${account.phone_number} recarregada`);
       return jsonResponse(res, 200, { ok: true });
     } catch (err: any) {
@@ -1461,9 +1378,6 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   // ── POST/DELETE /groups/:id/listen ──────────────────────────────────────
-  // POST: inicia listener manual para um grupo aberto.
-  //       Disparado pelo frontend quando o usuário ativa o modo de escuta.
-  // DELETE: cancela o listener ativo para o grupo.
   const listenMatch = url.pathname.match(/^\/groups\/([^/]+)\/listen$/);
   if (listenMatch) {
     const groupId = listenMatch[1];
@@ -1481,7 +1395,6 @@ const httpServer = http.createServer(async (req, res) => {
       const ctrl = new AbortController();
       listenMap.set(groupId, ctrl);
 
-      // Listener manual roda em background, mesma lógica do scheduled listener
       (async () => {
         try {
           const { data: grpRow } = await supabase
@@ -1511,7 +1424,7 @@ const httpServer = http.createServer(async (req, res) => {
           const account = accountCache.get(firstMember.accounts.id) ?? firstMember.accounts as unknown as Account;
           const client  = await getClient(account);
 
-          const deadline    = Date.now() + 2 * 60 * 60_000; // 2h
+          const deadline    = Date.now() + 2 * 60 * 60_000;
           const startUnix   = Math.floor((Date.now() - 10_000) / 1000);
           let lastSeenMsgId = 0;
 
@@ -1555,7 +1468,6 @@ const httpServer = http.createServer(async (req, res) => {
                   .eq("id", groupId)
                   .single();
 
-                // Cria um stub de Schedule para reutilizar dispatchToGroup
                 const scheduleStub = {
                   id:                         `manual-${groupId}-${Date.now()}`,
                   user_id:                    grpFull?.user_id ?? "",
@@ -1624,24 +1536,18 @@ httpServer.listen(WORKER_PORT, () => {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    GRACEFUL SHUTDOWN
-   Garante que não ficam timers, intervals ou conexões penduradas
-   quando o processo recebe SIGTERM (ex: deploy, restart do container).
    ───────────────────────────────────────────────────────────────────────────── */
 async function shutdown() {
   console.log("[worker] Encerrando...");
 
-  // Cancela todos os timers pendentes
   for (const t of scheduledTimers.values()) clearTimeout(t);
   scheduledTimers.clear();
 
-  // Para todos os keepalives
   for (const t of keepaliveTimers.values()) clearInterval(t);
   keepaliveTimers.clear();
 
-  // Para o servidor HTTP
   httpServer.close();
 
-  // Desconecta todos os clients Telegram
   await Promise.all([...clients.entries()].map(async ([id, client]) => {
     try { await client.disconnect(); } catch {}
     console.log(`[client] Desconectado: ${id}`);
@@ -1656,13 +1562,14 @@ process.on("SIGINT",  shutdown);
 /* ─────────────────────────────────────────────────────────────────────────────
    INICIALIZAÇÃO
    Sequência de boot:
-   1. prewarmAccounts: conecta todas as contas e popula accountCache
+   1. prewarmAccounts: conecta todas as contas, awaita getDialogs (FIX #4),
+      popula accountCache
    2. reloadSchedules: lê o banco e cria os timers iniciais
    3. setInterval: mantém o ciclo de reload a cada 30s
    ───────────────────────────────────────────────────────────────────────────── */
 async function init(): Promise<void> {
   console.log("[worker] Iniciando...");
-  await prewarmAccounts();
+  await prewarmAccounts();  // FIX #4: getDialogs awaited aqui antes de criar timers
   await reloadSchedules();
   setInterval(async () => {
     try { await Promise.allSettled([reloadSchedules(), prewarmAccounts()]); }
