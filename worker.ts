@@ -107,6 +107,15 @@ const OPEN_GROUP_LISTEN_TIMEOUT_MS = 2 * 60 * 60_000; // 2 horas
 // Backoff máximo entre tentativas de envio (ms)
 const SEND_RETRY_BACKOFF_MAX_MS = 8_000;
 
+// Intervalo de polling para detectar abertura de grupo fechado (ms)
+// Ajuste conservador: se vier FLOOD_WAIT cai para CLOSED_GROUP_POLL_FLOOD_FALLBACK_MS
+const CLOSED_GROUP_POLL_MS = 10;
+const CLOSED_GROUP_POLL_FLOOD_FALLBACK_MS = 50;
+
+// Janela de espera ao redor do horário programado para grupo fechado
+// Após esse tempo sem abertura, desiste e avança para próxima semana
+const CLOSED_GROUP_WATCH_WINDOW_MS = 30_000;
+
 const WORKER_PORT   = parseInt(process.env.PORT ?? "3001", 10);
 const WORKER_SECRET = process.env.WORKER_SECRET ?? "";
 
@@ -955,6 +964,183 @@ async function updateScheduleAfterDispatch(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
+   LISTENER DE GRUPO FECHADO
+   Estratégia: polling leve de GetFullChannel a cada CLOSED_GROUP_POLL_MS (10ms)
+   para detectar o momento exato em que o admin remove a restrição de envio.
+   Quando defaultBannedRights.sendMessages passar a false → dispara imediatamente.
+   Nunca tenta enviar antes da detecção — zero tentativas desperdiçadas.
+   ───────────────────────────────────────────────────────────────────────────── */
+function startClosedGroupListener(schedule: Schedule, group: Group, account: Account): void {
+  const existing = listenMap.get(group.id);
+  if (existing) existing.abort();
+
+  const ctrl = new AbortController();
+  listenMap.set(group.id, ctrl);
+
+  console.log(
+    `[closed-listen] 🔒 Aguardando abertura de ${group.telegram_chat_id} ` +
+    `(schedule ${schedule.id}) — polling ${CLOSED_GROUP_POLL_MS}ms`
+  );
+
+  (async () => {
+    try {
+      const client = await getClient(account).catch(() => null);
+      if (!client) {
+        console.warn(`[closed-listen] Sem client — abortando para ${schedule.id}`);
+        listenMap.delete(group.id);
+        return;
+      }
+
+      // Pre-resolve peer antes de entrar no loop crítico
+      try { await resolvePeer(client, group.telegram_chat_id!, account.id); } catch {}
+
+      const deadline  = Date.now() + CLOSED_GROUP_WATCH_WINDOW_MS;
+      let pollMs      = CLOSED_GROUP_POLL_MS;
+      let lastRestricted: boolean | null = null;
+
+      while (Date.now() < deadline && !ctrl.signal.aborted) {
+        const loopStart = Date.now();
+
+        try {
+          const rawId    = group.telegram_chat_id!.replace(/^-/, "");
+          const channelId = rawId.startsWith("100") ? rawId.slice(3) : rawId;
+
+          // GetFullChannel: query leve de metadata, não conta como envio
+          // Retorna defaultBannedRights com os bits de restrição atuais do grupo
+          const result = await client.invoke(
+            new Api.channels.GetFullChannel({
+              channel: new Api.InputChannel({
+                channelId: bigInt(channelId),
+                accessHash: bigInt(0),
+              }),
+            })
+          ) as any;
+
+          const banned   = result?.fullChat?.chat?.defaultBannedRights;
+          // sendMessages=true significa PROIBIDO; false ou ausente significa LIBERADO
+          const restricted = banned?.sendMessages === true;
+
+          if (lastRestricted === null) {
+            // Primeira leitura — só loga estado inicial
+            console.log(
+              `[closed-listen] Estado inicial: ${restricted ? "🔒 fechado" : "🔓 já aberto"} ` +
+              `— ${group.telegram_chat_id}`
+            );
+          }
+
+          if (!restricted && !ctrl.signal.aborted) {
+            // Grupo abriu — dispara imediatamente
+            const detectedAt = new Date();
+            console.log(
+              `[closed-listen] 🔓 Abertura detectada em ${detectedAt.toISOString()} ` +
+              `(schedule ${schedule.id}) — disparando`
+            );
+            listenMap.delete(group.id);
+
+            const alreadySent  = schedule.retry_until
+              ? await getAlreadySentIds(schedule)
+              : new Set<string>();
+            const results      = await dispatchToGroup(schedule, group, alreadySent);
+
+            const sentForMonitor = results
+              .filter(r => r.status === "sent")
+              .map(r => ({ account_id: r.account_id, message_text: r.message_text ?? "" }))
+              .filter(r => r.message_text);
+            if (sentForMonitor.length > 0) {
+              monitorPositions(
+                group.telegram_chat_id!,
+                sentForMonitor,
+                schedule.id,
+                detectedAt,
+                "closed"
+              ).catch(err => console.error("[closed-listen] Erro no monitor:", err.message));
+            }
+
+            await updateScheduleAfterDispatch(schedule, results, detectedAt);
+            return;
+          }
+
+          lastRestricted = restricted;
+          // Restaura poll normal após eventual fallback
+          if (pollMs !== CLOSED_GROUP_POLL_MS) pollMs = CLOSED_GROUP_POLL_MS;
+
+        } catch (err: any) {
+          if (ctrl.signal.aborted) return;
+
+          const isFlood =
+            err?.seconds != null ||
+            err?.constructor?.name === "FloodWaitError" ||
+            /flood/i.test(String(err?.message ?? ""));
+
+          if (isFlood) {
+            // Flood no polling de verificação — cai para fallback e continua
+            pollMs = CLOSED_GROUP_POLL_FLOOD_FALLBACK_MS;
+            const waitSecs: number = typeof err.seconds === "number"
+              ? err.seconds
+              : parseInt(String(err?.message ?? "").match(/(\d+)/)?.[1] ?? "1", 10);
+            console.warn(
+              `[closed-listen] FloodWait ${waitSecs}s no polling — ` +
+              `fallback para ${CLOSED_GROUP_POLL_FLOOD_FALLBACK_MS}ms`
+            );
+            await new Promise(r => setTimeout(r, Math.min(waitSecs * 1000, deadline - Date.now())));
+            continue;
+          }
+
+          // Erro transitório (network, timeout) — tenta reconectar e continua
+          console.warn(`[closed-listen] Erro no poll (${schedule.id}): ${err.message}`);
+          try {
+            if (!client.connected) {
+              await getClient(account);
+              await resolvePeer(client, group.telegram_chat_id!, account.id);
+            }
+          } catch {}
+        }
+
+        // Espera o restante do intervalo descontando o tempo gasto na chamada
+        const elapsed = Date.now() - loopStart;
+        const wait    = Math.max(0, pollMs - elapsed);
+        if (wait > 0 && !ctrl.signal.aborted) {
+          await new Promise(r => setTimeout(r, wait));
+        }
+      }
+
+      listenMap.delete(group.id);
+
+      if (ctrl.signal.aborted) {
+        console.log(`[closed-listen] ⏹ Listener abortado para schedule ${schedule.id}`);
+        return;
+      }
+
+      // Janela de 30s esgotada sem abertura — avança para próxima semana
+      console.warn(
+        `[closed-listen] ⏰ Janela de ${CLOSED_GROUP_WATCH_WINDOW_MS / 1000}s esgotada ` +
+        `sem abertura detectada — schedule ${schedule.id}`
+      );
+      const nowISO = new Date().toISOString();
+      let nextRun: string;
+      try { nextRun = nextWeeklyOccurrence(schedule.cron_expression); }
+      catch {
+        await supabase.from("schedules").update({ is_active: false }).eq("id", schedule.id);
+        return;
+      }
+      await supabase.from("schedules").update({
+        next_run_at:         nextRun,
+        retry_until:         null,
+        retry_count:         0,
+        last_attempt_at:     nowISO,
+        last_attempt_status: "timeout",
+        last_attempt_error:  `Grupo fechado: janela de ${CLOSED_GROUP_WATCH_WINDOW_MS / 1000}s sem abertura`,
+      }).eq("id", schedule.id);
+      scheduleTimer(schedule.id, nextRun);
+
+    } catch (err: any) {
+      console.error(`[closed-listen] Erro inesperado (${schedule.id}):`, err.message);
+      listenMap.delete(group.id);
+    }
+  })();
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
    DISPARO DE SCHEDULE
    ───────────────────────────────────────────────────────────────────────────── */
 async function fireSchedule(scheduleId: string): Promise<void> {
@@ -1007,27 +1193,43 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
     console.log(`[fire] ⚡ Disparando schedule ${scheduleId} às ${now.toISOString()}`);
 
+    // Listener já ativo para este grupo (open ou closed) — não duplica
+    if (listenMap.has(group.id)) {
+      console.log(`[fire] Listener já ativo para grupo ${group.id} — ignorando`);
+      return;
+    }
+
+    const firstAccount = (group.group_members ?? [])
+      .filter(m => m.is_active && m.accounts?.is_active)
+      .sort((a, b) => a.position - b.position)[0]?.accounts ?? null;
+
+    if (!firstAccount) {
+      console.warn(`[fire] Nenhuma conta ativa no grupo — abortando.`);
+      return;
+    }
+
     if (group.group_type === "open") {
-      if (listenMap.has(group.id)) {
-        console.log(`[fire] Listener já ativo para grupo ${group.id} — ignorando`);
-        return;
-      }
-
-      const firstAccount = (group.group_members ?? [])
-        .filter(m => m.is_active && m.accounts?.is_active)
-        .sort((a, b) => a.position - b.position)[0]?.accounts ?? null;
-
-      if (!firstAccount) {
-        console.warn(`[fire] Nenhuma conta ativa no grupo — abortando.`);
-        return;
-      }
-
       startGroupListener(schedule, group, firstAccount as Account);
 
       await supabase.from("schedules").update({
         retry_until:         new Date(now.getTime() + OPEN_GROUP_LISTEN_TIMEOUT_MS).toISOString(),
         last_attempt_at:     now.toISOString(),
         last_attempt_status: "waiting_admin",
+        last_attempt_error:  null,
+      }).eq("id", scheduleId);
+      return;
+    }
+
+    if (group.group_type === "closed") {
+      // Listener roda em background — libera firingNow para não bloquear reloads
+      firingNow.delete(scheduleId);
+
+      startClosedGroupListener(schedule, group, firstAccount as Account);
+
+      await supabase.from("schedules").update({
+        retry_until:         new Date(now.getTime() + CLOSED_GROUP_WATCH_WINDOW_MS).toISOString(),
+        last_attempt_at:     now.toISOString(),
+        last_attempt_status: "waiting_open",
         last_attempt_error:  null,
       }).eq("id", scheduleId);
       return;
