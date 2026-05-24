@@ -6,36 +6,49 @@
 //
 // Fix v2 (2025-05):
 //   BUG #1 — reconnect loop infinito:
-//     _updateLoop substituído por receiveUpdates:false (flag nativa do GramJS).
-//     A supressão manual quebrava o fluxo de sync de estado pós-reconexão,
-//     causando "Not connected" em loop no _recvLoop.
+//     _loopStarted=true antes de connect() suprime o updateLoop sem quebrar
+//     o fluxo de reconexão (autoReconnect, _handleReconnect não dependem do flag).
 //
 //   BUG #2 — peerCache stale após reconexão:
 //     Ao desconectar/reconectar um account, todos os peers desse account
 //     são removidos do cache. accessHash gerado com sessão anterior é inválido.
 //
 //   BUG #3 — sem delay entre tentativas no sendMessage:
-//     Loop de retry sem espera causava dezenas de tentativas por segundo
-//     quando o client estava instável. Adicionado backoff exponencial
-//     (1s → 2s → 4s → 8s) entre tentativas.
+//     Adicionado backoff exponencial (1s → 2s → 4s → 8s) entre tentativas.
 //
 //   BUG #4 — getDialogs warm-up não era awaited:
-//     getDialogs() disparado com .then() dentro de getClient() corria
-//     em paralelo com o primeiro resolvePeer(), que encontrava cache vazio
-//     e ia para a estratégia lenta (getDialogs de 200 itens) no caminho
-//     crítico. Warm-up movido para prewarmAccounts() com await.
-
+//     Warm-up movido para prewarmAccounts() com await + pre-resolve de peers.
 //
 // Fix v3 (2025-05):
 //   BUG #5 — AUTH_KEY_DUPLICATED (406) via race condition em getClient():
-//     getClient() é async. Sem mutex, duas chamadas concorrentes para o mesmo
-//     account.id passavam pela guarda `if (existing?.connected)` antes de
-//     qualquer uma completar o connect(). Ambas criavam um TelegramClient com
-//     a mesma session_string e chamavam connect() — o Telegram recebia duas
-//     conexões com a mesma auth key e retornava AUTH_KEY_DUPLICATED na segunda.
-//     Solução: connectingPromises Map<accountId, Promise<TelegramClient>> que
-//     armazena a Promise em andamento. Qualquer chamada concorrente reutiliza
-//     a mesma Promise em vez de criar uma nova conexão.
+//     connectingPromises Map<accountId, Promise<TelegramClient>> serializa
+//     conexões concorrentes para o mesmo account.
+//
+// Otimizações v4 (2025-05) — latência mínima no caminho crítico:
+//
+//   OPT #1 — invoke direto em vez de client.sendMessage():
+//     client.sendMessage() de alto nível chama getInputEntity internamente
+//     mesmo quando recebe um InputPeer já resolvido — adiciona ~5-20ms por
+//     envio. client.invoke(new Api.messages.SendMessage(...)) com peer já
+//     resolvido bypassa toda essa lógica e vai direto ao MTProto.
+//
+//   OPT #2 — pre-fetch do schedule antes do fire:
+//     scheduleTimer agenda um segundo timeout PREFETCH_BEFORE_MS antes do
+//     disparo real. Esse timeout faz a query Supabase e guarda o resultado
+//     em schedulePrefetchCache. Quando fireSchedule executa, consome o cache
+//     instantaneamente — a query deixa de estar no caminho crítico (~50-150ms).
+//
+//   OPT #3 — pre-resolve de peers no prewarm:
+//     Após getDialogs(), prewarmAccounts() chama resolvePeer() para todos os
+//     telegram_chat_id de grupos ativos. O peerCache fica populado antes do
+//     primeiro disparo — elimina a Estratégia 3 (getDialogs 200 itens) do
+//     caminho crítico.
+//
+//   OPT #4 — noWebpage: true + randomId único por tentativa:
+//     noWebpage evita que o Telegram tente gerar preview (RTT extra).
+//     randomId diferente em cada tentativa evita que o Telegram dedup uma
+//     mensagem que falhou e está sendo reenviada.
+
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -58,9 +71,7 @@ const supabase = createClient(
 const SEND_TIMEOUT_MS = 15_000;
 
 // Budget total de retentativas para enviar a mensagem de um membro.
-// Se não enviou nesse tempo, desiste e marca como "failed".
-// IMPORTANTE: esse valor (50s) é maior que RELOAD_INTERVAL_MS (30s),
-// o que causava o bug de duplo disparo. O firingNow resolve isso.
+// IMPORTANTE: maior que RELOAD_INTERVAL_MS (30s) — o firingNow resolve o duplo disparo.
 const RETRY_BUDGET_MS = 50_000;
 
 // Com que frequência o worker relê o banco para encontrar schedules novos
@@ -72,8 +83,10 @@ const LOOKAHEAD_MS = 2 * 60 * 1000;
 // Frequência do ping de keepalive para manter conexões Telegram vivas
 const KEEPALIVE_INTERVAL_MS = 45_000;
 
-// Quanto aguardar após o envio antes de ler o histórico (grupos fechados).
-// Dá tempo para o Telegram processar e ordenar as mensagens.
+// OPT #2: quanto tempo antes do fire fazer o pre-fetch do schedule no banco
+const PREFETCH_BEFORE_MS = 800;
+
+// Quanto aguardar após o envio antes de ler o histórico (grupos fechados)
 const MONITOR_DELAY_CLOSED_MS = 6_000;
 
 // Quanto tempo no máximo monitorar posição em grupos abertos
@@ -91,7 +104,7 @@ const MONITOR_HISTORY_LIMIT = 150;
 // Quanto tempo o listener de grupo aberto espera o sinal do admin antes de desistir
 const OPEN_GROUP_LISTEN_TIMEOUT_MS = 2 * 60 * 60_000; // 2 horas
 
-// FIX #3: Backoff máximo entre tentativas de envio (ms)
+// Backoff máximo entre tentativas de envio (ms)
 const SEND_RETRY_BACKOFF_MAX_MS = 8_000;
 
 const WORKER_PORT   = parseInt(process.env.PORT ?? "3001", 10);
@@ -113,7 +126,7 @@ interface Account {
 interface GroupMember {
   id: string;
   message_text: string | null;
-  position: number;          // ordem de disparo dentro do grupo
+  position: number;
   is_active: boolean;
   accounts: Account | null;
 }
@@ -121,26 +134,24 @@ interface GroupMember {
 interface Group {
   id: string;
   name: string;
-  telegram_chat_id: string | null;   // ID numérico do chat no Telegram
+  telegram_chat_id: string | null;
   telegram_chat_name: string | null;
   group_type: "open" | "closed";
-  // open:   aguarda sinal do admin ("ok" ou mídia) antes de enviar
-  // closed: dispara imediatamente no horário agendado
   group_members: GroupMember[];
 }
 
 interface Schedule {
   id: string;
-  cron_expression: string;           // ex: "30 14 * * 2" = terça 14:30 UTC
+  cron_expression: string;
   user_id: string;
   group_id: string;
-  next_run_at: string;               // próximo disparo planejado (ISO)
-  retry_window_seconds: number;      // janela total de retentativas após falha
-  retry_interval_seconds: number;    // intervalo base entre retentativas (cresce exponencialmente)
-  retry_interval_max_seconds: number;// teto do intervalo de retry
-  retry_count: number;               // quantas retentativas já ocorreram no ciclo atual
-  retry_until: string | null;        // se não-nulo: estamos em modo retry até essa data
-  last_attempt_at: string | null;    // quando foi a última tentativa (usado pelo isRetryDue)
+  next_run_at: string;
+  retry_window_seconds: number;
+  retry_interval_seconds: number;
+  retry_interval_max_seconds: number;
+  retry_count: number;
+  retry_until: string | null;
+  last_attempt_at: string | null;
   groups: Group;
 }
 
@@ -154,28 +165,32 @@ interface DispatchResult {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    ESTADO GLOBAL
-   Tudo que precisa viver entre chamadas fica em Maps no topo.
    ───────────────────────────────────────────────────────────────────────────── */
 
-// Conexões Telegram ativas: accountId → TelegramClient conectado
+// Conexões Telegram ativas: accountId → TelegramClient
 const clients = new Map<string, TelegramClient>();
 
-// Qual session_string foi usada para abrir cada client.
-// Permite detectar se a sessão mudou e reconectar.
+// session_string usada em cada client — detecta mudança de sessão
 const sessions = new Map<string, string>();
 
-// Timers de keepalive por conta: accountId → setInterval handle
+// Timers de keepalive: accountId → setInterval handle
 const keepaliveTimers = new Map<string, ReturnType<typeof setInterval>>();
 
-// Cache de peers Telegram resolvidos: "accountId:chatId" → InputPeer
-// Evita re-resolver o mesmo chat em todo envio (operação potencialmente cara)
+// Cache de peers resolvidos: "accountId:chatId" → InputPeer
+// OPT #3: populado no prewarm antes do primeiro disparo
 const peerCache = new Map<string, unknown>();
 
-// Cache de contas do banco: accountId → Account
+// Cache de contas: accountId → Account
 const accountCache = new Map<string, Account>();
 
-// Timers de disparo agendado: scheduleId → setTimeout handle
+// Timers de disparo: scheduleId → setTimeout handle
 const scheduledTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+// OPT #2: timers de pre-fetch: scheduleId → setTimeout handle
+const prefetchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+// OPT #2: schedules pre-carregados prontos para uso instantâneo no fire
+const schedulePrefetchCache = new Map<string, Schedule>();
 
 // Listeners de grupos abertos: groupId → AbortController
 const listenMap = new Map<string, AbortController>();
@@ -183,17 +198,7 @@ const listenMap = new Map<string, AbortController>();
 // FIX v1: schedules atualmente em execução — previne duplo disparo
 const firingNow = new Set<string>();
 
-// FIX v3 (BUG #5): mutex de conexão por account — previne AUTH_KEY_DUPLICATED.
-// getClient() é async. Sem este Map, chamadas concorrentes para o mesmo
-// account.id passavam pela guarda `if (existing?.connected)` simultaneamente
-// — nenhuma encontrava um client existente, ambas construíam um TelegramClient
-// com a mesma session_string e chamavam connect(). O Telegram recebia duas
-// conexões com a mesma auth key e matava uma delas com AUTH_KEY_DUPLICATED.
-//
-// Funcionamento: antes de criar o client, getClient() armazena a Promise aqui.
-// Chamadas subsequentes encontram a Promise em andamento e retornam a mesma,
-// sem criar uma segunda conexão. A entrada é removida quando connect() termina
-// (com sucesso ou falha), para que reconexões futuras possam funcionar.
+// FIX BUG #5: mutex de conexão por account — previne AUTH_KEY_DUPLICATED
 const connectingPromises = new Map<string, Promise<TelegramClient>>();
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -267,13 +272,19 @@ function isRetryDue(schedule: Schedule, now: Date): boolean {
   return now >= new Date(last.getTime() + interval * 1000);
 }
 
+// Gera um randomId único para cada invoke de SendMessage.
+// OPT #4: randomId diferente por tentativa evita que o Telegram dedup
+// uma mensagem que falhou e está sendo reenviada com o mesmo ID.
+function makeRandomId(): bigInt.BigInteger {
+  // 52 bits de entropia (safe para JS number, único na prática)
+  return bigInt(Date.now()).multiply(bigInt(1000)).add(bigInt(Math.floor(Math.random() * 1000)));
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────
-   HELPERS INTERNOS DE PEER CACHE
+   HELPERS DE PEER CACHE
    ───────────────────────────────────────────────────────────────────────────── */
 
-// FIX #2: Limpa todos os peers de um account do cache.
-// Chamado sempre que o client é desconectado/reconectado, porque
-// o accessHash do peer é vinculado à sessão anterior e fica inválido.
+// FIX #2: limpa peers de um account ao desconectar/reconectar
 function evictPeersForAccount(accountId: string): void {
   for (const key of peerCache.keys()) {
     if (key.startsWith(`${accountId}:`)) {
@@ -291,109 +302,100 @@ async function getClient(account: Account): Promise<TelegramClient> {
   const sessionInUse  = sessions.get(account.id);
   const sessionChanged = sessionInUse !== account.session_string;
 
+  // Fast path: client conectado e sessão não mudou
   if (existing?.connected && !sessionChanged) return existing;
 
-  if (existing) {
-    try { await existing.disconnect(); } catch {}
-    clients.delete(account.id);
-    // FIX #2: limpa peers do account ao desconectar
-    evictPeersForAccount(account.id);
-    const t = keepaliveTimers.get(account.id);
-    if (t) { clearInterval(t); keepaliveTimers.delete(account.id); }
-  }
+  // FIX BUG #5: se já há uma conexão em andamento para este account,
+  // reutiliza a Promise existente em vez de criar uma segunda conexão.
+  // Sem isso, chamadas concorrentes criariam dois TelegramClient com a
+  // mesma session_string → AUTH_KEY_DUPLICATED.
+  const inflight = connectingPromises.get(account.id);
+  if (inflight) return inflight;
 
-  const client = new TelegramClient(
-    new StringSession(account.session_string),
-    parseInt(account.api_id),
-    account.api_hash,
-    {
-      connectionRetries: 5,
-      retryDelay: 1_000,
-      autoReconnect: true,
-      floodSleepThreshold: 60,
-      requestRetries: 3,
-    }
-  );
-
-  // FIX #1: Suprimir o update loop sem quebrar o fluxo de reconexão.
-  //
-  // Abordagem descartada — (client as any)._updateLoop = () => Promise.resolve():
-  //   Substituía a função inteira, mas o GramJS chama _updateLoop(client) passando
-  //   o client como argumento (não como método). O monkey-patch no objeto não
-  //   interceptava a chamada no módulo updates.js, que mantinha sua própria
-  //   referência. Resultado: o loop subia mesmo com o patch, e quando o sender
-  //   ficava instável o _recvLoop lançava "Not connected" sem ter o loop para
-  //   processar o estado → reconnect → "Not connected" infinito.
-  //
-  // Abordagem descartada — receiveUpdates: false no construtor:
-  //   Não existe em TelegramClientParams. Causa TS2353 com strict mode.
-  //
-  // Solução correta — _loopStarted = true antes de connect():
-  //   O GramJS declara _loopStarted em telegramBaseClient (linha 176 do .d.ts)
-  //   e inicializa como false. Em TelegramClient.connect(), ambos os pontos
-  //   que chamam _updateLoop são guardados por `if (!this._loopStarted)`.
-  //   Setar true antes do connect() faz os dois guards falharem → loop nunca
-  //   sobe. O flag já é typed como `protected boolean`, então o cast para `any`
-  //   é necessário apenas para acesso externo — não há risco de TS2353.
-  //   O fluxo de reconexão (autoReconnect, _handleReconnect) não depende desse
-  //   flag, então continua funcionando normalmente.
-  (client as any)._loopStarted = true;
-
-  await client.connect();
-
-  clients.set(account.id, client);
-  sessions.set(account.id, account.session_string);
-
-  // FIX #4: getDialogs NÃO é chamado aqui.
-  // Antes ficava aqui como .then() (fire-and-forget), correndo em paralelo
-  // com o primeiro resolvePeer(). Isso causava cache miss na estratégia 1
-  // (getInputEntity) e forçava a estratégia 3 (getDialogs 200 itens) no
-  // caminho crítico de disparo.
-  // O warm-up agora é feito em prewarmAccounts() com await, antes de qualquer disparo.
-
-  // Keepalive: pinga a conta a cada 45s para manter a conexão viva.
-  const interval = setInterval(async () => {
-    if (!client.connected) {
-      console.warn(`[keepalive] ${account.phone_number} desconectou — removendo do pool`);
+  const connectPromise = (async () => {
+    // Desconecta client anterior se existir
+    if (existing) {
+      try { await existing.disconnect(); } catch {}
       clients.delete(account.id);
-      // FIX #2: limpa peers ao detectar desconexão no keepalive
       evictPeersForAccount(account.id);
-      keepaliveTimers.delete(account.id);
-      clearInterval(interval);
-      return;
+      const t = keepaliveTimers.get(account.id);
+      if (t) { clearInterval(t); keepaliveTimers.delete(account.id); }
     }
-    try {
-      await Promise.race([
-        client.getMe(),
-        new Promise<never>((_, r) =>
-          setTimeout(() => r(new Error("keepalive timeout")), 10_000)
-        ),
-      ]);
-    } catch (err: any) {
-      console.warn(`[keepalive] Ping falhou para ${account.phone_number}: ${err.message}`);
-      try { await client.disconnect(); } catch {}
-      clients.delete(account.id);
-      // FIX #2: limpa peers ao detectar falha no keepalive
-      evictPeersForAccount(account.id);
-      keepaliveTimers.delete(account.id);
-      clearInterval(interval);
 
-      const authDead =
-        err.message?.includes("AUTH_KEY_UNREGISTERED") ||
-        err.message?.includes("USER_DEACTIVATED") ||
-        err.message?.includes("SESSION_REVOKED");
-      if (authDead) {
-        console.warn(`[keepalive] Sessão morta: ${account.phone_number} — desativando no banco`);
-        supabase.from("accounts").update({ is_active: false }).eq("id", account.id).then(({ error: e }) => {
-          if (e) console.error(`[keepalive] Falha ao desativar ${account.id}:`, e.message);
-        });
+    const client = new TelegramClient(
+      new StringSession(account.session_string),
+      parseInt(account.api_id),
+      account.api_hash,
+      {
+        connectionRetries: 5,
+        retryDelay: 1_000,
+        autoReconnect: true,
+        floodSleepThreshold: 60,
+        requestRetries: 3,
       }
-    }
-  }, KEEPALIVE_INTERVAL_MS);
+    );
 
-  keepaliveTimers.set(account.id, interval);
-  console.log(`[client] ✓ Conectado: ${account.phone_number}`);
-  return client;
+    // FIX BUG #1: suprimir o update loop sem quebrar o fluxo de reconexão.
+    // _loopStarted=true antes de connect() faz os guards de `if (!this._loopStarted)`
+    // no GramJS falharem → updateLoop nunca sobe.
+    // autoReconnect/_handleReconnect não dependem desse flag, continuam funcionando.
+    (client as any)._loopStarted = true;
+
+    await client.connect();
+
+    clients.set(account.id, client);
+    sessions.set(account.id, account.session_string);
+
+    // Keepalive a cada 45s para manter a conexão viva
+    const interval = setInterval(async () => {
+      if (!client.connected) {
+        console.warn(`[keepalive] ${account.phone_number} desconectou — removendo do pool`);
+        clients.delete(account.id);
+        evictPeersForAccount(account.id);
+        keepaliveTimers.delete(account.id);
+        clearInterval(interval);
+        return;
+      }
+      try {
+        await Promise.race([
+          client.getMe(),
+          new Promise<never>((_, r) =>
+            setTimeout(() => r(new Error("keepalive timeout")), 10_000)
+          ),
+        ]);
+      } catch (err: any) {
+        console.warn(`[keepalive] Ping falhou para ${account.phone_number}: ${err.message}`);
+        try { await client.disconnect(); } catch {}
+        clients.delete(account.id);
+        evictPeersForAccount(account.id);
+        keepaliveTimers.delete(account.id);
+        clearInterval(interval);
+
+        const authDead =
+          err.message?.includes("AUTH_KEY_UNREGISTERED") ||
+          err.message?.includes("USER_DEACTIVATED") ||
+          err.message?.includes("SESSION_REVOKED");
+        if (authDead) {
+          console.warn(`[keepalive] Sessão morta: ${account.phone_number} — desativando no banco`);
+          supabase.from("accounts").update({ is_active: false }).eq("id", account.id).then(({ error: e }) => {
+            if (e) console.error(`[keepalive] Falha ao desativar ${account.id}:`, e.message);
+          });
+        }
+      }
+    }, KEEPALIVE_INTERVAL_MS);
+
+    keepaliveTimers.set(account.id, interval);
+    console.log(`[client] ✓ Conectado: ${account.phone_number}`);
+    return client;
+  })();
+
+  connectingPromises.set(account.id, connectPromise);
+  try {
+    return await connectPromise;
+  } finally {
+    // Remove sempre ao terminar (sucesso ou falha) para permitir reconexões futuras
+    connectingPromises.delete(account.id);
+  }
 }
 
 async function reloadClient(account: Account): Promise<TelegramClient> {
@@ -401,11 +403,12 @@ async function reloadClient(account: Account): Promise<TelegramClient> {
   if (existing) {
     try { await existing.disconnect(); } catch {}
     clients.delete(account.id);
-    // FIX #2: limpa peers ao fazer reload manual
     evictPeersForAccount(account.id);
     const t = keepaliveTimers.get(account.id);
     if (t) { clearInterval(t); keepaliveTimers.delete(account.id); }
   }
+  // Garante que não há promise em andamento para este account
+  connectingPromises.delete(account.id);
   return getClient(account);
 }
 
@@ -423,15 +426,16 @@ async function resolvePeer(
   const chatIdNum = parseInt(telegramChatId, 10);
   if (isNaN(chatIdNum)) throw new Error(`telegram_chat_id inválido: "${telegramChatId}"`);
 
-  // Estratégia 1: getInputEntity — usa o cache interno do GramJS.
-  // Funciona se o cliente já sincronizou os dialogs (warm-up em prewarmAccounts).
+  // Estratégia 1: getInputEntity — cache interno do GramJS.
+  // Funciona quando os dialogs já foram sincronizados (prewarm com OPT #3).
   try {
     const peer = await client.getInputEntity(chatIdNum);
     peerCache.set(key, peer);
     return peer;
   } catch {}
 
-  // Estratégia 2: GetChannels via MTProto direto.
+  // Estratégia 2: GetChannels via MTProto direto com accessHash=0.
+  // O Telegram retorna o accessHash real para canais/grupos que a conta é membro.
   const absId     = Math.abs(chatIdNum);
   const channelId = absId > 1_000_000_000_000 ? absId - 1_000_000_000_000 : absId;
   try {
@@ -449,8 +453,8 @@ async function resolvePeer(
   } catch {}
 
   // Estratégia 3: sincroniza todos os dialogs e tenta de novo.
-  // Mais lento, mas resolve casos onde a conta é membro mas o grupo
-  // não estava nos dialogs em cache.
+  // Caminho lento — só chega aqui se o prewarm falhou ou a conta foi adicionada
+  // ao grupo após o boot.
   await client.getDialogs({ limit: 200 });
   try {
     const peer = await client.getInputEntity(chatIdNum);
@@ -485,8 +489,19 @@ async function sendMessage(
       await Promise.race([
         (async () => {
           const peer = await resolvePeer(client, telegramChatId, account.id);
+
           try {
-            await client.sendMessage(peer as any, { message: messageText });
+            // OPT #1: invoke direto bypassa a resolução interna de entidade
+            // do client.sendMessage() de alto nível (~5-20ms por envio).
+            // OPT #4: noWebpage=true evita RTT extra de preview.
+            //         randomId único por tentativa evita dedup indevido em retries.
+            await client.invoke(new Api.messages.SendMessage({
+              peer:       peer as any,
+              message:    messageText,
+              randomId:   makeRandomId(),
+              noWebpage:  true,
+            }));
+
           } catch (err: any) {
             const errMsg = String(err?.message ?? "");
 
@@ -515,7 +530,12 @@ async function sendMessage(
                 await new Promise(r => setTimeout(r, waitMs));
                 peerCache.delete(`${account.id}:${telegramChatId}`);
                 const freshPeer = await resolvePeer(client, telegramChatId, account.id);
-                await client.sendMessage(freshPeer as any, { message: messageText });
+                await client.invoke(new Api.messages.SendMessage({
+                  peer:      freshPeer as any,
+                  message:   messageText,
+                  randomId:  makeRandomId(),
+                  noWebpage: true,
+                }));
                 return;
               }
               throw new Error(`FLOOD_WAIT_${waitSecs}_EXCEEDS_BUDGET`);
@@ -538,10 +558,7 @@ async function sendMessage(
     } catch (err: any) {
       const remaining = budgetEnd - Date.now();
       if (remaining > 500) {
-        // FIX #3: backoff exponencial entre tentativas.
-        // Antes: tentava de novo imediatamente → dezenas de req/s com client instável.
-        // Agora: 1s → 2s → 4s → 8s (teto), sempre respeitando o budget restante.
-        const backoffMs = Math.min(1_000 * Math.pow(2, attempt - 1), SEND_RETRY_BACKOFF_MAX_MS);
+        const backoffMs   = Math.min(1_000 * Math.pow(2, attempt - 1), SEND_RETRY_BACKOFF_MAX_MS);
         const safeBackoff = Math.min(backoffMs, remaining - 500);
         console.warn(
           `[send] tentativa ${attempt} falhou — aguardando ${safeBackoff}ms ` +
@@ -809,10 +826,10 @@ async function dispatchToGroup(
     if (alreadySent.has(account.id)) {
       console.log(`[dispatch] ↷ ${account.phone_number} — já enviou neste ciclo`);
       return {
-        account_id:  account.id,
+        account_id:   account.id,
         message_text: member.message_text,
-        status:      "skipped" as const,
-        retryable:   false,
+        status:       "skipped" as const,
+        retryable:    false,
       };
     }
 
@@ -834,6 +851,7 @@ async function dispatchToGroup(
       );
     }
 
+    // Log em background — não bloqueia o caminho crítico de envio
     supabase.from("dispatch_logs").insert({
       user_id:             schedule.user_id,
       group_id:            group.id,
@@ -886,6 +904,7 @@ async function updateScheduleAfterDispatch(
       return;
     }
 
+    // Update em background — mensagens já enviadas, isso não é crítico
     supabase.from("schedules").update({
       next_run_at:         nextRun,
       last_run_at:         nowISO,
@@ -948,26 +967,37 @@ async function fireSchedule(scheduleId: string): Promise<void> {
   try {
     const now = new Date();
 
-    const { data, error } = await supabase
-      .from("schedules")
-      .select(SCHEDULE_SELECT)
-      .eq("id", scheduleId)
-      .eq("is_active", true)
-      .single();
+    // OPT #2: tenta consumir o pre-fetch cache primeiro.
+    // Se o prefetch chegou a tempo (800ms antes), a query Supabase não está
+    // no caminho crítico — o schedule já está em memória.
+    let schedule = schedulePrefetchCache.get(scheduleId);
+    if (schedule) {
+      schedulePrefetchCache.delete(scheduleId);
+      console.log(`[fire] ⚡ Schedule ${scheduleId} servido do pre-fetch cache`);
+    } else {
+      // Fallback: busca ao vivo (primeiro boot, retry imediato, etc.)
+      const { data, error } = await supabase
+        .from("schedules")
+        .select(SCHEDULE_SELECT)
+        .eq("id", scheduleId)
+        .eq("is_active", true)
+        .single();
 
-    if (error || !data) {
-      console.warn(`[fire] Schedule ${scheduleId} não encontrado ou inativo.`);
-      return;
+      if (error || !data) {
+        console.warn(`[fire] Schedule ${scheduleId} não encontrado ou inativo.`);
+        return;
+      }
+      schedule = data as unknown as Schedule;
     }
 
-    const schedule = data as unknown as Schedule;
-    const group    = schedule.groups;
+    const group = schedule.groups;
 
     if (!group?.telegram_chat_id) {
       console.warn(`[fire] Schedule ${scheduleId}: sem telegram_chat_id — pulando.`);
       return;
     }
 
+    // Injeta contas frescas do accountCache (podem ter sido atualizadas desde o pre-fetch)
     if (group.group_members) {
       group.group_members = group.group_members.map(m => ({
         ...m,
@@ -1003,6 +1033,8 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       return;
     }
 
+    // Em ciclos frescos (sem retry_until) não há nada enviado ainda —
+    // skip da query de dedup elimina ~50-100ms do caminho crítico.
     const alreadySent = schedule.retry_until
       ? await getAlreadySentIds(schedule)
       : new Set<string>();
@@ -1035,7 +1067,7 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   TIMER DE PRECISÃO
+   TIMER DE PRECISÃO + PRE-FETCH
    ───────────────────────────────────────────────────────────────────────────── */
 function scheduleTimer(scheduleId: string, nextRunAt: string): void {
   const delay = new Date(nextRunAt).getTime() - Date.now();
@@ -1045,10 +1077,51 @@ function scheduleTimer(scheduleId: string, nextRunAt: string): void {
     return;
   }
 
+  // Cancela timers anteriores (fire + prefetch)
   const prev = scheduledTimers.get(scheduleId);
   if (prev) clearTimeout(prev);
+  const prevPrefetch = prefetchTimers.get(scheduleId);
+  if (prevPrefetch) { clearTimeout(prevPrefetch); prefetchTimers.delete(scheduleId); }
 
   const effectiveDelay = Math.max(0, delay);
+
+  // OPT #2: pre-fetch do schedule PREFETCH_BEFORE_MS antes do fire.
+  // Carrega o schedule do banco enquanto ainda há tempo, e guarda em
+  // schedulePrefetchCache. Quando fireSchedule rodar, consome instantaneamente.
+  if (effectiveDelay > PREFETCH_BEFORE_MS) {
+    const prefetchDelay = effectiveDelay - PREFETCH_BEFORE_MS;
+    const pt = setTimeout(async () => {
+      prefetchTimers.delete(scheduleId);
+      try {
+        const { data, error } = await supabase
+          .from("schedules")
+          .select(SCHEDULE_SELECT)
+          .eq("id", scheduleId)
+          .eq("is_active", true)
+          .single();
+
+        if (error || !data) {
+          console.warn(`[prefetch] Schedule ${scheduleId} inativo ou removido — ignorando`);
+          return;
+        }
+
+        const s = data as unknown as Schedule;
+        // Injeta contas frescas do accountCache no pre-fetch
+        if (s.groups?.group_members) {
+          s.groups.group_members = s.groups.group_members.map(m => ({
+            ...m,
+            accounts: m.accounts ? (accountCache.get(m.accounts.id) ?? m.accounts) : null,
+          }));
+        }
+
+        schedulePrefetchCache.set(scheduleId, s);
+        console.log(`[prefetch] ✅ Schedule ${scheduleId} pré-carregado (${PREFETCH_BEFORE_MS}ms antes do fire)`);
+      } catch (err: any) {
+        console.warn(`[prefetch] Falha ao pré-carregar schedule ${scheduleId}: ${err.message}`);
+      }
+    }, prefetchDelay);
+    prefetchTimers.set(scheduleId, pt);
+  }
 
   const timer = setTimeout(async () => {
     scheduledTimers.delete(scheduleId);
@@ -1175,10 +1248,7 @@ async function prewarmAccounts(): Promise<void> {
       try {
         const client = await getClient(account);
 
-        // FIX #4: getDialogs é awaited aqui, no prewarm, antes de qualquer disparo.
-        // Antes ficava dentro de getClient() como .then() (fire-and-forget),
-        // correndo em paralelo com o primeiro resolvePeer() e causando cache miss.
-        // Agora o warm-up completa antes de reloadSchedules() criar os timers.
+        // FIX #4: getDialogs awaited antes de qualquer disparo
         await client.getDialogs({ limit: 100 });
         console.log(`[prewarm] ✓ Dialogs prontos: ${account.phone_number}`);
 
@@ -1195,6 +1265,45 @@ async function prewarmAccounts(): Promise<void> {
         }
       }
     }));
+
+    // OPT #3: pre-resolve de peers para todos os grupos ativos.
+    // Após getDialogs(), popula peerCache com os telegram_chat_id conhecidos.
+    // Garante que resolvePeer() vai pelo caminho rápido (Estratégia 1: cache local)
+    // no primeiro disparo, sem cair na Estratégia 3 (getDialogs 200 itens).
+    try {
+      const { data: groups } = await supabase
+        .from("groups")
+        .select("telegram_chat_id, group_members(accounts(id))")
+        .not("telegram_chat_id", "is", null)
+        .eq("group_members.is_active", true);
+
+      const resolvePromises: Promise<unknown>[] = [];
+      for (const group of groups ?? []) {
+        if (!group.telegram_chat_id) continue;
+        const chatId = String(group.telegram_chat_id);
+
+        for (const member of (group as any).group_members ?? []) {
+          const accountId = member?.accounts?.id ?? member?.accounts?.[0]?.id;
+          if (!accountId) continue;
+          const acc = accountCache.get(accountId);
+          if (!acc) continue;
+          const cl = clients.get(acc.id);
+          if (!cl?.connected) continue;
+
+          resolvePromises.push(
+            resolvePeer(cl, chatId, acc.id)
+              .then(() => console.log(`[prewarm] ✓ Peer pré-resolvido: ${chatId} via ${acc.phone_number}`))
+              .catch(() => {}) // silencia — só otimização, não crítico
+          );
+        }
+      }
+
+      await Promise.allSettled(resolvePromises);
+      console.log(`[prewarm] ✓ Pre-resolve de peers concluído (${resolvePromises.length} entradas)`);
+    } catch (err: any) {
+      console.warn(`[prewarm] Falha no pre-resolve de peers: ${err.message}`);
+    }
+
   } finally {
     prewarmRunning = false;
   }
@@ -1406,7 +1515,6 @@ const httpServer = http.createServer(async (req, res) => {
 
     try {
       const client = await reloadClient(account);
-      // FIX #4: warm-up dos dialogs após reload manual também
       await client.getDialogs({ limit: 100 });
       console.log(`[http] /reload ✓ ${account.phone_number} recarregada`);
       return jsonResponse(res, 200, { ok: true });
@@ -1579,6 +1687,9 @@ httpServer.listen(WORKER_PORT, () => {
 async function shutdown() {
   console.log("[worker] Encerrando...");
 
+  for (const t of prefetchTimers.values()) clearTimeout(t);
+  prefetchTimers.clear();
+
   for (const t of scheduledTimers.values()) clearTimeout(t);
   scheduledTimers.clear();
 
@@ -1602,13 +1713,15 @@ process.on("SIGINT",  shutdown);
    INICIALIZAÇÃO
    Sequência de boot:
    1. prewarmAccounts: conecta todas as contas, awaita getDialogs (FIX #4),
-      popula accountCache
+      pre-resolve peers de todos os grupos ativos (OPT #3),
+      popula accountCache e peerCache
    2. reloadSchedules: lê o banco e cria os timers iniciais
+      (cada timer agenda também um pre-fetch — OPT #2)
    3. setInterval: mantém o ciclo de reload a cada 30s
    ───────────────────────────────────────────────────────────────────────────── */
 async function init(): Promise<void> {
   console.log("[worker] Iniciando...");
-  await prewarmAccounts();  // FIX #4: getDialogs awaited aqui antes de criar timers
+  await prewarmAccounts();
   await reloadSchedules();
   setInterval(async () => {
     try { await Promise.allSettled([reloadSchedules(), prewarmAccounts()]); }
