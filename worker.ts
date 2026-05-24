@@ -25,6 +25,17 @@
 //     e ia para a estratégia lenta (getDialogs de 200 itens) no caminho
 //     crítico. Warm-up movido para prewarmAccounts() com await.
 
+//
+// Fix v3 (2025-05):
+//   BUG #5 — AUTH_KEY_DUPLICATED (406) via race condition em getClient():
+//     getClient() é async. Sem mutex, duas chamadas concorrentes para o mesmo
+//     account.id passavam pela guarda `if (existing?.connected)` antes de
+//     qualquer uma completar o connect(). Ambas criavam um TelegramClient com
+//     a mesma session_string e chamavam connect() — o Telegram recebia duas
+//     conexões com a mesma auth key e retornava AUTH_KEY_DUPLICATED na segunda.
+//     Solução: connectingPromises Map<accountId, Promise<TelegramClient>> que
+//     armazena a Promise em andamento. Qualquer chamada concorrente reutiliza
+//     a mesma Promise em vez de criar uma nova conexão.
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
@@ -171,6 +182,19 @@ const listenMap = new Map<string, AbortController>();
 
 // FIX v1: schedules atualmente em execução — previne duplo disparo
 const firingNow = new Set<string>();
+
+// FIX v3 (BUG #5): mutex de conexão por account — previne AUTH_KEY_DUPLICATED.
+// getClient() é async. Sem este Map, chamadas concorrentes para o mesmo
+// account.id passavam pela guarda `if (existing?.connected)` simultaneamente
+// — nenhuma encontrava um client existente, ambas construíam um TelegramClient
+// com a mesma session_string e chamavam connect(). O Telegram recebia duas
+// conexões com a mesma auth key e matava uma delas com AUTH_KEY_DUPLICATED.
+//
+// Funcionamento: antes de criar o client, getClient() armazena a Promise aqui.
+// Chamadas subsequentes encontram a Promise em andamento e retornam a mesma,
+// sem criar uma segunda conexão. A entrada é removida quando connect() termina
+// (com sucesso ou falha), para que reconexões futuras possam funcionar.
+const connectingPromises = new Map<string, Promise<TelegramClient>>();
 
 /* ─────────────────────────────────────────────────────────────────────────────
    QUERY REUTILIZADA
