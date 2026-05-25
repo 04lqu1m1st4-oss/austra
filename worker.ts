@@ -78,6 +78,24 @@
 //     [sniper][timing] invoke RTT: Xms  → tempo real do MTProto
 //     [sniper][timing] vs horário: Xms  → negativo=antes, positivo=atrasado
 //     Com esses dados é possível calibrar SNIPER_BEFORE_MS no valor exato.
+//
+// Fix v8 (2025-05) — sniper zero-delay + fase 2 paralela:
+//
+//   OPT #8 — randomId fixo por ciclo na Fase 1 do sniper:
+//     Um único randomId é gerado antes do loop e reutilizado em todas as
+//     tentativas. Se um invoke "fantasma" chegar ao Telegram após nosso
+//     timeout local (rede lenta), o servidor deduplica pelo id e ignora —
+//     garante exactly-once mesmo com timeout falso.
+//
+//   OPT #9 — zero delay artificial entre tentativas na Fase 1:
+//     Removidos SNIPER_ATTEMPT_INTERVAL_MS (1ms) e SNIPER_PAUSE_EVERY_N/
+//     SNIPER_PAUSE_MS (5ms a cada 10 tentativas). O único delay real entre
+//     tentativas é o RTT de rede (~25ms) — inevitável e suficiente.
+//
+//   OPT #10 — Fase 2 do sniper totalmente paralela (Promise.allSettled):
+//     Contas restantes disparam simultaneamente em vez de sequencialmente.
+//     Após a Fase 1 confirmar, cada millisegundo de espera é posição perdida.
+//     Grupos de uma única conta nunca chegam na Fase 2 — zero impacto.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -102,7 +120,7 @@ const RETRY_BUDGET_MS               = 50_000;
 const RELOAD_INTERVAL_MS            = 30_000;
 const LOOKAHEAD_MS                  = 2 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS         = 45_000;
-const KEEPALIVE_JITTER_MAX_MS       = 10_000; // BUG #G: jitter para evitar spike simultâneo
+const KEEPALIVE_JITTER_MAX_MS       = 10_000;
 const PREFETCH_BEFORE_MS            = 800;
 const MONITOR_DELAY_CLOSED_MS       = 6_000;
 const MONITOR_MAX_OPEN_MS           = 5 * 60_000;
@@ -111,15 +129,8 @@ const LISTEN_POLL_MS                = 400;
 const MONITOR_HISTORY_LIMIT         = 150;
 const OPEN_GROUP_LISTEN_TIMEOUT_MS  = 2 * 60 * 60_000;
 const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
-// OPT #6: era 20ms. Railway US East → DC Miami RTT ~50ms → one-way ~25ms.
-// 45ms cobre o one-way + event loop lag do Node (~5-15ms) com ~5ms de margem.
-// Ajuste fino baseado nos logs [sniper][timing] vs horário abaixo.
 const SNIPER_BEFORE_MS              = 48;
 const SNIPER_SEND_TIMEOUT_MS        = 800;
-const SNIPER_ATTEMPT_INTERVAL_MS    = 1;
-const SNIPER_PAUSE_EVERY_N          = 10;
-const SNIPER_PAUSE_MS               = 5;
-const SNIPER_INTER_ACCOUNT_DELAY_MS = 1;
 const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
 
 // BUG #A: após o sniper terminar, bloqueia fireSchedule do mesmo ciclo por este TTL
@@ -270,7 +281,7 @@ function isRetryDue(schedule: Schedule, now: Date): boolean {
   return now >= new Date(last.getTime() + interval * 1000);
 }
 
-// BUG #F: 64 bits reais de entropia — shiftLeft(32) na big-integer lib.
+// BUG #F: 64 bits reais de entropia
 function makeRandomId(): bigInt.BigInteger {
   const hi = Math.floor(Math.random() * 0xFFFFFFFF);
   const lo = Math.floor(Math.random() * 0xFFFFFFFF);
@@ -332,7 +343,7 @@ async function getClient(account: Account): Promise<TelegramClient> {
     clients.set(account.id, client);
     sessions.set(account.id, account.session_string);
 
-    // BUG #G: jitter aleatório de até 10s
+    // BUG #G: jitter aleatório de até 10s para evitar spike simultâneo
     const jitter   = Math.floor(Math.random() * KEEPALIVE_JITTER_MAX_MS);
     const interval = setInterval(async () => {
       if (!client.connected) {
@@ -454,7 +465,7 @@ async function resolvePeer(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   ENVIO COM RETRY INTERNO
+   ENVIO COM RETRY INTERNO (grupos abertos / fallback)
    ───────────────────────────────────────────────────────────────────────────── */
 async function sendMessage(
   client: TelegramClient,
@@ -482,7 +493,6 @@ async function sendMessage(
               randomId:  makeRandomId(),
               noWebpage: true,
             }));
-
           } catch (err: any) {
             const errMsg = String(err?.message ?? "");
 
@@ -556,13 +566,16 @@ async function sendMessage(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   SNIPER — ENVIO ÚNICO COM TIMEOUT CURTO (sem retry interno)
+   SNIPER — ENVIO ÚNICO COM TIMEOUT CURTO
+   randomId opcional: se fornecido, reutiliza (deduplicação server-side);
+   se omitido, gera novo (usado na Fase 2, onde não há retry).
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperSendOnce(
   client: TelegramClient,
   account: Account,
   telegramChatId: string,
-  messageText: string
+  messageText: string,
+  randomId?: bigInt.BigInteger
 ): Promise<void> {
   const peer = await resolvePeer(client, telegramChatId, account.id);
 
@@ -570,7 +583,7 @@ async function sniperSendOnce(
     client.invoke(new Api.messages.SendMessage({
       peer:      peer as any,
       message:   messageText,
-      randomId:  makeRandomId(),
+      randomId:  randomId ?? makeRandomId(),
       noWebpage: true,
     })),
     new Promise<never>((_, r) =>
@@ -589,12 +602,12 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
   }
   sniperFiringNow.add(scheduleId);
 
-  // OPT #7: captura o timestamp exato de entrada para medir o lag do timer
   const sniperEnteredAt = Date.now();
 
   try {
     const now = new Date();
 
+    // ── Carrega schedule (pre-fetch ou live) ──────────────────────────────
     let schedule = schedulePrefetchCache.get(scheduleId);
     if (schedule) {
       schedulePrefetchCache.delete(scheduleId);
@@ -613,14 +626,12 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       schedule = data as unknown as Schedule;
     }
 
-    // OPT #7: log do lag do timer (quanto o setTimeout atrasou em relação ao planejado)
-    const scheduledAt      = new Date(schedule.next_run_at).getTime();
-    const plannedSniperAt  = scheduledAt - SNIPER_BEFORE_MS;
-    const timerLagMs       = sniperEnteredAt - plannedSniperAt;
+    const scheduledAt     = new Date(schedule.next_run_at).getTime();
+    const plannedSniperAt = scheduledAt - SNIPER_BEFORE_MS;
+    const timerLagMs      = sniperEnteredAt - plannedSniperAt;
     console.log(`[sniper][timing] timer lag: ${timerLagMs}ms (SNIPER_BEFORE_MS=${SNIPER_BEFORE_MS}, ideal=0)`);
 
     const group = schedule.groups;
-
     if (!group?.telegram_chat_id) {
       console.warn(`[sniper] Schedule ${scheduleId}: sem telegram_chat_id — pulando.`);
       return;
@@ -646,12 +657,25 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     const budgetEnd = Date.now() + SNIPER_BUDGET_MS;
     const results:  DispatchResult[] = [];
 
-    console.log(`[sniper] 🎯 Iniciando loop agressivo para schedule ${scheduleId} — ${members.length} conta(s)`);
+    console.log(`[sniper] 🎯 Iniciando loop para schedule ${scheduleId} — ${members.length} conta(s)`);
 
-    // ── FASE 1: loop agressivo na primeira conta ──────────────────────────
+    // ── FASE 1: loop puro na primeira conta ───────────────────────────────
+    //
+    // OPT #8 — randomId fixo para todo o ciclo desta fase:
+    //   Se um invoke demorar mais que SNIPER_SEND_TIMEOUT_MS e chegar ao
+    //   Telegram após nosso timeout local, o servidor deduplica pelo id
+    //   e descarta — exactly-once garantido mesmo com rede lenta.
+    //
+    // OPT #9 — zero delay artificial:
+    //   O único intervalo entre tentativas é o RTT de rede (~25ms),
+    //   que é inevitável: precisamos da resposta de erro para saber que
+    //   o grupo ainda está fechado antes de tentar novamente.
+    //   Qualquer sleep artificial só aumenta a janela cega.
+
     const firstMember  = members[0];
     const firstAccount = firstMember.accounts!;
     const firstText    = firstMember.message_text ?? "";
+    const firstRandId  = makeRandomId(); // fixo para todo o ciclo desta fase
 
     let firstClient: TelegramClient;
     try {
@@ -669,38 +693,31 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       return;
     }
 
-    let attempt        = 0;
     let firstSentAt: Date | null = null;
+    let attempt = 0;
 
-    while (Date.now() < budgetEnd) {
+    while (!firstSentAt && Date.now() < budgetEnd) {
       attempt++;
 
       try {
-        await sniperSendOnce(firstClient, firstAccount, chatId, firstText);
+        await sniperSendOnce(firstClient, firstAccount, chatId, firstText, firstRandId);
         firstSentAt = new Date();
 
-        // OPT #7: logs de timing para calibração de SNIPER_BEFORE_MS
-        const invokeRttMs  = firstSentAt.getTime() - sniperEnteredAt;
-        const vsHorarioMs  = firstSentAt.getTime() - scheduledAt;
+        const invokeRttMs = firstSentAt.getTime() - sniperEnteredAt;
+        const vsHorarioMs = firstSentAt.getTime() - scheduledAt;
         console.log(`[sniper][timing] invoke RTT: ${invokeRttMs}ms (tempo real do MTProto+network)`);
         console.log(`[sniper][timing] vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms (negativo=antes, positivo=atrasado) tentativa=${attempt}`);
-
         console.log(`[sniper] ✓ Primeira conta ${firstAccount.phone_number} enviou na tentativa ${attempt} (${firstSentAt.toISOString()})`);
-        results.push({
-          account_id:   firstAccount.id,
-          message_text: firstMember.message_text,
-          status:       "sent",
-          retryable:    false,
-        });
-        break;
+
       } catch (err: any) {
         const errMsg = String(err?.message ?? "");
-        const isFatal =
+
+        // Erro fatal — para imediatamente
+        if (
           errMsg.includes("AUTH_KEY_UNREGISTERED") ||
           errMsg.includes("USER_DEACTIVATED")      ||
-          errMsg.includes("SESSION_REVOKED");
-
-        if (isFatal) {
+          errMsg.includes("SESSION_REVOKED")
+        ) {
           console.error(`[sniper] Erro fatal na conta ${firstAccount.phone_number}: ${errMsg}`);
           results.push({
             account_id:   firstAccount.id,
@@ -713,7 +730,8 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
           return;
         }
 
-        // BUG #C: FloodWait — aguarda tempo exato antes de retomar
+        // FloodWait — limite hard do Telegram por conta/sessão.
+        // Aguardamos o mínimo obrigatório e retomamos imediatamente.
         const isFlood =
           err?.seconds != null ||
           err?.constructor?.name === "FloodWaitError" ||
@@ -727,13 +745,14 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
           console.warn(`[sniper] FloodWait ${waitSecs}s — pausando loop (budget restante: ${Math.round((budgetEnd - Date.now()) / 1000)}s)`);
           if (waitMs < budgetEnd - Date.now() - 500) {
             await new Promise(r => setTimeout(r, waitMs));
-            continue;
+            continue; // retry imediato após wait obrigatório
           } else {
             console.warn(`[sniper] FloodWait ${waitSecs}s excede budget — encerrando loop`);
             break;
           }
         }
 
+        // Peer inválido — limpa cache, resolvePeer reconstrói na próxima tentativa
         if (
           errMsg.includes("PEER_ID_INVALID") ||
           errMsg.includes("CHANNEL_INVALID") ||
@@ -742,11 +761,8 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
           peerCache.delete(`${firstAccount.id}:${chatId}`);
         }
 
-        if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
-          await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
-        } else {
-          await new Promise(r => setTimeout(r, SNIPER_ATTEMPT_INTERVAL_MS));
-        }
+        // Qualquer outro erro (grupo fechado, timeout local, etc.):
+        // o loop volta imediatamente. Zero delay artificial.
       }
     }
 
@@ -780,57 +796,76 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       return;
     }
 
-    // ── FASE 2: demais contas em sequência com delay de 1ms ──────────────
-    for (let i = 1; i < members.length; i++) {
-      await new Promise(r => setTimeout(r, SNIPER_INTER_ACCOUNT_DELAY_MS));
+    results.push({
+      account_id:   firstAccount.id,
+      message_text: firstMember.message_text,
+      status:       "sent",
+      retryable:    false,
+    });
 
-      const member  = members[i];
-      const account = member.accounts!;
-      const text    = member.message_text ?? "";
-      let   sentAt: Date | null = null;
-      let   error: string | undefined;
+    // ── FASE 2: contas restantes — todas em paralelo, sem delay ──────────
+    //
+    // OPT #10 — Promise.allSettled: todas as contas disparam simultaneamente.
+    // Cada conta é independente — falha em uma não afeta as outras.
+    // randomId único por conta (sem retry aqui, disparo único por conta).
+    // Grupos com uma única conta nunca chegam aqui.
 
-      try {
-        const client = await getClient(account);
-        await sniperSendOnce(client, account, chatId, text);
-        sentAt = new Date();
-        console.log(`[sniper] ✓ Conta ${i + 1}/${members.length} ${account.phone_number} enviou`);
-        results.push({
-          account_id:   account.id,
-          message_text: member.message_text,
-          status:       "sent",
-          retryable:    false,
-        });
-      } catch (err: any) {
-        error = String(err?.message ?? "");
-        console.error(`[sniper] ✗ Conta ${i + 1}/${members.length} ${account.phone_number}: ${error}`);
-        results.push({
-          account_id:   account.id,
-          message_text: member.message_text,
-          status:       "failed",
-          retryable:    isRetryableError(error),
-          error,
-        });
+    if (members.length > 1) {
+      const phase2Results = await Promise.allSettled(
+        members.slice(1).map(async (member, idx) => {
+          const account = member.accounts!;
+          const text    = member.message_text ?? "";
+          let   sentAt: Date | null = null;
+          let   error:  string | undefined;
+
+          try {
+            const client = await getClient(account);
+            // randomId novo por conta — cada conta é um envio independente
+            await sniperSendOnce(client, account, chatId, text);
+            sentAt = new Date();
+            console.log(`[sniper] ✓ Conta ${idx + 2}/${members.length} ${account.phone_number} enviou`);
+          } catch (err: any) {
+            error = String(err?.message ?? "");
+            console.error(`[sniper] ✗ Conta ${idx + 2}/${members.length} ${account.phone_number}: ${error}`);
+          }
+
+          // Log em background
+          supabase.from("dispatch_logs").insert({
+            user_id:             schedule.user_id,
+            group_id:            group.id,
+            account_id:          account.id,
+            schedule_id:         schedule.id,
+            status:              sentAt ? "sent" : "failed",
+            message_text:        member.message_text,
+            position_rank:       idx + 2,
+            group_name_snapshot: group.name,
+            chat_name_snapshot:  group.telegram_chat_name,
+            sent_at:             sentAt ? sentAt.toISOString() : null,
+            error_message:       error ?? null,
+          }).then(({ error: e }) => {
+            if (e) console.error(`[sniper][log] Falha ao inserir log para ${account.id}:`, e.message);
+          });
+
+          return {
+            account_id:   account.id,
+            message_text: member.message_text,
+            status:       (sentAt ? "sent" : "failed") as "sent" | "failed",
+            retryable:    !sentAt && isRetryableError(error ?? ""),
+            error,
+          } satisfies DispatchResult;
+        })
+      );
+
+      for (const r of phase2Results) {
+        if (r.status === "fulfilled") {
+          results.push(r.value);
+        }
+        // "rejected" só ocorre se houver exceção não capturada dentro do map —
+        // na prática impossível dado o try/catch acima, mas tratamos por robustez.
       }
-
-      supabase.from("dispatch_logs").insert({
-        user_id:             schedule.user_id,
-        group_id:            group.id,
-        account_id:          account.id,
-        schedule_id:         schedule.id,
-        status:              sentAt ? "sent" : "failed",
-        message_text:        member.message_text,
-        position_rank:       i + 1,
-        group_name_snapshot: group.name,
-        chat_name_snapshot:  group.telegram_chat_name,
-        sent_at:             sentAt ? sentAt.toISOString() : null,
-        error_message:       error ?? null,
-      }).then(({ error: e }) => {
-        if (e) console.error(`[sniper][log] Falha ao inserir log para ${account.id}:`, e.message);
-      });
     }
 
-    // ── FASE 3: monitoramento de posições ─────────────────────────────────
+    // ── FASE 3: monitoramento de posições (background) ────────────────────
     const sentForMonitor = results
       .filter(r => r.status === "sent")
       .map(r => ({ account_id: r.account_id, message_text: r.message_text ?? "" }))
@@ -1364,7 +1399,7 @@ function scheduleTimer(scheduleId: string, nextRunAt: string, groupType?: "open"
 
   const effectiveDelay = Math.max(0, delay);
 
-  // OPT #2: pre-fetch do schedule PREFETCH_BEFORE_MS antes do fire.
+  // OPT #2: pre-fetch do schedule PREFETCH_BEFORE_MS antes do fire
   if (effectiveDelay > PREFETCH_BEFORE_MS) {
     const prefetchDelay = effectiveDelay - PREFETCH_BEFORE_MS;
     const pt = setTimeout(async () => {
@@ -1399,7 +1434,7 @@ function scheduleTimer(scheduleId: string, nextRunAt: string, groupType?: "open"
     prefetchTimers.set(scheduleId, pt);
   }
 
-  // OPT #5: sniper para grupos fechados.
+  // OPT #5: sniper para grupos fechados
   if (groupType === "closed" && effectiveDelay > SNIPER_BEFORE_MS) {
     const sniperDelay = effectiveDelay - SNIPER_BEFORE_MS;
     const st = setTimeout(async () => {
@@ -1525,8 +1560,7 @@ async function reloadSchedules(): Promise<void> {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   RECONEXÃO LEVE
-   BUG #E: só reconecta clientes offline, sem getDialogs.
+   RECONEXÃO LEVE — BUG #E: só reconecta clientes offline, sem getDialogs.
    ───────────────────────────────────────────────────────────────────────────── */
 async function reconnectDeadClients(): Promise<void> {
   const reconnectPromises: Promise<void>[] = [];
@@ -1586,7 +1620,7 @@ async function prewarmAccounts(): Promise<void> {
       }
     }));
 
-    // OPT #3: pre-resolve de peers para todos os grupos ativos.
+    // OPT #3: pre-resolve de peers para todos os grupos ativos
     try {
       const { data: groups } = await supabase
         .from("groups")
@@ -1641,6 +1675,7 @@ const httpServer = http.createServer(async (req, res) => {
 
   const url = new URL(req.url ?? "/", `http://localhost:${WORKER_PORT}`);
 
+  // ── GET /accounts/:id/chats ──────────────────────────────────────────────
   const chatsMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chats$/);
   if (req.method === "GET" && chatsMatch) {
     const account = accountCache.get(chatsMatch[1]);
@@ -1664,6 +1699,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
+  // ── GET /accounts/:id/chat-count?chat_id=XXXX ───────────────────────────
   const chatCountMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-count$/);
   if (req.method === "GET" && chatCountMatch) {
     const chatId  = url.searchParams.get("chat_id");
@@ -1729,6 +1765,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
+  // ── GET /accounts/:id/chat-members?chat_id=XXXX ─────────────────────────
   const membersMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-members$/);
   if (req.method === "GET" && membersMatch) {
     const chatId  = url.searchParams.get("chat_id");
@@ -1808,6 +1845,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
+  // ── POST /accounts/:id/reload ────────────────────────────────────────────
   const reloadMatch = url.pathname.match(/^\/accounts\/([^/]+)\/reload$/);
   if (req.method === "POST" && reloadMatch) {
     const accountId = reloadMatch[1];
@@ -1837,6 +1875,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
+  // ── POST/DELETE /groups/:id/listen ───────────────────────────────────────
   const listenMatch = url.pathname.match(/^\/groups\/([^/]+)\/listen$/);
   if (listenMatch) {
     const groupId = listenMatch[1];
