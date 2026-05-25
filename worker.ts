@@ -5,97 +5,42 @@
 //         entre RETRY_BUDGET_MS=50s e RELOAD_INTERVAL_MS=30s)
 //
 // Fix v2 (2025-05):
-//   BUG #1 — reconnect loop infinito:
-//     _loopStarted=true antes de connect() suprime o updateLoop sem quebrar
-//     o fluxo de reconexão (autoReconnect, _handleReconnect não dependem do flag).
-//
-//   BUG #2 — peerCache stale após reconexão:
-//     Ao desconectar/reconectar um account, todos os peers desse account
-//     são removidos do cache. accessHash gerado com sessão anterior é inválido.
-//
-//   BUG #3 — sem delay entre tentativas no sendMessage:
-//     Adicionado backoff exponencial (1s → 2s → 4s → 8s) entre tentativas.
-//
-//   BUG #4 — getDialogs warm-up não era awaited:
-//     Warm-up movido para prewarmAccounts() com await + pre-resolve de peers.
+//   BUG #1 — reconnect loop infinito
+//   BUG #2 — peerCache stale após reconexão
+//   BUG #3 — sem delay entre tentativas no sendMessage
+//   BUG #4 — getDialogs warm-up não era awaited
 //
 // Fix v3 (2025-05):
-//   BUG #5 — AUTH_KEY_DUPLICATED (406) via race condition em getClient():
-//     connectingPromises Map<accountId, Promise<TelegramClient>> serializa
-//     conexões concorrentes para o mesmo account.
+//   BUG #5 — AUTH_KEY_DUPLICATED (406) via race condition em getClient()
 //
-// Otimizações v4 (2025-05) — latência mínima no caminho crítico:
+// Otimizações v4 (2025-05):
+//   OPT #1..#4
 //
-//   OPT #1 — invoke direto em vez de client.sendMessage():
-//   OPT #2 — pre-fetch do schedule antes do fire
-//   OPT #3 — pre-resolve de peers no prewarm
-//   OPT #4 — noWebpage: true + randomId único por tentativa
+// Fix v5 (2025-05): sniper loop para grupos fechados
+// Fix v6 (2025-05): correções de bugs críticos (BUG #A..#G)
+// Fix v7 (2025-05): timing logs + calibração SNIPER_BEFORE_MS
+// Fix v8 (2025-05): sniper zero-delay + fase 2 paralela (OPT #8..#10)
 //
-// Fix v5 (2025-05) — sniper loop para grupos fechados:
-//   OPT #5 — sniperFireClosed(): loop ultra-agressivo para grupos fechados
+// Fix v9 (2025-05) — correções de duplicidade crítica:
 //
-// Fix v6 (2025-05) — correções de bugs críticos:
+//   BUG #H — getAlreadySentIds retornava Set vazio em caso de erro Supabase:
+//     Falha silenciosa tornava todos os accounts elegíveis de novo, causando
+//     duplicata garantida em retry com banco instável. Agora lança exceção
+//     (fail-closed): sem confirmação de quem já enviou, não dispara.
 //
-//   BUG #A — duplo disparo sniper + fireSchedule no mesmo ciclo:
-//     Ao terminar (sucesso ou falha), sniperFireClosed() registra o scheduleId
-//     em firingNow com TTL de 60s. Isso bloqueia o fireSchedule do mesmo ciclo
-//     que ainda está pendente no setTimeout.
+//   BUG #I — sem lock distribuído entre processos/restarts:
+//     firingNow é in-memory. Crash + restart durante disparo → banco com
+//     next_run_at não atualizado → reloadSchedules dispara de novo.
+//     Solução: acquireScheduleLock() em fireSchedule faz UPDATE atômico no
+//     Postgres com condição WHERE, garantindo que só um processo/instância
+//     dispara por vez. Lock expira em 90s automaticamente.
+//     NOTA: sniperFireClosed NÃO usa o lock distribuído — sniperFiringNow
+//     é suficiente para instância única e o lock adicionaria latência
+//     inaceitável no caminho crítico de timing.
 //
-//   BUG #B — groupType perdido após o 1º ciclo:
-//     updateScheduleAfterDispatch() agora recebe e repassa groupType para
-//     scheduleTimer(). Sem isso, grupos fechados perdiam o sniper silenciosamente
-//     a partir do 2º ciclo.
-//
-//   BUG #C — FloodWait no sniper gera ~30.000 chamadas em 30s:
-//     Sniper agora detecta FloodWait e aguarda o tempo exato antes de retomar.
-//     Se o wait excede o budget, encerra o loop graciosamente.
-//
-//   BUG #D — reloadClient() deleta mutex sem await da promise inflight:
-//     Aguarda a promise em andamento antes de deletar connectingPromises,
-//     evitando AUTH_KEY_DUPLICATED por conexão dupla simultânea.
-//
-//   BUG #E — prewarmAccounts() a cada 30s chama getDialogs em todas as contas:
-//     Prewarm completo (getDialogs + peer pre-resolve) só roda no boot.
-//     O interval periódico chama reconnectDeadClients() — apenas reconecta
-//     clientes offline sem recarregar dialogs.
-//
-//   BUG #F — makeRandomId com entropia insuficiente (colisão em envios paralelos):
-//     Usa 64 bits reais via shiftLeft(32) na biblioteca big-integer.
-//
-//   BUG #G — keepalive sem jitter: spike de N contas simultâneas a cada 45s:
-//     Cada setInterval recebe até 10s de jitter aleatório no boot.
-//
-// Fix v7 (2025-05) — timing logs + calibração SNIPER_BEFORE_MS:
-//
-//   OPT #6 — SNIPER_BEFORE_MS aumentado de 20 para 45ms:
-//     Railway US East → Telegram DC1/DC3 Miami: RTT medido ~50ms (round-trip).
-//     Invoke one-way ~25ms + event loop lag Node.js ~5-15ms = precisa de ~40ms
-//     de antecipação mínima. 45ms dá ~5ms de margem.
-//     Calibrar com os logs [sniper][timing] após alguns disparos reais.
-//
-//   OPT #7 — logs de timing no sniper para diagnóstico preciso:
-//     [sniper][timing] timer lag: Xms   → quanto o setTimeout atrasou
-//     [sniper][timing] invoke RTT: Xms  → tempo real do MTProto
-//     [sniper][timing] vs horário: Xms  → negativo=antes, positivo=atrasado
-//     Com esses dados é possível calibrar SNIPER_BEFORE_MS no valor exato.
-//
-// Fix v8 (2025-05) — sniper zero-delay + fase 2 paralela:
-//
-//   OPT #8 — randomId fixo por ciclo na Fase 1 do sniper:
-//     Um único randomId é gerado antes do loop e reutilizado em todas as
-//     tentativas. Se um invoke "fantasma" chegar ao Telegram após nosso
-//     timeout local (rede lenta), o servidor deduplica pelo id e ignora —
-//     garante exactly-once mesmo com timeout falso.
-//
-//   OPT #9 — zero delay artificial entre tentativas na Fase 1:
-//     Removidos SNIPER_ATTEMPT_INTERVAL_MS (1ms) e SNIPER_PAUSE_EVERY_N/
-//     SNIPER_PAUSE_MS (5ms a cada 10 tentativas). O único delay real entre
-//     tentativas é o RTT de rede (~25ms) — inevitável e suficiente.
-//
-//   OPT #10 — Fase 2 do sniper totalmente paralela (Promise.allSettled):
-//     Contas restantes disparam simultaneamente em vez de sequencialmente.
-//     Após a Fase 1 confirmar, cada millisegundo de espera é posição perdida.
-//     Grupos de uma única conta nunca chegam na Fase 2 — zero impacto.
+//   BUG #B (bonus) — groupType perdido em expiredRetries:
+//     scheduleTimer() chamado sem groupType ao expirar retry window.
+//     Agora busca group_type do banco antes de agendar.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -135,6 +80,10 @@ const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
 
 // BUG #A: após o sniper terminar, bloqueia fireSchedule do mesmo ciclo por este TTL
 const SNIPER_DONE_BLOCK_TTL_MS      = 60_000;
+
+// BUG #I: lock distribuído — expira após este tempo (deve ser > RETRY_BUDGET_MS)
+// Usado apenas em fireSchedule e reloadSchedules.
+const DISTRIBUTED_LOCK_TTL_MS       = 90_000;
 
 const WORKER_PORT   = parseInt(process.env.PORT ?? "3001", 10);
 const WORKER_SECRET = process.env.WORKER_SECRET ?? "";
@@ -286,6 +235,52 @@ function makeRandomId(): bigInt.BigInteger {
   const hi = Math.floor(Math.random() * 0xFFFFFFFF);
   const lo = Math.floor(Math.random() * 0xFFFFFFFF);
   return bigInt(hi).shiftLeft(32).add(bigInt(lo));
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   LOCK DISTRIBUÍDO — BUG #I
+   Usado apenas em fireSchedule (não no sniper — timing crítico).
+   Usa UPDATE atômico no Postgres: só um processo/instância adquire o lock.
+   Condição: last_attempt_status != 'firing' OU lock expirou (> 90s atrás).
+   Retorna true se adquiriu, false se já está locked por outro processo.
+   ───────────────────────────────────────────────────────────────────────────── */
+async function acquireScheduleLock(scheduleId: string): Promise<boolean> {
+  const lockExpiry = new Date(Date.now() - DISTRIBUTED_LOCK_TTL_MS).toISOString();
+  const now        = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from("schedules")
+    .update({
+      last_attempt_status: "firing",
+      last_attempt_at:     now,
+    })
+    .eq("id", scheduleId)
+    .eq("is_active", true)
+    .or(`last_attempt_status.neq.firing,last_attempt_at.lte.${lockExpiry}`)
+    .select("id");
+
+  if (error) {
+    console.error(`[lock] Erro ao adquirir lock para ${scheduleId}:`, error.message);
+    return false;
+  }
+
+  const acquired = Array.isArray(data) && data.length > 0;
+  if (!acquired) {
+    console.warn(`[lock] Schedule ${scheduleId} já em disparo em outro processo — abortando`);
+  }
+  return acquired;
+}
+
+async function releaseScheduleLock(scheduleId: string, status: string): Promise<void> {
+  const { error } = await supabase
+    .from("schedules")
+    .update({ last_attempt_status: status })
+    .eq("id", scheduleId)
+    .eq("last_attempt_status", "firing");
+
+  if (error) {
+    console.warn(`[lock] Falha ao liberar lock para ${scheduleId}:`, error.message);
+  }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -594,6 +589,9 @@ async function sniperSendOnce(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    SNIPER LOOP — GRUPOS FECHADOS
+   Proteção de duplicidade: sniperFiringNow (in-memory) é suficiente para
+   instância única. O lock distribuído NÃO é usado aqui para preservar
+   a latência mínima no caminho crítico de timing.
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperFireClosed(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -667,15 +665,12 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     //   e descarta — exactly-once garantido mesmo com rede lenta.
     //
     // OPT #9 — zero delay artificial:
-    //   O único intervalo entre tentativas é o RTT de rede (~25ms),
-    //   que é inevitável: precisamos da resposta de erro para saber que
-    //   o grupo ainda está fechado antes de tentar novamente.
-    //   Qualquer sleep artificial só aumenta a janela cega.
+    //   O único intervalo entre tentativas é o RTT de rede (~25ms).
 
     const firstMember  = members[0];
     const firstAccount = firstMember.accounts!;
     const firstText    = firstMember.message_text ?? "";
-    const firstRandId  = makeRandomId(); // fixo para todo o ciclo desta fase
+    const firstRandId  = makeRandomId();
 
     let firstClient: TelegramClient;
     try {
@@ -705,14 +700,13 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
         const invokeRttMs = firstSentAt.getTime() - sniperEnteredAt;
         const vsHorarioMs = firstSentAt.getTime() - scheduledAt;
-        console.log(`[sniper][timing] invoke RTT: ${invokeRttMs}ms (tempo real do MTProto+network)`);
+        console.log(`[sniper][timing] invoke RTT: ${invokeRttMs}ms`);
         console.log(`[sniper][timing] vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms (negativo=antes, positivo=atrasado) tentativa=${attempt}`);
         console.log(`[sniper] ✓ Primeira conta ${firstAccount.phone_number} enviou na tentativa ${attempt} (${firstSentAt.toISOString()})`);
 
       } catch (err: any) {
         const errMsg = String(err?.message ?? "");
 
-        // Erro fatal — para imediatamente
         if (
           errMsg.includes("AUTH_KEY_UNREGISTERED") ||
           errMsg.includes("USER_DEACTIVATED")      ||
@@ -730,8 +724,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
           return;
         }
 
-        // FloodWait — limite hard do Telegram por conta/sessão.
-        // Aguardamos o mínimo obrigatório e retomamos imediatamente.
         const isFlood =
           err?.seconds != null ||
           err?.constructor?.name === "FloodWaitError" ||
@@ -745,14 +737,13 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
           console.warn(`[sniper] FloodWait ${waitSecs}s — pausando loop (budget restante: ${Math.round((budgetEnd - Date.now()) / 1000)}s)`);
           if (waitMs < budgetEnd - Date.now() - 500) {
             await new Promise(r => setTimeout(r, waitMs));
-            continue; // retry imediato após wait obrigatório
+            continue;
           } else {
             console.warn(`[sniper] FloodWait ${waitSecs}s excede budget — encerrando loop`);
             break;
           }
         }
 
-        // Peer inválido — limpa cache, resolvePeer reconstrói na próxima tentativa
         if (
           errMsg.includes("PEER_ID_INVALID") ||
           errMsg.includes("CHANNEL_INVALID") ||
@@ -760,9 +751,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         ) {
           peerCache.delete(`${firstAccount.id}:${chatId}`);
         }
-
-        // Qualquer outro erro (grupo fechado, timeout local, etc.):
-        // o loop volta imediatamente. Zero delay artificial.
       }
     }
 
@@ -803,12 +791,9 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       retryable:    false,
     });
 
-    // ── FASE 2: contas restantes — todas em paralelo, sem delay ──────────
+    // ── FASE 2: contas restantes — todas em paralelo ──────────────────────
     //
     // OPT #10 — Promise.allSettled: todas as contas disparam simultaneamente.
-    // Cada conta é independente — falha em uma não afeta as outras.
-    // randomId único por conta (sem retry aqui, disparo único por conta).
-    // Grupos com uma única conta nunca chegam aqui.
 
     if (members.length > 1) {
       const phase2Results = await Promise.allSettled(
@@ -820,7 +805,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
           try {
             const client = await getClient(account);
-            // randomId novo por conta — cada conta é um envio independente
             await sniperSendOnce(client, account, chatId, text);
             sentAt = new Date();
             console.log(`[sniper] ✓ Conta ${idx + 2}/${members.length} ${account.phone_number} enviou`);
@@ -829,7 +813,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
             console.error(`[sniper] ✗ Conta ${idx + 2}/${members.length} ${account.phone_number}: ${error}`);
           }
 
-          // Log em background
           supabase.from("dispatch_logs").insert({
             user_id:             schedule.user_id,
             group_id:            group.id,
@@ -857,11 +840,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       );
 
       for (const r of phase2Results) {
-        if (r.status === "fulfilled") {
-          results.push(r.value);
-        }
-        // "rejected" só ocorre se houver exceção não capturada dentro do map —
-        // na prática impossível dado o try/catch acima, mas tratamos por robustez.
+        if (r.status === "fulfilled") results.push(r.value);
       }
     }
 
@@ -890,6 +869,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    DEDUPLICAÇÃO
+   BUG #H: fail-closed — lança exceção em vez de retornar Set vazio.
    ───────────────────────────────────────────────────────────────────────────── */
 async function getAlreadySentIds(schedule: Schedule): Promise<Set<string>> {
   const cycleStart = schedule.retry_until
@@ -906,9 +886,11 @@ async function getAlreadySentIds(schedule: Schedule): Promise<Set<string>> {
     .gte("sent_at", cycleStart);
 
   if (error) {
-    console.warn(`[dedup] Falha ao buscar enviados do schedule ${schedule.id}:`, error.message);
-    return new Set();
+    // FAIL-CLOSED: sem confirmação de quem já enviou, não dispara.
+    // Retornar Set vazio aqui causaria duplicatas em caso de banco instável.
+    throw new Error(`[dedup] Query falhou para schedule ${schedule.id}: ${error.message}`);
   }
+
   return new Set((data ?? []).map(r => r.account_id as string));
 }
 
@@ -1133,7 +1115,7 @@ async function dispatchToGroup(
     .filter(m => m.is_active && m.accounts?.is_active && m.accounts?.session_string)
     .sort((a, b) => a.position - b.position);
 
-  return Promise.all(members.map(async (member, i) => {
+  return Promise.allSettled(members.map(async (member, i) => {
     const account      = member.accounts!;
     const positionRank = i + 1;
 
@@ -1182,7 +1164,11 @@ async function dispatchToGroup(
     });
 
     return { account_id: account.id, message_text: member.message_text, status, retryable, error };
-  }));
+  })).then(results =>
+    results
+      .filter((r): r is PromiseFulfilledResult<DispatchResult> => r.status === "fulfilled")
+      .map(r => r.value)
+  );
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -1281,6 +1267,11 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     console.warn(`[fire] Schedule ${scheduleId} já em execução — ignorando disparo duplicado`);
     return;
   }
+
+  // BUG #I: lock distribuído — garante exactly-once entre processos/restarts
+  const locked = await acquireScheduleLock(scheduleId);
+  if (!locked) return;
+
   firingNow.add(scheduleId);
 
   try {
@@ -1300,6 +1291,7 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
       if (error || !data) {
         console.warn(`[fire] Schedule ${scheduleId} não encontrado ou inativo.`);
+        await releaseScheduleLock(scheduleId, "failed");
         return;
       }
       schedule = data as unknown as Schedule;
@@ -1309,6 +1301,7 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
     if (!group?.telegram_chat_id) {
       console.warn(`[fire] Schedule ${scheduleId}: sem telegram_chat_id — pulando.`);
+      await releaseScheduleLock(scheduleId, "failed");
       return;
     }
 
@@ -1324,6 +1317,7 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     if (group.group_type === "open") {
       if (listenMap.has(group.id)) {
         console.log(`[fire] Listener já ativo para grupo ${group.id} — ignorando`);
+        await releaseScheduleLock(scheduleId, "waiting_admin");
         return;
       }
 
@@ -1333,6 +1327,7 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
       if (!firstAccount) {
         console.warn(`[fire] Nenhuma conta ativa no grupo — abortando.`);
+        await releaseScheduleLock(scheduleId, "failed");
         return;
       }
 
@@ -1348,9 +1343,16 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     }
 
     // Grupo fechado chegou aqui sem sniper (retry via banco, boot tardio, etc.)
-    const alreadySent = schedule.retry_until
-      ? await getAlreadySentIds(schedule)
-      : new Set<string>();
+    let alreadySent: Set<string>;
+    try {
+      alreadySent = schedule.retry_until
+        ? await getAlreadySentIds(schedule)
+        : new Set<string>();
+    } catch (err: any) {
+      console.error(`[fire] ${err.message} — abortando disparo para evitar duplicata`);
+      await releaseScheduleLock(scheduleId, "retrying");
+      return;
+    }
 
     if (alreadySent.size > 0) {
       console.log(`[dedup] ${alreadySent.size} account(s) já enviaram neste ciclo — pulando.`);
@@ -1374,6 +1376,10 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
     await updateScheduleAfterDispatch(schedule, results, now, group.group_type);
 
+  } catch (err: any) {
+    console.error(`[fire] Erro inesperado no schedule ${scheduleId}:`, err.message);
+    await releaseScheduleLock(scheduleId, "failed");
+    throw err;
   } finally {
     firingNow.delete(scheduleId);
   }
@@ -1399,7 +1405,6 @@ function scheduleTimer(scheduleId: string, nextRunAt: string, groupType?: "open"
 
   const effectiveDelay = Math.max(0, delay);
 
-  // OPT #2: pre-fetch do schedule PREFETCH_BEFORE_MS antes do fire
   if (effectiveDelay > PREFETCH_BEFORE_MS) {
     const prefetchDelay = effectiveDelay - PREFETCH_BEFORE_MS;
     const pt = setTimeout(async () => {
@@ -1434,7 +1439,6 @@ function scheduleTimer(scheduleId: string, nextRunAt: string, groupType?: "open"
     prefetchTimers.set(scheduleId, pt);
   }
 
-  // OPT #5: sniper para grupos fechados
   if (groupType === "closed" && effectiveDelay > SNIPER_BEFORE_MS) {
     const sniperDelay = effectiveDelay - SNIPER_BEFORE_MS;
     const st = setTimeout(async () => {
@@ -1471,11 +1475,14 @@ function scheduleTimer(scheduleId: string, nextRunAt: string, groupType?: "open"
 
 /* ─────────────────────────────────────────────────────────────────────────────
    RELOAD PERIÓDICO
+   BUG #B (bonus): expiredRetries agora busca group_type para passar ao scheduleTimer.
+   BUG #I: reloadSchedules pula schedules com lock ativo recente (status='firing').
    ───────────────────────────────────────────────────────────────────────────── */
 async function reloadSchedules(): Promise<void> {
   const now          = new Date();
   const nowISO       = now.toISOString();
   const lookaheadISO = new Date(now.getTime() + LOOKAHEAD_MS).toISOString();
+  const lockExpiry   = new Date(now.getTime() - DISTRIBUTED_LOCK_TTL_MS).toISOString();
 
   const [
     { data: futureSchedules },
@@ -1486,16 +1493,18 @@ async function reloadSchedules(): Promise<void> {
       .select("id, next_run_at, groups(group_type)")
       .eq("is_active", true)
       .is("retry_until", null)
-      .lte("next_run_at", lookaheadISO),
+      .lte("next_run_at", lookaheadISO)
+      .or(`last_attempt_status.neq.firing,last_attempt_at.lte.${lockExpiry}`),
 
     supabase.from("schedules")
       .select(SCHEDULE_SELECT)
       .eq("is_active", true)
       .not("retry_until", "is", null)
-      .gt("retry_until", nowISO),
+      .gt("retry_until", nowISO)
+      .or(`last_attempt_status.neq.firing,last_attempt_at.lte.${lockExpiry}`),
 
     supabase.from("schedules")
-      .select("id, cron_expression, group_id")
+      .select("id, cron_expression, group_id, groups(group_type)")
       .eq("is_active", true)
       .not("retry_until", "is", null)
       .lte("retry_until", nowISO),
@@ -1530,7 +1539,10 @@ async function reloadSchedules(): Promise<void> {
       last_attempt_status: "failed",
       last_attempt_error:  "Retry expirou sem sucesso total",
     }).eq("id", expired.id);
-    scheduleTimer(expired.id, nextRun);
+
+    // BUG #B (bonus): passa group_type para scheduleTimer
+    const gType = (expired as any).groups?.group_type as "open" | "closed" | undefined;
+    scheduleTimer(expired.id, nextRun, gType);
   }));
 
   for (const s of futureSchedules ?? []) {
@@ -1620,7 +1632,6 @@ async function prewarmAccounts(): Promise<void> {
       }
     }));
 
-    // OPT #3: pre-resolve de peers para todos os grupos ativos
     try {
       const { data: groups } = await supabase
         .from("groups")
@@ -1675,7 +1686,6 @@ const httpServer = http.createServer(async (req, res) => {
 
   const url = new URL(req.url ?? "/", `http://localhost:${WORKER_PORT}`);
 
-  // ── GET /accounts/:id/chats ──────────────────────────────────────────────
   const chatsMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chats$/);
   if (req.method === "GET" && chatsMatch) {
     const account = accountCache.get(chatsMatch[1]);
@@ -1699,7 +1709,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // ── GET /accounts/:id/chat-count?chat_id=XXXX ───────────────────────────
   const chatCountMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-count$/);
   if (req.method === "GET" && chatCountMatch) {
     const chatId  = url.searchParams.get("chat_id");
@@ -1765,7 +1774,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // ── GET /accounts/:id/chat-members?chat_id=XXXX ─────────────────────────
   const membersMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-members$/);
   if (req.method === "GET" && membersMatch) {
     const chatId  = url.searchParams.get("chat_id");
@@ -1845,7 +1853,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // ── POST /accounts/:id/reload ────────────────────────────────────────────
   const reloadMatch = url.pathname.match(/^\/accounts\/([^/]+)\/reload$/);
   if (req.method === "POST" && reloadMatch) {
     const accountId = reloadMatch[1];
@@ -1875,7 +1882,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // ── POST/DELETE /groups/:id/listen ───────────────────────────────────────
   const listenMatch = url.pathname.match(/^\/groups\/([^/]+)\/listen$/);
   if (listenMatch) {
     const groupId = listenMatch[1];
