@@ -64,6 +64,20 @@
 //
 //   BUG #G — keepalive sem jitter: spike de N contas simultâneas a cada 45s:
 //     Cada setInterval recebe até 10s de jitter aleatório no boot.
+//
+// Fix v7 (2025-05) — timing logs + calibração SNIPER_BEFORE_MS:
+//
+//   OPT #6 — SNIPER_BEFORE_MS aumentado de 20 para 45ms:
+//     Railway US East → Telegram DC1/DC3 Miami: RTT medido ~50ms (round-trip).
+//     Invoke one-way ~25ms + event loop lag Node.js ~5-15ms = precisa de ~40ms
+//     de antecipação mínima. 45ms dá ~5ms de margem.
+//     Calibrar com os logs [sniper][timing] após alguns disparos reais.
+//
+//   OPT #7 — logs de timing no sniper para diagnóstico preciso:
+//     [sniper][timing] timer lag: Xms   → quanto o setTimeout atrasou
+//     [sniper][timing] invoke RTT: Xms  → tempo real do MTProto
+//     [sniper][timing] vs horário: Xms  → negativo=antes, positivo=atrasado
+//     Com esses dados é possível calibrar SNIPER_BEFORE_MS no valor exato.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -83,30 +97,33 @@ const supabase = createClient(
    CONSTANTES
    ───────────────────────────────────────────────────────────────────────────── */
 
-const SEND_TIMEOUT_MS              = 15_000;
-const RETRY_BUDGET_MS              = 50_000;
-const RELOAD_INTERVAL_MS           = 30_000;
-const LOOKAHEAD_MS                 = 2 * 60 * 1000;
-const KEEPALIVE_INTERVAL_MS        = 45_000;
-const KEEPALIVE_JITTER_MAX_MS      = 10_000; // BUG #G: jitter para evitar spike simultâneo
-const PREFETCH_BEFORE_MS           = 800;
-const MONITOR_DELAY_CLOSED_MS      = 6_000;
-const MONITOR_MAX_OPEN_MS          = 5 * 60_000;
-const MONITOR_POLL_MS              = 5_000;
-const LISTEN_POLL_MS               = 400;
-const MONITOR_HISTORY_LIMIT        = 150;
-const OPEN_GROUP_LISTEN_TIMEOUT_MS = 2 * 60 * 60_000;
-const SEND_RETRY_BACKOFF_MAX_MS    = 8_000;
-const SNIPER_BEFORE_MS             = 20;
-const SNIPER_SEND_TIMEOUT_MS       = 800;
-const SNIPER_ATTEMPT_INTERVAL_MS   = 1;
-const SNIPER_PAUSE_EVERY_N         = 10;
-const SNIPER_PAUSE_MS              = 5;
+const SEND_TIMEOUT_MS               = 15_000;
+const RETRY_BUDGET_MS               = 50_000;
+const RELOAD_INTERVAL_MS            = 30_000;
+const LOOKAHEAD_MS                  = 2 * 60 * 1000;
+const KEEPALIVE_INTERVAL_MS         = 45_000;
+const KEEPALIVE_JITTER_MAX_MS       = 10_000; // BUG #G: jitter para evitar spike simultâneo
+const PREFETCH_BEFORE_MS            = 800;
+const MONITOR_DELAY_CLOSED_MS       = 6_000;
+const MONITOR_MAX_OPEN_MS           = 5 * 60_000;
+const MONITOR_POLL_MS               = 5_000;
+const LISTEN_POLL_MS                = 400;
+const MONITOR_HISTORY_LIMIT         = 150;
+const OPEN_GROUP_LISTEN_TIMEOUT_MS  = 2 * 60 * 60_000;
+const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
+// OPT #6: era 20ms. Railway US East → DC Miami RTT ~50ms → one-way ~25ms.
+// 45ms cobre o one-way + event loop lag do Node (~5-15ms) com ~5ms de margem.
+// Ajuste fino baseado nos logs [sniper][timing] vs horário abaixo.
+const SNIPER_BEFORE_MS              = 45;
+const SNIPER_SEND_TIMEOUT_MS        = 800;
+const SNIPER_ATTEMPT_INTERVAL_MS    = 1;
+const SNIPER_PAUSE_EVERY_N          = 10;
+const SNIPER_PAUSE_MS               = 5;
 const SNIPER_INTER_ACCOUNT_DELAY_MS = 1;
-const SNIPER_BUDGET_MS             = RETRY_BUDGET_MS;
+const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
 
 // BUG #A: após o sniper terminar, bloqueia fireSchedule do mesmo ciclo por este TTL
-const SNIPER_DONE_BLOCK_TTL_MS     = 60_000;
+const SNIPER_DONE_BLOCK_TTL_MS      = 60_000;
 
 const WORKER_PORT   = parseInt(process.env.PORT ?? "3001", 10);
 const WORKER_SECRET = process.env.WORKER_SECRET ?? "";
@@ -168,19 +185,19 @@ interface DispatchResult {
    ESTADO GLOBAL
    ───────────────────────────────────────────────────────────────────────────── */
 
-const clients            = new Map<string, TelegramClient>();
-const sessions           = new Map<string, string>();
-const keepaliveTimers    = new Map<string, ReturnType<typeof setInterval>>();
-const peerCache          = new Map<string, unknown>();
-const accountCache       = new Map<string, Account>();
-const scheduledTimers    = new Map<string, ReturnType<typeof setTimeout>>();
-const prefetchTimers     = new Map<string, ReturnType<typeof setTimeout>>();
-const sniperTimers       = new Map<string, ReturnType<typeof setTimeout>>();
+const clients               = new Map<string, TelegramClient>();
+const sessions              = new Map<string, string>();
+const keepaliveTimers       = new Map<string, ReturnType<typeof setInterval>>();
+const peerCache             = new Map<string, unknown>();
+const accountCache          = new Map<string, Account>();
+const scheduledTimers       = new Map<string, ReturnType<typeof setTimeout>>();
+const prefetchTimers        = new Map<string, ReturnType<typeof setTimeout>>();
+const sniperTimers          = new Map<string, ReturnType<typeof setTimeout>>();
 const schedulePrefetchCache = new Map<string, Schedule>();
-const listenMap          = new Map<string, AbortController>();
-const firingNow          = new Set<string>();
-const sniperFiringNow    = new Set<string>();
-const connectingPromises = new Map<string, Promise<TelegramClient>>();
+const listenMap             = new Map<string, AbortController>();
+const firingNow             = new Set<string>();
+const sniperFiringNow       = new Set<string>();
+const connectingPromises    = new Map<string, Promise<TelegramClient>>();
 
 /* ─────────────────────────────────────────────────────────────────────────────
    QUERY REUTILIZADA
@@ -254,7 +271,6 @@ function isRetryDue(schedule: Schedule, now: Date): boolean {
 }
 
 // BUG #F: 64 bits reais de entropia — shiftLeft(32) na big-integer lib.
-// Antes usava Date.now()*1000 + rand(1000) → apenas ~10 bits efetivos de aleatoriedade.
 function makeRandomId(): bigInt.BigInteger {
   const hi = Math.floor(Math.random() * 0xFFFFFFFF);
   const lo = Math.floor(Math.random() * 0xFFFFFFFF);
@@ -278,8 +294,8 @@ function evictPeersForAccount(accountId: string): void {
    ───────────────────────────────────────────────────────────────────────────── */
 
 async function getClient(account: Account): Promise<TelegramClient> {
-  const existing      = clients.get(account.id);
-  const sessionInUse  = sessions.get(account.id);
+  const existing       = clients.get(account.id);
+  const sessionInUse   = sessions.get(account.id);
   const sessionChanged = sessionInUse !== account.session_string;
 
   if (existing?.connected && !sessionChanged) return existing;
@@ -316,9 +332,8 @@ async function getClient(account: Account): Promise<TelegramClient> {
     clients.set(account.id, client);
     sessions.set(account.id, account.session_string);
 
-    // BUG #G: jitter aleatório de até 10s para não criar spike simultâneo
-    // quando todas as contas conectam no boot ao mesmo tempo.
-    const jitter = Math.floor(Math.random() * KEEPALIVE_JITTER_MAX_MS);
+    // BUG #G: jitter aleatório de até 10s
+    const jitter   = Math.floor(Math.random() * KEEPALIVE_JITTER_MAX_MS);
     const interval = setInterval(async () => {
       if (!client.connected) {
         console.warn(`[keepalive] ${account.phone_number} desconectou — removendo do pool`);
@@ -369,8 +384,7 @@ async function getClient(account: Account): Promise<TelegramClient> {
   }
 }
 
-// BUG #D: aguarda promise inflight antes de deletar o mutex, evitando que
-// duas conexões simultâneas coexistam com a mesma session_string.
+// BUG #D: aguarda promise inflight antes de deletar o mutex
 async function reloadClient(account: Account): Promise<TelegramClient> {
   const inflight = connectingPromises.get(account.id);
   if (inflight) {
@@ -463,10 +477,10 @@ async function sendMessage(
 
           try {
             await client.invoke(new Api.messages.SendMessage({
-              peer:       peer as any,
-              message:    messageText,
-              randomId:   makeRandomId(),
-              noWebpage:  true,
+              peer:      peer as any,
+              message:   messageText,
+              randomId:  makeRandomId(),
+              noWebpage: true,
             }));
 
           } catch (err: any) {
@@ -575,6 +589,9 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
   }
   sniperFiringNow.add(scheduleId);
 
+  // OPT #7: captura o timestamp exato de entrada para medir o lag do timer
+  const sniperEnteredAt = Date.now();
+
   try {
     const now = new Date();
 
@@ -595,6 +612,12 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       }
       schedule = data as unknown as Schedule;
     }
+
+    // OPT #7: log do lag do timer (quanto o setTimeout atrasou em relação ao planejado)
+    const scheduledAt      = new Date(schedule.next_run_at).getTime();
+    const plannedSniperAt  = scheduledAt - SNIPER_BEFORE_MS;
+    const timerLagMs       = sniperEnteredAt - plannedSniperAt;
+    console.log(`[sniper][timing] timer lag: ${timerLagMs}ms (SNIPER_BEFORE_MS=${SNIPER_BEFORE_MS}, ideal=0)`);
 
     const group = schedule.groups;
 
@@ -655,6 +678,13 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       try {
         await sniperSendOnce(firstClient, firstAccount, chatId, firstText);
         firstSentAt = new Date();
+
+        // OPT #7: logs de timing para calibração de SNIPER_BEFORE_MS
+        const invokeRttMs  = firstSentAt.getTime() - sniperEnteredAt;
+        const vsHorarioMs  = firstSentAt.getTime() - scheduledAt;
+        console.log(`[sniper][timing] invoke RTT: ${invokeRttMs}ms (tempo real do MTProto+network)`);
+        console.log(`[sniper][timing] vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms (negativo=antes, positivo=atrasado) tentativa=${attempt}`);
+
         console.log(`[sniper] ✓ Primeira conta ${firstAccount.phone_number} enviou na tentativa ${attempt} (${firstSentAt.toISOString()})`);
         results.push({
           account_id:   firstAccount.id,
@@ -683,8 +713,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
           return;
         }
 
-        // BUG #C: FloodWait no sniper gerava ~30.000 chamadas por flood.
-        // Agora aguarda o tempo exato e retoma o loop. Se excede o budget, encerra.
+        // BUG #C: FloodWait — aguarda tempo exato antes de retomar
         const isFlood =
           err?.seconds != null ||
           err?.constructor?.name === "FloodWaitError" ||
@@ -698,7 +727,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
           console.warn(`[sniper] FloodWait ${waitSecs}s — pausando loop (budget restante: ${Math.round((budgetEnd - Date.now()) / 1000)}s)`);
           if (waitMs < budgetEnd - Date.now() - 500) {
             await new Promise(r => setTimeout(r, waitMs));
-            continue; // retoma o loop sem o delay de 1ms
+            continue;
           } else {
             console.warn(`[sniper] FloodWait ${waitSecs}s excede budget — encerrando loop`);
             break;
@@ -818,9 +847,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
   } finally {
     sniperFiringNow.delete(scheduleId);
 
-    // BUG #A: bloqueia o fireSchedule do mesmo ciclo que ainda pode estar
-    // pendente no setTimeout. Sem isso, o sniper termina e o fire executa
-    // normalmente — mensagem enviada em dobro.
+    // BUG #A: bloqueia o fireSchedule do mesmo ciclo por TTL
     firingNow.add(scheduleId);
     setTimeout(() => firingNow.delete(scheduleId), SNIPER_DONE_BLOCK_TTL_MS);
   }
@@ -1126,7 +1153,6 @@ async function dispatchToGroup(
 /* ─────────────────────────────────────────────────────────────────────────────
    ATUALIZAÇÃO DO SCHEDULE APÓS DISPARO
    BUG #B: recebe groupType e repassa para scheduleTimer.
-   Sem isso, o sniper nunca seria reagendado a partir do 2º ciclo.
    ───────────────────────────────────────────────────────────────────────────── */
 async function updateScheduleAfterDispatch(
   schedule: Schedule,
@@ -1171,8 +1197,6 @@ async function updateScheduleAfterDispatch(
     });
 
     console.log(`[schedule] ✓ Schedule ${schedule.id} OK. Próxima: ${nextRun}`);
-    // BUG #B: groupType propagado — garante que o sniper seja reagendado
-    // no próximo ciclo para grupos fechados.
     scheduleTimer(schedule.id, nextRun, groupType ?? schedule.groups?.group_type);
 
   } else {
@@ -1218,8 +1242,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     return;
   }
 
-  // BUG #A: firingNow também é setado pelo finally do sniper com TTL de 60s,
-  // bloqueando este fireSchedule caso o sniper já tenha terminado o ciclo.
   if (firingNow.has(scheduleId)) {
     console.warn(`[fire] Schedule ${scheduleId} já em execução — ignorando disparo duplicado`);
     return;
@@ -1503,10 +1525,8 @@ async function reloadSchedules(): Promise<void> {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   RECONEXÃO LEVE — chamada no intervalo periódico em vez do prewarm completo
-   BUG #E: prewarmAccounts() a cada 30s chamava getDialogs em TODAS as contas,
-   garantindo flood wait em produção com 20+ contas.
-   Esta função só reconecta clientes offline — sem getDialogs, sem peer pre-resolve.
+   RECONEXÃO LEVE
+   BUG #E: só reconecta clientes offline, sem getDialogs.
    ───────────────────────────────────────────────────────────────────────────── */
 async function reconnectDeadClients(): Promise<void> {
   const reconnectPromises: Promise<void>[] = [];
@@ -1607,7 +1627,7 @@ async function prewarmAccounts(): Promise<void> {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   HTTP SERVER — 5 ROTAS DE GERENCIAMENTO
+   HTTP SERVER
    ───────────────────────────────────────────────────────────────────────────── */
 function jsonResponse(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -1621,7 +1641,6 @@ const httpServer = http.createServer(async (req, res) => {
 
   const url = new URL(req.url ?? "/", `http://localhost:${WORKER_PORT}`);
 
-  // ── GET /accounts/:id/chats ──────────────────────────────────────────────
   const chatsMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chats$/);
   if (req.method === "GET" && chatsMatch) {
     const account = accountCache.get(chatsMatch[1]);
@@ -1645,7 +1664,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // ── GET /accounts/:id/chat-count?chat_id=XXXX ───────────────────────────
   const chatCountMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-count$/);
   if (req.method === "GET" && chatCountMatch) {
     const chatId  = url.searchParams.get("chat_id");
@@ -1711,7 +1729,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // ── GET /accounts/:id/chat-members?chat_id=XXXX ─────────────────────────
   const membersMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-members$/);
   if (req.method === "GET" && membersMatch) {
     const chatId  = url.searchParams.get("chat_id");
@@ -1791,7 +1808,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // ── POST /accounts/:id/reload ────────────────────────────────────────────
   const reloadMatch = url.pathname.match(/^\/accounts\/([^/]+)\/reload$/);
   if (req.method === "POST" && reloadMatch) {
     const accountId = reloadMatch[1];
@@ -1821,7 +1837,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // ── POST/DELETE /groups/:id/listen ──────────────────────────────────────
   const listenMatch = url.pathname.match(/^\/groups\/([^/]+)\/listen$/);
   if (listenMatch) {
     const groupId = listenMatch[1];
@@ -2011,14 +2026,6 @@ process.on("SIGINT",  shutdown);
 
 /* ─────────────────────────────────────────────────────────────────────────────
    INICIALIZAÇÃO
-   Sequência de boot:
-   1. prewarmAccounts: conecta todas as contas, awaita getDialogs (FIX #4),
-      pre-resolve peers de todos os grupos ativos (OPT #3),
-      popula accountCache e peerCache.
-   2. reloadSchedules: lê o banco e cria os timers iniciais.
-   3. setInterval: a cada 30s, chama reloadSchedules() + reconnectDeadClients().
-      Prewarm completo (getDialogs) NÃO roda no interval — apenas no boot e
-      no /reload manual. (BUG #E)
    ───────────────────────────────────────────────────────────────────────────── */
 async function init(): Promise<void> {
   console.log("[worker] Iniciando...");
@@ -2028,7 +2035,7 @@ async function init(): Promise<void> {
     try {
       await Promise.allSettled([
         reloadSchedules(),
-        reconnectDeadClients(), // BUG #E: substituiu prewarmAccounts() no interval
+        reconnectDeadClients(),
       ]);
     } catch (err) {
       console.error("[reload] Erro no reload periódico:", err);
