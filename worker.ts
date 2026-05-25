@@ -114,7 +114,7 @@ const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
 // OPT #6: era 20ms. Railway US East → DC Miami RTT ~50ms → one-way ~25ms.
 // 45ms cobre o one-way + event loop lag do Node (~5-15ms) com ~5ms de margem.
 // Ajuste fino baseado nos logs [sniper][timing] vs horário abaixo.
-const SNIPER_BEFORE_MS              = 45;
+const SNIPER_BEFORE_MS              = 48;
 const SNIPER_SEND_TIMEOUT_MS        = 800;
 const SNIPER_ATTEMPT_INTERVAL_MS    = 1;
 const SNIPER_PAUSE_EVERY_N          = 10;
