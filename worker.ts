@@ -2002,6 +2002,97 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
+  // POST /groups/:id/dispatch
+  const dispatchMatch = url.pathname.match(/^\/groups\/([^/]+)\/dispatch$/);
+  if (req.method === "POST" && dispatchMatch) {
+    const groupId = dispatchMatch[1];
+
+    let body: { user_id?: string; send_to_self?: boolean } = {};
+    try {
+      const raw = await new Promise<string>((resolve, reject) => {
+        let data = "";
+        req.on("data", chunk => { data += chunk; });
+        req.on("end",  () => resolve(data));
+        req.on("error", reject);
+      });
+      if (raw) body = JSON.parse(raw);
+    } catch {}
+
+    const sendToSelf = !!body.send_to_self;
+
+    try {
+      const { data, error } = await supabase
+        .from("groups")
+        .select(`
+          id, name, telegram_chat_id, telegram_chat_name, group_type,
+          group_members(
+            id, message_text, position, is_active,
+            accounts(id, name, phone_number, api_id, api_hash, session_string, is_active)
+          )
+        `)
+        .eq("id", groupId)
+        .single();
+
+      if (error || !data) {
+        return jsonResponse(res, 404, { error: "Grupo não encontrado" });
+      }
+
+      const group = data as unknown as Group;
+      const members = (group.group_members ?? [])
+        .filter(m => m.is_active && m.accounts?.is_active && m.accounts?.session_string)
+        .sort((a, b) => a.position - b.position);
+
+      if (members.length === 0) {
+        return jsonResponse(res, 200, { ok: true, sent: 0, failed: 0, results: [] });
+      }
+
+      let sent = 0, failed = 0;
+      const results: Array<{ account_id: string; status: string; error?: string }> = [];
+
+      for (const member of members) {
+        const account = member.accounts
+          ? (accountCache.get(member.accounts.id) ?? member.accounts as unknown as Account)
+          : null;
+        if (!account) continue;
+
+        try {
+          const client = await getClient(account);
+          const text = member.message_text ?? "";
+
+          if (sendToSelf) {
+            // Envia para Saved Messages — aquece peer cache sem afetar o grupo real
+            const stableId = makeRandomId();
+            await Promise.race([
+              client.invoke(new Api.messages.SendMessage({
+                peer:      new Api.InputPeerSelf(),
+                message:   text || "[teste de aquecimento]",
+                randomId:  stableId,
+                noWebpage: true,
+              })),
+              new Promise<never>((_, r) => setTimeout(() => r(new Error("TIMEOUT")), SEND_TIMEOUT_MS)),
+            ]);
+          } else {
+            if (!group.telegram_chat_id) throw new Error("telegram_chat_id não configurado");
+            await sendMessage(client, account, String(group.telegram_chat_id), text);
+          }
+
+          sent++;
+          results.push({ account_id: account.id, status: "sent" });
+          console.log(`[dispatch-http] ✓ ${account.phone_number}${sendToSelf ? " (self)" : ""}`);
+        } catch (err: any) {
+          failed++;
+          results.push({ account_id: account.id, status: "failed", error: err.message });
+          console.error(`[dispatch-http] ✗ ${account?.phone_number}: ${err.message}`);
+        }
+      }
+
+      return jsonResponse(res, 200, { ok: true, sent, failed, results });
+    } catch (err: any) {
+      console.error("[dispatch-http] Erro inesperado:", err.message);
+      return jsonResponse(res, 500, { error: err.message });
+    }
+  }
+
   jsonResponse(res, 404, { error: "Not found" });
 });
 
