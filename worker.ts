@@ -78,6 +78,13 @@
 //     [sniper][timing] invoke RTT: Xms  → tempo real do MTProto
 //     [sniper][timing] vs horário: Xms  → negativo=antes, positivo=atrasado
 //     Com esses dados é possível calibrar SNIPER_BEFORE_MS no valor exato.
+//
+// Fix v8 (2025-05) — randomId estável por ciclo de tentativas:
+//   BUG #H — timeout pós-envio com retry gera mensagem duplicada:
+//     Se o invoke chegar ao Telegram mas o ACK for perdido na rede, o retry
+//     com randomId novo é tratado como mensagem nova pelo Telegram.
+//     sendMessage() e sniperSendOnce() agora geram o randomId UMA vez por
+//     ciclo e reutilizam nos retries — Telegram deduplica automaticamente.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -455,6 +462,7 @@ async function resolvePeer(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    ENVIO COM RETRY INTERNO
+   BUG #H: randomId gerado uma vez por ciclo e reutilizado nos retries.
    ───────────────────────────────────────────────────────────────────────────── */
 async function sendMessage(
   client: TelegramClient,
@@ -463,6 +471,8 @@ async function sendMessage(
   messageText: string
 ): Promise<void> {
   const budgetEnd = Date.now() + RETRY_BUDGET_MS;
+  // BUG #H: gerado uma vez — reutilizado em todos os retries do mesmo ciclo.
+  const stableRandomId = makeRandomId();
   let attempt = 0;
 
   while (Date.now() < budgetEnd) {
@@ -479,7 +489,7 @@ async function sendMessage(
             await client.invoke(new Api.messages.SendMessage({
               peer:      peer as any,
               message:   messageText,
-              randomId:  makeRandomId(),
+              randomId:  stableRandomId,
               noWebpage: true,
             }));
 
@@ -514,7 +524,7 @@ async function sendMessage(
                 await client.invoke(new Api.messages.SendMessage({
                   peer:      freshPeer as any,
                   message:   messageText,
-                  randomId:  makeRandomId(),
+                  randomId:  stableRandomId,
                   noWebpage: true,
                 }));
                 return;
@@ -557,12 +567,14 @@ async function sendMessage(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    SNIPER — ENVIO ÚNICO COM TIMEOUT CURTO (sem retry interno)
+   BUG #H: randomId recebido como parâmetro — gerado uma vez no loop do sniper.
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperSendOnce(
   client: TelegramClient,
   account: Account,
   telegramChatId: string,
-  messageText: string
+  messageText: string,
+  randomId: bigInt.BigInteger
 ): Promise<void> {
   const peer = await resolvePeer(client, telegramChatId, account.id);
 
@@ -570,7 +582,7 @@ async function sniperSendOnce(
     client.invoke(new Api.messages.SendMessage({
       peer:      peer as any,
       message:   messageText,
-      randomId:  makeRandomId(),
+      randomId,
       noWebpage: true,
     })),
     new Promise<never>((_, r) =>
@@ -671,12 +683,14 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
     let attempt        = 0;
     let firstSentAt: Date | null = null;
+    // BUG #H: gerado uma vez — reutilizado em todos os retries do loop sniper.
+    const firstRandomId = makeRandomId();
 
     while (Date.now() < budgetEnd) {
       attempt++;
 
       try {
-        await sniperSendOnce(firstClient, firstAccount, chatId, firstText);
+        await sniperSendOnce(firstClient, firstAccount, chatId, firstText, firstRandomId);
         firstSentAt = new Date();
 
         // OPT #7: logs de timing para calibração de SNIPER_BEFORE_MS
@@ -792,7 +806,9 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
       try {
         const client = await getClient(account);
-        await sniperSendOnce(client, account, chatId, text);
+        // BUG #H: cada conta da fase 2 recebe seu próprio randomId estável.
+        const memberRandomId = makeRandomId();
+        await sniperSendOnce(client, account, chatId, text, memberRandomId);
         sentAt = new Date();
         console.log(`[sniper] ✓ Conta ${i + 1}/${members.length} ${account.phone_number} enviou`);
         results.push({
