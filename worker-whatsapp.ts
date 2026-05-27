@@ -53,7 +53,7 @@ const supabase = createClient(
 /* ─────────────────────────────────────────────────────────────────────────────
    CONSTANTES
    ───────────────────────────────────────────────────────────────────────────── */
-const WORKER_PORT              = parseInt(process.env.WA_PORT ?? "3002", 10);
+const WORKER_PORT              = parseInt(process.env.PORT ?? "3002", 10);
 const WORKER_SECRET            = process.env.WORKER_SECRET ?? "";
 
 // Timing — calibrar com logs [sniper][timing] após primeiros disparos.
