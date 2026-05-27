@@ -85,6 +85,24 @@
 //     com randomId novo é tratado como mensagem nova pelo Telegram.
 //     sendMessage() e sniperSendOnce() agora geram o randomId UMA vez por
 //     ciclo e reutilizam nos retries — Telegram deduplica automaticamente.
+//
+// Fix v9 (2025-05) — correção de timing: mensagem aparecia no minuto anterior:
+//
+//   BUG #I — SNIPER_BEFORE_MS=45 causava invoke chegar ao Telegram ANTES da virada:
+//     O Telegram carimba a mensagem com o timestamp de CHEGADA do pacote, não
+//     do ACK. Com 45ms de antecipação e RTT one-way ~25ms, o pacote chegava em
+//     ~18:59:59.980 → Telegram carimbava 18:59.
+//
+//     Solução: SNIPER_BEFORE_MS agora é apenas warm-up do loop (200ms).
+//     Adicionado SNIPER_AFTER_GUARD_MS (15ms): busy-wait garante que o invoke
+//     só parte DEPOIS de scheduledAt + SNIPER_AFTER_GUARD_MS.
+//
+//     Resultado esperado: pacote chega ao Telegram em scheduledAt + ~40ms
+//     (15ms guarda + ~25ms one-way) → sempre carimbado no minuto correto.
+//
+//     Calibração: se ainda aparecer no minuto anterior, aumente SNIPER_AFTER_GUARD_MS
+//     em +10ms por vez. Se atrasar demais, diminua. Alvo: [sniper][timing]
+//     vs horário entre +10ms e +60ms.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -118,10 +136,19 @@ const LISTEN_POLL_MS                = 400;
 const MONITOR_HISTORY_LIMIT         = 150;
 const OPEN_GROUP_LISTEN_TIMEOUT_MS  = 2 * 60 * 60_000;
 const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
-// OPT #6: era 20ms. Railway US East → DC Miami RTT ~50ms → one-way ~25ms.
-// 45ms cobre o one-way + event loop lag do Node (~5-15ms) com ~5ms de margem.
-// Ajuste fino baseado nos logs [sniper][timing] vs horário abaixo.
-const SNIPER_BEFORE_MS              = 45;
+
+// BUG #I fix: SNIPER_BEFORE_MS é apenas warm-up do loop — NÃO é mais o offset
+// de timing. O invoke só parte depois de scheduledAt + SNIPER_AFTER_GUARD_MS.
+// 200ms de warm-up garante que o loop está rodando bem antes da virada.
+const SNIPER_BEFORE_MS              = 200;
+
+// BUG #I fix: margem de segurança pós-virada. O invoke parte depois de
+// scheduledAt + SNIPER_AFTER_GUARD_MS, garantindo que o pacote chega ao
+// Telegram APÓS a virada do minuto (never antes).
+// Calibração: se ainda aparecer no minuto anterior → aumente +10ms.
+//             se atrasar demais → diminua. Alvo: vs horário +10ms ~ +60ms.
+const SNIPER_AFTER_GUARD_MS         = 15;
+
 const SNIPER_SEND_TIMEOUT_MS        = 800;
 const SNIPER_ATTEMPT_INTERVAL_MS    = 1;
 const SNIPER_PAUSE_EVERY_N          = 10;
@@ -626,9 +653,9 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     }
 
     // OPT #7: log do lag do timer (quanto o setTimeout atrasou em relação ao planejado)
-    const scheduledAt      = new Date(schedule.next_run_at).getTime();
-    const plannedSniperAt  = scheduledAt - SNIPER_BEFORE_MS;
-    const timerLagMs       = sniperEnteredAt - plannedSniperAt;
+    const scheduledAt     = new Date(schedule.next_run_at).getTime();
+    const plannedSniperAt = scheduledAt - SNIPER_BEFORE_MS;
+    const timerLagMs      = sniperEnteredAt - plannedSniperAt;
     console.log(`[sniper][timing] timer lag: ${timerLagMs}ms (SNIPER_BEFORE_MS=${SNIPER_BEFORE_MS}, ideal=0)`);
 
     const group = schedule.groups;
@@ -686,6 +713,31 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     // BUG #H: gerado uma vez — reutilizado em todos os retries do loop sniper.
     const firstRandomId = makeRandomId();
 
+    // ── BUG #I fix: busy-wait até scheduledAt + SNIPER_AFTER_GUARD_MS ────
+    // Garante que o invoke só parte DEPOIS da virada do minuto.
+    // O Telegram carimba com o timestamp de chegada do pacote — se chegar
+    // antes de scheduledAt o grupo mostra o minuto anterior.
+    const invokeNotBefore = scheduledAt + SNIPER_AFTER_GUARD_MS;
+    {
+      const msUntilFire = invokeNotBefore - Date.now();
+      if (msUntilFire > 0) {
+        console.log(
+          `[sniper][timing] aguardando virada: ${msUntilFire}ms até ` +
+          `${new Date(invokeNotBefore).toISOString()} (guard=${SNIPER_AFTER_GUARD_MS}ms)`
+        );
+        // sleep para a maior parte do wait, busy-spin nos últimos 5ms
+        if (msUntilFire > 5) {
+          await new Promise(r => setTimeout(r, msUntilFire - 5));
+        }
+        // busy-wait de precisão sub-ms
+        while (Date.now() < invokeNotBefore) { /* spin */ }
+      } else {
+        console.warn(
+          `[sniper][timing] já passou da virada em ${-msUntilFire}ms — invocando imediatamente`
+        );
+      }
+    }
+
     while (Date.now() < budgetEnd) {
       attempt++;
 
@@ -693,11 +745,13 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         await sniperSendOnce(firstClient, firstAccount, chatId, firstText, firstRandomId);
         firstSentAt = new Date();
 
-        // OPT #7: logs de timing para calibração de SNIPER_BEFORE_MS
-        const invokeRttMs  = firstSentAt.getTime() - sniperEnteredAt;
-        const vsHorarioMs  = firstSentAt.getTime() - scheduledAt;
+        // OPT #7: logs de timing para calibração
+        const invokeRttMs        = firstSentAt.getTime() - sniperEnteredAt;
+        const vsHorarioMs        = firstSentAt.getTime() - scheduledAt;
+        const vsInvokeNotBefore  = firstSentAt.getTime() - invokeNotBefore;
         console.log(`[sniper][timing] invoke RTT: ${invokeRttMs}ms (tempo real do MTProto+network)`);
         console.log(`[sniper][timing] vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms (negativo=antes, positivo=atrasado) tentativa=${attempt}`);
+        console.log(`[sniper][timing] margem pós-guard: +${vsInvokeNotBefore + SNIPER_AFTER_GUARD_MS}ms desde scheduledAt`);
 
         console.log(`[sniper] ✓ Primeira conta ${firstAccount.phone_number} enviou na tentativa ${attempt} (${firstSentAt.toISOString()})`);
         results.push({
