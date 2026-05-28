@@ -1,108 +1,79 @@
-// worker-flat.ts — dispatch worker Telegram, sem camadas de abstração
+// worker-v10.ts — dispatch worker Telegram, timing adaptativo por grupo
 //
-// Fix v1: firingNow Set previne duplo disparo quando reloadSchedules
-//         roda enquanto fireSchedule ainda está executando (race condition
-//         entre RETRY_BUDGET_MS=50s e RELOAD_INTERVAL_MS=30s)
+// ═══════════════════════════════════════════════════════════════════════════
+// HISTÓRICO DE FIXES (v1–v9 preservados para referência)
+// ═══════════════════════════════════════════════════════════════════════════
 //
-// Fix v2 (2025-05):
-//   BUG #1 — reconnect loop infinito:
-//     _loopStarted=true antes de connect() suprime o updateLoop sem quebrar
-//     o fluxo de reconexão (autoReconnect, _handleReconnect não dependem do flag).
+// Fix v1: firingNow Set previne duplo disparo (race condition RETRY_BUDGET_MS vs RELOAD_INTERVAL_MS)
+// Fix v2: BUG #1 reconnect loop; BUG #2 peerCache stale; BUG #3 backoff; BUG #4 prewarm awaited
+// Fix v3: BUG #5 AUTH_KEY_DUPLICATED via race em getClient() → connectingPromises serializa conexões
+// Otimizações v4: invoke direto, pre-fetch, pre-resolve peers, noWebpage, randomId único
+// Fix v5: sniperFireClosed() — loop ultra-agressivo para grupos fechados
+// Fix v6: BUG #A duplo disparo; BUG #B groupType perdido; BUG #C FloodWait; BUG #D reloadClient;
+//         BUG #E prewarm a cada 30s; BUG #F makeRandomId; BUG #G keepalive jitter
+// Fix v7: timing logs + SNIPER_BEFORE_MS aumentado para 45ms
+// Fix v8: BUG #H randomId estável por ciclo (deduplicação Telegram)
+// Fix v9: BUG #I SNIPER_BEFORE_MS=45 → pacote chegava antes da virada →
+//         SNIPER_BEFORE_MS virou warm-up (200ms) + SNIPER_AFTER_GUARD_MS=15ms busy-wait
 //
-//   BUG #2 — peerCache stale após reconexão:
-//     Ao desconectar/reconectar um account, todos os peers desse account
-//     são removidos do cache. accessHash gerado com sessão anterior é inválido.
+// ═══════════════════════════════════════════════════════════════════════════
+// Fix v10 — Adaptive Gate: timing dinâmico por perfil de grupo
+// ═══════════════════════════════════════════════════════════════════════════
 //
-//   BUG #3 — sem delay entre tentativas no sendMessage:
-//     Adicionado backoff exponencial (1s → 2s → 4s → 8s) entre tentativas.
+// PROBLEMA v9:
+//   SNIPER_AFTER_GUARD_MS=15 + busy-spin de até 15ms + disparos simultâneos
+//   congestionando o event loop → latência observada de 60–100ms no disparo.
+//   Antes da v9 (sem guard): 3–5ms. Guard resolveu o carimbo errado mas
+//   quebrou a latência para 10–20x pior.
 //
-//   BUG #4 — getDialogs warm-up não era awaited:
-//     Warm-up movido para prewarmAccounts() com await + pre-resolve de peers.
+// RAIZ DO PROBLEMA:
+//   Guard fixo ignora que cada grupo tem comportamento diferente:
+//   - Grupos "opens_early": abrem antes do horário nominal → guard desnecessário
+//   - Grupos "on-time": abrem no horário → guard pequeno ou zero
+//   - Grupos "opens_late": abrem depois → guard negativo (esperar mais)
+//   Um offset fixo de 15ms penaliza todos para cobrir o pior caso de um.
 //
-// Fix v3 (2025-05):
-//   BUG #5 — AUTH_KEY_DUPLICATED (406) via race condition em getClient():
-//     connectingPromises Map<accountId, Promise<TelegramClient>> serializa
-//     conexões concorrentes para o mesmo account.
+// SOLUÇÃO v10 — 3 camadas:
 //
-// Otimizações v4 (2025-05) — latência mínima no caminho crítico:
+// CAMADA 1 — Spin reduzido (imediato, zero infra):
+//   SNIPER_SPIN_MAX_MS = 2 → spin máximo de 2ms em vez dos atuais ≤15ms.
+//   sleep(msUntilFire - 2ms) libera event loop → sem congestionamento em
+//   disparos simultâneos. Ganho esperado: recupera 10–13ms imediatamente.
 //
-//   OPT #1 — invoke direto em vez de client.sendMessage():
-//   OPT #2 — pre-fetch do schedule antes do fire
-//   OPT #3 — pre-resolve de peers no prewarm
-//   OPT #4 — noWebpage: true + randomId único por tentativa
+// CAMADA 2 — Guard adaptativo por grupo (requer 2 novas tabelas no Supabase):
+//   Cada disparo grava vsHorárioMs em group_dispatch_samples.
+//   Após ≥3 amostras, computa p10/p50/p90 e atualiza group_profiles.
+//   O próximo disparo usa esses percentis para calcular guardMs:
+//     opens_early (p50 < -20ms): guardMs = p10 - 50ms → tenta antes do horário
+//     on-time/late:               guardMs = max(0, p50 - 20ms) → próximo da mediana
+//     sem dados:                  guardMs = 0 → dispara em scheduledAt exato
 //
-// Fix v5 (2025-05) — sniper loop para grupos fechados:
-//   OPT #5 — sniperFireClosed(): loop ultra-agressivo para grupos fechados
+// CAMADA 3 — Sniper timer mais cedo para opens_early:
+//   scheduleTimer() consulta o perfil do grupo. Para opens_early, o sniperTimer
+//   é agendado com extra lead = abs(p10) + 100ms. Garante que o sniper já está
+//   rodando quando o grupo abrir, mesmo que seja muito antes do horário nominal.
 //
-// Fix v6 (2025-05) — correções de bugs críticos:
+// SQL NECESSÁRIO (rodar no Supabase antes do deploy):
 //
-//   BUG #A — duplo disparo sniper + fireSchedule no mesmo ciclo:
-//     Ao terminar (sucesso ou falha), sniperFireClosed() registra o scheduleId
-//     em firingNow com TTL de 60s. Isso bloqueia o fireSchedule do mesmo ciclo
-//     que ainda está pendente no setTimeout.
+//   create table if not exists group_dispatch_samples (
+//     id            uuid primary key default gen_random_uuid(),
+//     group_id      uuid not null references groups(id) on delete cascade,
+//     vs_horario_ms int not null,
+//     created_at    timestamptz default now()
+//   );
+//   create index if not exists idx_gds_group_created
+//     on group_dispatch_samples(group_id, created_at desc);
 //
-//   BUG #B — groupType perdido após o 1º ciclo:
-//     updateScheduleAfterDispatch() agora recebe e repassa groupType para
-//     scheduleTimer(). Sem isso, grupos fechados perdiam o sniper silenciosamente
-//     a partir do 2º ciclo.
-//
-//   BUG #C — FloodWait no sniper gera ~30.000 chamadas em 30s:
-//     Sniper agora detecta FloodWait e aguarda o tempo exato antes de retomar.
-//     Se o wait excede o budget, encerra o loop graciosamente.
-//
-//   BUG #D — reloadClient() deleta mutex sem await da promise inflight:
-//     Aguarda a promise em andamento antes de deletar connectingPromises,
-//     evitando AUTH_KEY_DUPLICATED por conexão dupla simultânea.
-//
-//   BUG #E — prewarmAccounts() a cada 30s chama getDialogs em todas as contas:
-//     Prewarm completo (getDialogs + peer pre-resolve) só roda no boot.
-//     O interval periódico chama reconnectDeadClients() — apenas reconecta
-//     clientes offline sem recarregar dialogs.
-//
-//   BUG #F — makeRandomId com entropia insuficiente (colisão em envios paralelos):
-//     Usa 64 bits reais via shiftLeft(32) na biblioteca big-integer.
-//
-//   BUG #G — keepalive sem jitter: spike de N contas simultâneas a cada 45s:
-//     Cada setInterval recebe até 10s de jitter aleatório no boot.
-//
-// Fix v7 (2025-05) — timing logs + calibração SNIPER_BEFORE_MS:
-//
-//   OPT #6 — SNIPER_BEFORE_MS aumentado de 20 para 45ms:
-//     Railway US East → Telegram DC1/DC3 Miami: RTT medido ~50ms (round-trip).
-//     Invoke one-way ~25ms + event loop lag Node.js ~5-15ms = precisa de ~40ms
-//     de antecipação mínima. 45ms dá ~5ms de margem.
-//     Calibrar com os logs [sniper][timing] após alguns disparos reais.
-//
-//   OPT #7 — logs de timing no sniper para diagnóstico preciso:
-//     [sniper][timing] timer lag: Xms   → quanto o setTimeout atrasou
-//     [sniper][timing] invoke RTT: Xms  → tempo real do MTProto
-//     [sniper][timing] vs horário: Xms  → negativo=antes, positivo=atrasado
-//     Com esses dados é possível calibrar SNIPER_BEFORE_MS no valor exato.
-//
-// Fix v8 (2025-05) — randomId estável por ciclo de tentativas:
-//   BUG #H — timeout pós-envio com retry gera mensagem duplicada:
-//     Se o invoke chegar ao Telegram mas o ACK for perdido na rede, o retry
-//     com randomId novo é tratado como mensagem nova pelo Telegram.
-//     sendMessage() e sniperSendOnce() agora geram o randomId UMA vez por
-//     ciclo e reutilizam nos retries — Telegram deduplica automaticamente.
-//
-// Fix v9 (2025-05) — correção de timing: mensagem aparecia no minuto anterior:
-//
-//   BUG #I — SNIPER_BEFORE_MS=45 causava invoke chegar ao Telegram ANTES da virada:
-//     O Telegram carimba a mensagem com o timestamp de CHEGADA do pacote, não
-//     do ACK. Com 45ms de antecipação e RTT one-way ~25ms, o pacote chegava em
-//     ~18:59:59.980 → Telegram carimbava 18:59.
-//
-//     Solução: SNIPER_BEFORE_MS agora é apenas warm-up do loop (200ms).
-//     Adicionado SNIPER_AFTER_GUARD_MS (15ms): busy-wait garante que o invoke
-//     só parte DEPOIS de scheduledAt + SNIPER_AFTER_GUARD_MS.
-//
-//     Resultado esperado: pacote chega ao Telegram em scheduledAt + ~40ms
-//     (15ms guarda + ~25ms one-way) → sempre carimbado no minuto correto.
-//
-//     Calibração: se ainda aparecer no minuto anterior, aumente SNIPER_AFTER_GUARD_MS
-//     em +10ms por vez. Se atrasar demais, diminua. Alvo: [sniper][timing]
-//     vs horário entre +10ms e +60ms.
+//   create table if not exists group_profiles (
+//     group_id          uuid primary key references groups(id) on delete cascade,
+//     offset_p10_ms     int not null default 0,
+//     offset_p50_ms     int not null default 0,
+//     offset_p90_ms     int not null default 0,
+//     opens_early       bool not null default false,
+//     min_safe_guard_ms int not null default 0,
+//     sample_count      int not null default 0,
+//     updated_at        timestamptz default now()
+//   );
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -127,7 +98,7 @@ const RETRY_BUDGET_MS               = 50_000;
 const RELOAD_INTERVAL_MS            = 30_000;
 const LOOKAHEAD_MS                  = 2 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS         = 45_000;
-const KEEPALIVE_JITTER_MAX_MS       = 10_000; // BUG #G: jitter para evitar spike simultâneo
+const KEEPALIVE_JITTER_MAX_MS       = 10_000;
 const PREFETCH_BEFORE_MS            = 800;
 const MONITOR_DELAY_CLOSED_MS       = 6_000;
 const MONITOR_MAX_OPEN_MS           = 5 * 60_000;
@@ -137,17 +108,22 @@ const MONITOR_HISTORY_LIMIT         = 150;
 const OPEN_GROUP_LISTEN_TIMEOUT_MS  = 2 * 60 * 60_000;
 const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
 
-// BUG #I fix: SNIPER_BEFORE_MS é apenas warm-up do loop — NÃO é mais o offset
-// de timing. O invoke só parte depois de scheduledAt + SNIPER_AFTER_GUARD_MS.
-// 200ms de warm-up garante que o loop está rodando bem antes da virada.
+// v10: warm-up do loop sniper — começa 100ms antes do horário (mais agressivo que os 200ms da v9,
+// o extra lead por opens_early é adicionado dinamicamente em scheduleTimer()).
 const SNIPER_BEFORE_MS              = 100;
 
-// BUG #I fix: margem de segurança pós-virada. O invoke parte depois de
-// scheduledAt + SNIPER_AFTER_GUARD_MS, garantindo que o pacote chega ao
-// Telegram APÓS a virada do minuto (never antes).
-// Calibração: se ainda aparecer no minuto anterior → aumente +10ms.
-//             se atrasar demais → diminua. Alvo: vs horário +10ms ~ +60ms.
-const SNIPER_AFTER_GUARD_MS         = 15;
+// v10: REMOVIDO SNIPER_AFTER_GUARD_MS fixo. Agora é calculado dinamicamente por grupo
+// em sniperFireClosed() via groupProfileCache. Default = 0 (dispara em scheduledAt exato).
+// O RTT one-way Railway US East → Miami DC (~25ms) garante que o pacote chega APÓS a virada.
+
+// v10: spin máximo no busy-wait de precisão.
+// Antes: spin podia durar até 15ms (SNIPER_AFTER_GUARD_MS).
+// Agora: spin máximo de 2ms — o resto do wait é sleep() que libera o event loop.
+// Isso resolve o congestionamento em disparos simultâneos.
+const SNIPER_SPIN_MAX_MS            = 2;
+
+// v10: tamanho da janela rolling para cálculo de percentis de timing.
+const GROUP_PROFILE_SAMPLE_SIZE     = 20;
 
 const SNIPER_SEND_TIMEOUT_MS        = 800;
 const SNIPER_ATTEMPT_INTERVAL_MS    = 1;
@@ -155,8 +131,6 @@ const SNIPER_PAUSE_EVERY_N          = 10;
 const SNIPER_PAUSE_MS               = 5;
 const SNIPER_INTER_ACCOUNT_DELAY_MS = 1;
 const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
-
-// BUG #A: após o sniper terminar, bloqueia fireSchedule do mesmo ciclo por este TTL
 const SNIPER_DONE_BLOCK_TTL_MS      = 500;
 
 const WORKER_PORT   = parseInt(process.env.PORT ?? "3001", 10);
@@ -215,6 +189,18 @@ interface DispatchResult {
   error?: string;
 }
 
+// v10: perfil de comportamento de timing de um grupo fechado.
+// Alimentado por persistGroupDispatchSample() após cada disparo do sniper.
+interface GroupBehaviorProfile {
+  group_id:          string;
+  offset_p10_ms:     number;  // percentil 10 de vsHorárioMs (abre mais cedo)
+  offset_p50_ms:     number;  // mediana de vsHorárioMs
+  offset_p90_ms:     number;  // percentil 90 de vsHorárioMs (abre mais tarde)
+  opens_early:       boolean; // true se p50 < -20ms (grupo historicamente abre antes)
+  min_safe_guard_ms: number;  // guardMs calculado: p10 - 50ms (opens_early) ou 0
+  sample_count:      number;  // amostras coletadas (mínimo 3 para ativar o adaptive gate)
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────
    ESTADO GLOBAL
    ───────────────────────────────────────────────────────────────────────────── */
@@ -232,6 +218,14 @@ const listenMap             = new Map<string, AbortController>();
 const firingNow             = new Set<string>();
 const sniperFiringNow       = new Set<string>();
 const connectingPromises    = new Map<string, Promise<TelegramClient>>();
+
+// v10: cache de perfis de timing por group_id.
+// Carregado no boot por loadGroupProfiles() e atualizado após cada disparo.
+const groupProfileCache     = new Map<string, GroupBehaviorProfile>();
+
+// v10: mapa scheduleId → groupId para scheduleTimer() consultar o perfil.
+// Populado em reloadSchedules() e updateScheduleAfterDispatch().
+const scheduleGroupMap      = new Map<string, string>();
 
 /* ─────────────────────────────────────────────────────────────────────────────
    QUERY REUTILIZADA
@@ -304,7 +298,6 @@ function isRetryDue(schedule: Schedule, now: Date): boolean {
   return now >= new Date(last.getTime() + interval * 1000);
 }
 
-// BUG #F: 64 bits reais de entropia — shiftLeft(32) na big-integer lib.
 function makeRandomId(): bigInt.BigInteger {
   const hi = Math.floor(Math.random() * 0xFFFFFFFF);
   const lo = Math.floor(Math.random() * 0xFFFFFFFF);
@@ -320,6 +313,108 @@ function evictPeersForAccount(accountId: string): void {
     if (key.startsWith(`${accountId}:`)) {
       peerCache.delete(key);
     }
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   v10: PERFIS DE TIMING ADAPTATIVO
+   ───────────────────────────────────────────────────────────────────────────── */
+
+// Carrega group_profiles do banco no boot. Chamado uma vez em prewarmAccounts().
+async function loadGroupProfiles(): Promise<void> {
+  try {
+    const { data, error } = await supabase
+      .from("group_profiles")
+      .select("group_id, offset_p10_ms, offset_p50_ms, offset_p90_ms, opens_early, min_safe_guard_ms, sample_count");
+
+    if (error) {
+      console.warn("[profiles] Falha ao carregar perfis de grupo:", error.message);
+      return;
+    }
+
+    for (const row of data ?? []) {
+      groupProfileCache.set(row.group_id as string, row as GroupBehaviorProfile);
+    }
+
+    console.log(`[profiles] ✅ ${groupProfileCache.size} perfis de timing carregados`);
+  } catch (err: any) {
+    console.warn("[profiles] Erro inesperado ao carregar perfis:", err.message);
+  }
+}
+
+// Persiste uma nova amostra de vsHorárioMs e recomputa os percentis do grupo.
+// Fire-and-forget: chamado no finally do sniper após confirmação de envio.
+// Não bloqueia o caminho crítico.
+async function persistGroupDispatchSample(groupId: string, vsHorarioMs: number): Promise<void> {
+  try {
+    // 1. Grava a nova amostra
+    const { error: insertErr } = await supabase
+      .from("group_dispatch_samples")
+      .insert({ group_id: groupId, vs_horario_ms: vsHorarioMs });
+
+    if (insertErr) {
+      console.warn(`[profiles] Falha ao inserir amostra para ${groupId}:`, insertErr.message);
+    }
+
+    // 2. Busca as últimas N amostras (rolling window)
+    const { data, error: fetchErr } = await supabase
+      .from("group_dispatch_samples")
+      .select("vs_horario_ms")
+      .eq("group_id", groupId)
+      .order("created_at", { ascending: false })
+      .limit(GROUP_PROFILE_SAMPLE_SIZE);
+
+    if (fetchErr || !data || data.length === 0) return;
+
+    // 3. Computa percentis
+    const samples = data.map(r => r.vs_horario_ms as number);
+    const sorted  = [...samples].sort((a, b) => a - b);
+    const n       = sorted.length;
+
+    const p10 = sorted[Math.max(0, Math.floor(n * 0.10))] ?? sorted[0];
+    const p50 = sorted[Math.max(0, Math.floor(n * 0.50))] ?? sorted[0];
+    const p90 = sorted[Math.min(n - 1, Math.floor(n * 0.90))] ?? sorted[n - 1];
+
+    // opens_early: mediana histórica está mais de 20ms antes do horário nominal
+    const opens_early       = p50 < -20;
+    // min_safe_guard_ms: para opens_early, tenta 50ms antes do p10 (mais cedo já observado)
+    //                    para os demais, dispara em scheduledAt (guard = 0)
+    const min_safe_guard_ms = opens_early
+      ? Math.max(-30_000, p10 - 50)
+      : 0;
+
+    const profile: GroupBehaviorProfile = {
+      group_id: groupId,
+      offset_p10_ms: p10,
+      offset_p50_ms: p50,
+      offset_p90_ms: p90,
+      opens_early,
+      min_safe_guard_ms,
+      sample_count: n,
+    };
+
+    // 4. Atualiza cache local imediatamente
+    groupProfileCache.set(groupId, profile);
+
+    // 5. Persiste no banco (upsert)
+    const { error: upsertErr } = await supabase
+      .from("group_profiles")
+      .upsert(
+        { ...profile, updated_at: new Date().toISOString() },
+        { onConflict: "group_id" }
+      );
+
+    if (upsertErr) {
+      console.warn(`[profiles] Falha ao salvar perfil para ${groupId}:`, upsertErr.message);
+    } else {
+      console.log(
+        `[profiles] ✅ Perfil atualizado: group=${groupId} ` +
+        `p10=${p10}ms p50=${p50}ms p90=${p90}ms ` +
+        `opens_early=${opens_early} n=${n}`
+      );
+    }
+  } catch (err: any) {
+    console.warn(`[profiles] Erro inesperado ao persistir amostra para ${groupId}:`, err.message);
   }
 }
 
@@ -366,7 +461,6 @@ async function getClient(account: Account): Promise<TelegramClient> {
     clients.set(account.id, client);
     sessions.set(account.id, account.session_string);
 
-    // BUG #G: jitter aleatório de até 10s
     const jitter   = Math.floor(Math.random() * KEEPALIVE_JITTER_MAX_MS);
     const interval = setInterval(async () => {
       if (!client.connected) {
@@ -394,7 +488,7 @@ async function getClient(account: Account): Promise<TelegramClient> {
 
         const authDead =
           err.message?.includes("AUTH_KEY_UNREGISTERED") ||
-          err.message?.includes("USER_DEACTIVATED") ||
+          err.message?.includes("USER_DEACTIVATED")      ||
           err.message?.includes("SESSION_REVOKED");
         if (authDead) {
           console.warn(`[keepalive] Sessão morta: ${account.phone_number} — desativando no banco`);
@@ -418,7 +512,6 @@ async function getClient(account: Account): Promise<TelegramClient> {
   }
 }
 
-// BUG #D: aguarda promise inflight antes de deletar o mutex
 async function reloadClient(account: Account): Promise<TelegramClient> {
   const inflight = connectingPromises.get(account.id);
   if (inflight) {
@@ -489,7 +582,6 @@ async function resolvePeer(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    ENVIO COM RETRY INTERNO
-   BUG #H: randomId gerado uma vez por ciclo e reutilizado nos retries.
    ───────────────────────────────────────────────────────────────────────────── */
 async function sendMessage(
   client: TelegramClient,
@@ -497,10 +589,9 @@ async function sendMessage(
   telegramChatId: string,
   messageText: string
 ): Promise<void> {
-  const budgetEnd = Date.now() + RETRY_BUDGET_MS;
-  // BUG #H: gerado uma vez — reutilizado em todos os retries do mesmo ciclo.
+  const budgetEnd      = Date.now() + RETRY_BUDGET_MS;
   const stableRandomId = makeRandomId();
-  let attempt = 0;
+  let attempt          = 0;
 
   while (Date.now() < budgetEnd) {
     attempt++;
@@ -519,7 +610,6 @@ async function sendMessage(
               randomId:  stableRandomId,
               noWebpage: true,
             }));
-
           } catch (err: any) {
             const errMsg = String(err?.message ?? "");
 
@@ -593,8 +683,7 @@ async function sendMessage(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   SNIPER — ENVIO ÚNICO COM TIMEOUT CURTO (sem retry interno)
-   BUG #H: randomId recebido como parâmetro — gerado uma vez no loop do sniper.
+   SNIPER — ENVIO ÚNICO COM TIMEOUT CURTO
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperSendOnce(
   client: TelegramClient,
@@ -619,7 +708,7 @@ async function sniperSendOnce(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   SNIPER LOOP — GRUPOS FECHADOS
+   SNIPER LOOP — GRUPOS FECHADOS (v10: adaptive gate)
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperFireClosed(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -628,7 +717,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
   }
   sniperFiringNow.add(scheduleId);
 
-  // OPT #7: captura o timestamp exato de entrada para medir o lag do timer
   const sniperEnteredAt = Date.now();
 
   try {
@@ -652,11 +740,10 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       schedule = data as unknown as Schedule;
     }
 
-    // OPT #7: log do lag do timer (quanto o setTimeout atrasou em relação ao planejado)
     const scheduledAt     = new Date(schedule.next_run_at).getTime();
     const plannedSniperAt = scheduledAt - SNIPER_BEFORE_MS;
     const timerLagMs      = sniperEnteredAt - plannedSniperAt;
-    console.log(`[sniper][timing] timer lag: ${timerLagMs}ms (SNIPER_BEFORE_MS=${SNIPER_BEFORE_MS}, ideal=0)`);
+    console.log(`[sniper][timing] timer lag: ${timerLagMs}ms (ideal=0, SNIPER_BEFORE_MS=${SNIPER_BEFORE_MS})`);
 
     const group = schedule.groups;
 
@@ -683,11 +770,8 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
     const chatId    = group.telegram_chat_id;
     const budgetEnd = Date.now() + SNIPER_BUDGET_MS;
-    const results:  DispatchResult[] = [];
 
-    console.log(`[sniper] 🎯 Iniciando loop agressivo para schedule ${scheduleId} — ${members.length} conta(s)`);
-
-    // ── FASE 1: loop agressivo na primeira conta ──────────────────────────
+    // ── FASE 0: conecta a primeira conta antes do gate ────────────────────
     const firstMember  = members[0];
     const firstAccount = firstMember.accounts!;
     const firstText    = firstMember.message_text ?? "";
@@ -697,46 +781,80 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       firstClient = await getClient(firstAccount);
     } catch (err: any) {
       console.error(`[sniper] Falha ao conectar ${firstAccount.phone_number}: ${err.message}`);
-      results.push({
+      const results: DispatchResult[] = [{
         account_id:   firstAccount.id,
         message_text: firstMember.message_text,
         status:       "failed",
         retryable:    isRetryableError(err.message),
         error:        err.message,
-      });
+      }];
       await updateScheduleAfterDispatch(schedule, results, now, "closed");
       return;
     }
 
-    let attempt        = 0;
-    let firstSentAt: Date | null = null;
-    // BUG #H: gerado uma vez — reutilizado em todos os retries do loop sniper.
-    const firstRandomId = makeRandomId();
+    // ── v10: ADAPTIVE GATE ────────────────────────────────────────────────
+    // Calcula guardMs dinamicamente com base no perfil histórico do grupo.
+    // guardMs negativo = invokeNotBefore está ANTES de scheduledAt (opens_early).
+    // guardMs zero     = dispara em scheduledAt (padrão para grupos sem dados).
+    // guardMs positivo = aguarda até scheduledAt + guardMs (opens_late).
+    const profile           = groupProfileCache.get(group.id);
+    const hasSufficientData = (profile?.sample_count ?? 0) >= 3;
 
-    // ── BUG #I fix: busy-wait até scheduledAt + SNIPER_AFTER_GUARD_MS ────
-    // Garante que o invoke só parte DEPOIS da virada do minuto.
-    // O Telegram carimba com o timestamp de chegada do pacote — se chegar
-    // antes de scheduledAt o grupo mostra o minuto anterior.
-    const invokeNotBefore = scheduledAt + SNIPER_AFTER_GUARD_MS;
+    let guardMs: number;
+    if (hasSufficientData) {
+      if (profile!.opens_early) {
+        // Grupo historicamente abre antes do horário.
+        // Tenta 50ms antes do p10 (mais cedo já observado) para pegar a abertura.
+        // Exemplo: p10 = -400ms → guardMs = -450ms → invokeNotBefore = scheduledAt - 450ms
+        guardMs = Math.max(-30_000, profile!.offset_p10_ms - 50);
+      } else {
+        // Grupo abre no horário ou depois.
+        // Dispara 20ms antes da mediana histórica (chega um pouco antes do ponto típico).
+        // Exemplo: p50 = +80ms → guardMs = 60ms → aguarda scheduledAt + 60ms
+        guardMs = Math.max(0, profile!.offset_p50_ms - 20);
+      }
+    } else {
+      // Sem dados suficientes: dispara no scheduledAt exato.
+      // O RTT one-way Railway US East → Miami DC (~25ms) garante que o pacote
+      // chega ao Telegram APÓS scheduledAt — sem risco de carimbo no minuto anterior.
+      guardMs = 0;
+    }
+
+    console.log(
+      `[sniper][adaptive] guardMs=${guardMs}ms | ` +
+      (hasSufficientData
+        ? `p10=${profile!.offset_p10_ms}ms p50=${profile!.offset_p50_ms}ms p90=${profile!.offset_p90_ms}ms opens_early=${profile!.opens_early} n=${profile!.sample_count}`
+        : `sem perfil (requer ≥3 amostras, atual: ${profile?.sample_count ?? 0})`)
+    );
+
+    const invokeNotBefore = scheduledAt + guardMs;
+
+    // ── v10: SLEEP + SPIN (máx 2ms de busy-spin) ─────────────────────────
+    // Antes (v9): spin de até 15ms → congestionava event loop em disparos simultâneos.
+    // Agora: sleep libera event loop → spin apenas nos últimos 2ms para precisão.
     {
       const msUntilFire = invokeNotBefore - Date.now();
-      if (msUntilFire > 0) {
+      if (msUntilFire > SNIPER_SPIN_MAX_MS) {
+        const sleepMs = msUntilFire - SNIPER_SPIN_MAX_MS;
         console.log(
-          `[sniper][timing] aguardando virada: ${msUntilFire}ms até ` +
-          `${new Date(invokeNotBefore).toISOString()} (guard=${SNIPER_AFTER_GUARD_MS}ms)`
+          `[sniper][timing] aguardando gate: sleep ${sleepMs}ms + spin ≤${SNIPER_SPIN_MAX_MS}ms ` +
+          `(invokeNotBefore=${new Date(invokeNotBefore).toISOString()})`
         );
-        // sleep para a maior parte do wait, busy-spin nos últimos 5ms
-        if (msUntilFire > 5) {
-          await new Promise(r => setTimeout(r, msUntilFire - 5));
-        }
-        // busy-wait de precisão sub-ms
-        while (Date.now() < invokeNotBefore) { /* spin */ }
+        await new Promise(r => setTimeout(r, sleepMs));
+      } else if (msUntilFire > 0) {
+        console.log(`[sniper][timing] spin ≤${msUntilFire}ms (já próximo do gate)`);
       } else {
-        console.warn(
-          `[sniper][timing] já passou da virada em ${-msUntilFire}ms — invocando imediatamente`
-        );
+        console.log(`[sniper][timing] gate já passou em ${-msUntilFire}ms — invocando imediatamente`);
       }
+      // busy-spin de precisão sub-ms — máx 2ms
+      while (Date.now() < invokeNotBefore) { /* spin */ }
     }
+
+    // ── FASE 1: loop agressivo na primeira conta ──────────────────────────
+    const results: DispatchResult[] = [];
+    let attempt        = 0;
+    let firstSentAt: Date | null = null;
+    const firstRandomId = makeRandomId();
 
     while (Date.now() < budgetEnd) {
       attempt++;
@@ -745,13 +863,13 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         await sniperSendOnce(firstClient, firstAccount, chatId, firstText, firstRandomId);
         firstSentAt = new Date();
 
-        // OPT #7: logs de timing para calibração
-        const invokeRttMs        = firstSentAt.getTime() - sniperEnteredAt;
-        const vsHorarioMs        = firstSentAt.getTime() - scheduledAt;
-        const vsInvokeNotBefore  = firstSentAt.getTime() - invokeNotBefore;
-        console.log(`[sniper][timing] invoke RTT: ${invokeRttMs}ms (tempo real do MTProto+network)`);
+        // v10: métricas de timing para diagnóstico e alimentar o perfil
+        const invokeRttMs       = firstSentAt.getTime() - sniperEnteredAt;
+        const vsHorarioMs       = firstSentAt.getTime() - scheduledAt;
+        const vsGateMs          = firstSentAt.getTime() - invokeNotBefore;
+        console.log(`[sniper][timing] invoke RTT: ${invokeRttMs}ms (tempo total desde entrada do sniper)`);
         console.log(`[sniper][timing] vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms (negativo=antes, positivo=atrasado) tentativa=${attempt}`);
-        console.log(`[sniper][timing] margem pós-guard: +${vsInvokeNotBefore + SNIPER_AFTER_GUARD_MS}ms desde scheduledAt`);
+        console.log(`[sniper][timing] vs gate: +${vsGateMs}ms desde invokeNotBefore (guardMs=${guardMs}ms)`);
 
         console.log(`[sniper] ✓ Primeira conta ${firstAccount.phone_number} enviou na tentativa ${attempt} (${firstSentAt.toISOString()})`);
         results.push({
@@ -760,6 +878,12 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
           status:       "sent",
           retryable:    false,
         });
+
+        // v10: persiste a amostra de timing fire-and-forget (não bloqueia)
+        persistGroupDispatchSample(group.id, vsHorarioMs).catch(e =>
+          console.warn("[profiles] Erro ao persistir amostra:", e.message)
+        );
+
         break;
       } catch (err: any) {
         const errMsg = String(err?.message ?? "");
@@ -781,7 +905,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
           return;
         }
 
-        // BUG #C: FloodWait — aguarda tempo exato antes de retomar
         const isFlood =
           err?.seconds != null ||
           err?.constructor?.name === "FloodWaitError" ||
@@ -860,7 +983,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
       try {
         const client = await getClient(account);
-        // BUG #H: cada conta da fase 2 recebe seu próprio randomId estável.
         const memberRandomId = makeRandomId();
         await sniperSendOnce(client, account, chatId, text, memberRandomId);
         sentAt = new Date();
@@ -916,8 +1038,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
   } finally {
     sniperFiringNow.delete(scheduleId);
-
-    // BUG #A: bloqueia o fireSchedule do mesmo ciclo por TTL
     firingNow.add(scheduleId);
     setTimeout(() => firingNow.delete(scheduleId), SNIPER_DONE_BLOCK_TTL_MS);
   }
@@ -1147,7 +1267,7 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
         last_attempt_status: "timeout",
         last_attempt_error:  "Timeout aguardando sinal do admin",
       }).eq("id", schedule.id);
-      scheduleTimer(schedule.id, nextRun, "open");
+      scheduleTimer(schedule.id, nextRun, "open", schedule.group_id);
 
     } catch (err: any) {
       console.error(`[listen] Erro inesperado para schedule ${schedule.id}:`, err.message);
@@ -1222,7 +1342,6 @@ async function dispatchToGroup(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    ATUALIZAÇÃO DO SCHEDULE APÓS DISPARO
-   BUG #B: recebe groupType e repassa para scheduleTimer.
    ───────────────────────────────────────────────────────────────────────────── */
 async function updateScheduleAfterDispatch(
   schedule: Schedule,
@@ -1243,6 +1362,12 @@ async function updateScheduleAfterDispatch(
     retryableFails.length === 0 &&
     permanentFails.length === 0 &&
     (sentCount + skippedCount) > 0;
+
+  const resolvedGroupType = groupType ?? schedule.groups?.group_type;
+  const groupId           = schedule.group_id ?? schedule.groups?.id;
+
+  // v10: mantém mapa scheduleId → groupId atualizado
+  if (groupId) scheduleGroupMap.set(schedule.id, groupId);
 
   if (allOk) {
     let nextRun: string;
@@ -1267,7 +1392,7 @@ async function updateScheduleAfterDispatch(
     });
 
     console.log(`[schedule] ✓ Schedule ${schedule.id} OK. Próxima: ${nextRun}`);
-    scheduleTimer(schedule.id, nextRun, groupType ?? schedule.groups?.group_type);
+    scheduleTimer(schedule.id, nextRun, resolvedGroupType, groupId);
 
   } else {
     const newRetryCount = schedule.retry_count + 1;
@@ -1298,13 +1423,13 @@ async function updateScheduleAfterDispatch(
 
     const retryAt = new Date(now.getTime() + interval * 1000);
     if (retryAt < new Date(retryUntil)) {
-      scheduleTimer(schedule.id, retryAt.toISOString(), groupType ?? schedule.groups?.group_type);
+      scheduleTimer(schedule.id, retryAt.toISOString(), resolvedGroupType, groupId);
     }
   }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   DISPARO DE SCHEDULE (grupos abertos + fallback para fechados sem sniper)
+   DISPARO DE SCHEDULE (grupos abertos + fallback fechados sem sniper)
    ───────────────────────────────────────────────────────────────────────────── */
 async function fireSchedule(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -1382,7 +1507,7 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       return;
     }
 
-    // Grupo fechado chegou aqui sem sniper (retry via banco, boot tardio, etc.)
+    // Grupo fechado sem sniper (retry via banco, boot tardio, etc.)
     const alreadySent = schedule.retry_until
       ? await getAlreadySentIds(schedule)
       : new Set<string>();
@@ -1415,15 +1540,23 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   TIMER DE PRECISÃO + PRE-FETCH + SNIPER
+   TIMER DE PRECISÃO + PRE-FETCH + SNIPER (v10: adaptive lead para opens_early)
    ───────────────────────────────────────────────────────────────────────────── */
-function scheduleTimer(scheduleId: string, nextRunAt: string, groupType?: "open" | "closed"): void {
+function scheduleTimer(
+  scheduleId: string,
+  nextRunAt: string,
+  groupType?: "open" | "closed",
+  groupId?: string   // v10: usado para consultar o perfil do grupo
+): void {
   const delay = new Date(nextRunAt).getTime() - Date.now();
 
   if (delay < -5_000) {
     console.warn(`[timer] Schedule ${scheduleId} ignorado — muito no passado (${nextRunAt})`);
     return;
   }
+
+  // v10: mantém o mapa scheduleId → groupId para uso futuro
+  if (groupId) scheduleGroupMap.set(scheduleId, groupId);
 
   const prev = scheduledTimers.get(scheduleId);
   if (prev) clearTimeout(prev);
@@ -1434,7 +1567,7 @@ function scheduleTimer(scheduleId: string, nextRunAt: string, groupType?: "open"
 
   const effectiveDelay = Math.max(0, delay);
 
-  // OPT #2: pre-fetch do schedule PREFETCH_BEFORE_MS antes do fire.
+  // OPT #2: pre-fetch 800ms antes
   if (effectiveDelay > PREFETCH_BEFORE_MS) {
     const prefetchDelay = effectiveDelay - PREFETCH_BEFORE_MS;
     const pt = setTimeout(async () => {
@@ -1469,24 +1602,49 @@ function scheduleTimer(scheduleId: string, nextRunAt: string, groupType?: "open"
     prefetchTimers.set(scheduleId, pt);
   }
 
-  // OPT #5: sniper para grupos fechados.
-  if (groupType === "closed" && effectiveDelay > SNIPER_BEFORE_MS) {
-    const sniperDelay = effectiveDelay - SNIPER_BEFORE_MS;
-    const st = setTimeout(async () => {
-      sniperTimers.delete(scheduleId);
-      const cached = schedulePrefetchCache.get(scheduleId);
-      if (cached && cached.groups?.group_type !== "closed") {
-        console.log(`[sniper] Schedule ${scheduleId} não é closed — pulando sniper`);
-        return;
+  // v10: sniper com lead adaptativo para grupos closed
+  if (groupType === "closed") {
+    // Para grupos opens_early com perfil suficiente, inicia o sniper mais cedo.
+    // O extra lead garante que o loop já está rodando quando o grupo abrir,
+    // mesmo que seja muito antes do horário nominal.
+    const resolvedGroupId = groupId ?? scheduleGroupMap.get(scheduleId);
+    const profile         = resolvedGroupId ? groupProfileCache.get(resolvedGroupId) : undefined;
+    const hasSufficientData = (profile?.sample_count ?? 0) >= 3;
+
+    // Extra lead: abs(p10) + 100ms de margem para o sniper estar pronto
+    // Exemplo: p10 = -500ms → extra = 600ms → sniper inicia 700ms antes do horário
+    const extraLeadMs = (hasSufficientData && profile!.opens_early)
+      ? Math.max(0, -profile!.offset_p10_ms) + 100
+      : 0;
+
+    const totalSniperLeadMs = SNIPER_BEFORE_MS + extraLeadMs;
+
+    if (effectiveDelay > totalSniperLeadMs) {
+      const sniperDelay = effectiveDelay - totalSniperLeadMs;
+      const st = setTimeout(async () => {
+        sniperTimers.delete(scheduleId);
+        const cached = schedulePrefetchCache.get(scheduleId);
+        if (cached && cached.groups?.group_type !== "closed") {
+          console.log(`[sniper] Schedule ${scheduleId} não é closed — pulando sniper`);
+          return;
+        }
+        try {
+          await sniperFireClosed(scheduleId);
+        } catch (err) {
+          console.error(`[sniper] Erro inesperado ao disparar ${scheduleId}:`, err);
+        }
+      }, sniperDelay);
+      sniperTimers.set(scheduleId, st);
+
+      if (extraLeadMs > 0) {
+        console.log(
+          `[sniper] ⏰ Sniper agendado (opens_early) — lead total=${totalSniperLeadMs}ms ` +
+          `(base=${SNIPER_BEFORE_MS}ms + extra=${extraLeadMs}ms) em ${Math.round(sniperDelay / 1000)}s`
+        );
+      } else {
+        console.log(`[sniper] ⏰ Sniper agendado para schedule ${scheduleId} em ${Math.round(sniperDelay / 1000)}s`);
       }
-      try {
-        await sniperFireClosed(scheduleId);
-      } catch (err) {
-        console.error(`[sniper] Erro inesperado ao disparar ${scheduleId}:`, err);
-      }
-    }, sniperDelay);
-    sniperTimers.set(scheduleId, st);
-    console.log(`[sniper] ⏰ Sniper agendado para schedule ${scheduleId} em ${Math.round(sniperDelay / 1000)}s`);
+    }
   }
 
   const timer = setTimeout(async () => {
@@ -1518,7 +1676,7 @@ async function reloadSchedules(): Promise<void> {
     { data: expiredRetries },
   ] = await Promise.all([
     supabase.from("schedules")
-      .select("id, next_run_at, groups(group_type)")
+      .select("id, next_run_at, group_id, groups(id, group_type)")  // v10: group_id incluído
       .eq("is_active", true)
       .is("retry_until", null)
       .lte("next_run_at", lookaheadISO),
@@ -1565,13 +1723,14 @@ async function reloadSchedules(): Promise<void> {
       last_attempt_status: "failed",
       last_attempt_error:  "Retry expirou sem sucesso total",
     }).eq("id", expired.id);
-    scheduleTimer(expired.id, nextRun);
+    scheduleTimer(expired.id, nextRun, undefined, expGroupId);
   }));
 
   for (const s of futureSchedules ?? []) {
     if (!scheduledTimers.has(s.id)) {
-      const gType = (s as any).groups?.group_type as "open" | "closed" | undefined;
-      scheduleTimer(s.id, s.next_run_at, gType);
+      const gType   = (s as any).groups?.group_type as "open" | "closed" | undefined;
+      const gId     = (s as any).group_id as string | undefined ?? (s as any).groups?.id as string | undefined;
+      scheduleTimer(s.id, s.next_run_at, gType, gId);
     }
   }
 
@@ -1596,7 +1755,6 @@ async function reloadSchedules(): Promise<void> {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    RECONEXÃO LEVE
-   BUG #E: só reconecta clientes offline, sem getDialogs.
    ───────────────────────────────────────────────────────────────────────────── */
 async function reconnectDeadClients(): Promise<void> {
   const reconnectPromises: Promise<void>[] = [];
@@ -1620,7 +1778,7 @@ async function reconnectDeadClients(): Promise<void> {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   PRE-WARM DE CONTAS — roda apenas no boot
+   PRE-WARM DE CONTAS + PERFIS (v10: loadGroupProfiles no boot)
    ───────────────────────────────────────────────────────────────────────────── */
 let prewarmRunning = false;
 async function prewarmAccounts(): Promise<void> {
@@ -1645,7 +1803,7 @@ async function prewarmAccounts(): Promise<void> {
       } catch (err: any) {
         const authDead =
           err.message?.includes("AUTH_KEY_UNREGISTERED") ||
-          err.message?.includes("USER_DEACTIVATED") ||
+          err.message?.includes("USER_DEACTIVATED")      ||
           err.message?.includes("SESSION_REVOKED");
         if (authDead) {
           console.warn(`[prewarm] Sessão morta: ${account.phone_number} — desativando.`);
@@ -1656,7 +1814,7 @@ async function prewarmAccounts(): Promise<void> {
       }
     }));
 
-    // OPT #3: pre-resolve de peers para todos os grupos ativos.
+    // OPT #3: pre-resolve de peers para todos os grupos ativos
     try {
       const { data: groups } = await supabase
         .from("groups")
@@ -1690,6 +1848,9 @@ async function prewarmAccounts(): Promise<void> {
     } catch (err: any) {
       console.warn(`[prewarm] Falha no pre-resolve de peers: ${err.message}`);
     }
+
+    // v10: carrega perfis de timing no boot
+    await loadGroupProfiles();
 
   } finally {
     prewarmRunning = false;
@@ -1907,6 +2068,24 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
+  // v10: GET /groups/:id/profile — consulta o perfil de timing de um grupo
+  const profileMatch = url.pathname.match(/^\/groups\/([^/]+)\/profile$/);
+  if (req.method === "GET" && profileMatch) {
+    const groupId = profileMatch[1];
+    const profile = groupProfileCache.get(groupId) ?? null;
+    return jsonResponse(res, 200, { profile });
+  }
+
+  // v10: DELETE /groups/:id/profile — reseta o perfil de um grupo (force relearn)
+  if (req.method === "DELETE" && profileMatch) {
+    const groupId = profileMatch[1];
+    groupProfileCache.delete(groupId);
+    await supabase.from("group_profiles").delete().eq("group_id", groupId);
+    await supabase.from("group_dispatch_samples").delete().eq("group_id", groupId);
+    console.log(`[profiles] 🗑 Perfil resetado para grupo ${groupId}`);
+    return jsonResponse(res, 200, { ok: true, message: "Perfil resetado — próximos 3 disparos reaprendem o timing" });
+  }
+
   const listenMatch = url.pathname.match(/^\/groups\/([^/]+)\/listen$/);
   if (listenMatch) {
     const groupId = listenMatch[1];
@@ -2114,7 +2293,6 @@ const httpServer = http.createServer(async (req, res) => {
           const text = member.message_text ?? "";
 
           if (sendToSelf) {
-            // Envia para Saved Messages — aquece peer cache sem afetar o grupo real
             const stableId = makeRandomId();
             await Promise.race([
               client.invoke(new Api.messages.SendMessage({
@@ -2189,8 +2367,8 @@ process.on("SIGINT",  shutdown);
    INICIALIZAÇÃO
    ───────────────────────────────────────────────────────────────────────────── */
 async function init(): Promise<void> {
-  console.log("[worker] Iniciando...");
-  await prewarmAccounts();
+  console.log("[worker] Iniciando v10 — Adaptive Gate...");
+  await prewarmAccounts();   // inclui loadGroupProfiles() no boot
   await reloadSchedules();
   setInterval(async () => {
     try {
@@ -2202,7 +2380,7 @@ async function init(): Promise<void> {
       console.error("[reload] Erro no reload periódico:", err);
     }
   }, RELOAD_INTERVAL_MS);
-  console.log("[worker] Pronto.");
+  console.log("[worker] Pronto. Adaptive Gate ativo.");
 }
 
 init().catch(err => {
