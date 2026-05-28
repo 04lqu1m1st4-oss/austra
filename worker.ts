@@ -140,7 +140,7 @@ const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
 // BUG #I fix: SNIPER_BEFORE_MS é apenas warm-up do loop — NÃO é mais o offset
 // de timing. O invoke só parte depois de scheduledAt + SNIPER_AFTER_GUARD_MS.
 // 200ms de warm-up garante que o loop está rodando bem antes da virada.
-const SNIPER_BEFORE_MS              = 200;
+const SNIPER_BEFORE_MS              = 100;
 
 // BUG #I fix: margem de segurança pós-virada. O invoke parte depois de
 // scheduledAt + SNIPER_AFTER_GUARD_MS, garantindo que o pacote chega ao
