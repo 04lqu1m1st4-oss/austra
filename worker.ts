@@ -22,6 +22,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // Fix v14 — Loop sempre agressivo. Gate só bloqueia opens_early antes do horário
 // Fix v15 — RTT-aware busy-wait: compensa half-RTT no floor de opens_early
+// Fix v16 — Floor universal: todo grupo (com ou sem perfil) espera até invokeDeadline
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // FILOSOFIA DO SNIPER (v15):
@@ -42,18 +43,20 @@
 //   já passou de scheduledAt, mas o servidor ainda está antes do horário.
 //   O busy-wait não ajuda porque compara relógio local com scheduledAt local.
 //
-//   SOLUÇÃO v15:
-//     invokeDeadline = scheduledAt - estimatedOneWayRttMs
-//     onde estimatedOneWayRttMs = max(0, avgRtt/2) medido nas clock probes.
-//     O invoke começa quando Date.now() >= invokeDeadline, garantindo que
-//     o pacote CHEGA ao servidor exatamente em scheduledAt.
+//   SOLUÇÃO v15/v16:
+//     invokeDeadline = scheduledAt (referencial servidor) - halfRtt
+//     APLICADO A TODOS OS GRUPOS — com ou sem perfil, opens_early ou não.
 //
-//     Se clockOffsetQuality = 'high', usa também telegramClockOffsetMs para
-//     ajustar scheduledAt para o referencial do servidor antes de subtrair RTT.
+//     Para grupos fechados que ainda não abriram: o floor garante que o
+//     primeiro invoke sai no horário certo. Se vier CHAT_WRITE_FORBIDDEN,
+//     o loop too_early cuida dos retries em 1ms normalmente.
+//
+//     Para grupos opens_early: mesmo comportamento — o floor evita mandar
+//     antes do horário mesmo quando o grupo já está aberto.
 //
 //   Resumo:
-//     opens_early → spin até (scheduledAt_servidor - halfRtt), depois loop
-//     qualquer outro caso → loop agressivo imediato, sem sleep
+//     TODOS → spin até invokeDeadline (scheduledAt_servidor - halfRtt)
+//     Se vier too_early após deadline → loop agressivo 1ms normalmente
 //
 // FIXES v13/v14 MANTIDOS:
 //   - Throttle progressivo suave (base 1ms, começa em 200 too_early)
@@ -988,46 +991,38 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         : `sem perfil suficiente (${profile?.sample_count ?? 0}/3) → loop agressivo imediato`)
     );
 
-    // ── Floor para opens_early: espera até que o invoke CHEGUE ao servidor em scheduledAt ──
-    // v15: compensa half-RTT para que o pacote chegue no servidor exatamente no horário.
+    // ── Floor universal (v16): todos os grupos esperam até invokeDeadline ────────────────
+    // invokeDeadline = scheduledAt no referencial do servidor - halfRtt
+    // Garante que o pacote CHEGA ao servidor exatamente em scheduledAt.
     //
-    // invokeDeadline = scheduledAt (no referencial do servidor) - halfRtt
-    // O clock offset (telegramClockOffsetMs) já está em "serverTime - localTime",
-    // portanto: scheduledAt_local - clockOffset dá scheduledAt_servidor em tempo local.
-    // Subtraindo halfRtt: momento local em que devemos INICIAR o invoke.
+    // clockAdj: quando temos medição de alta qualidade, converte scheduledAt do
+    // referencial local para o referencial do servidor antes de subtrair halfRtt.
+    //   offset = serverTime - localTime  →  localTime + offset = serverTime
+    //   scheduledAt_em_localRef_mas_equivalente_ao_servidor = scheduledAt - offset
+    //   (se offset=-983ms → relógio local adiantado: espera mais 983ms)
     //
-    // Se offset = 0 e rtt = 40ms: invokeDeadline = scheduledAt - 20ms
-    // Se relógio local adiantado (offset = -50ms) e rtt = 40ms:
-    //   scheduledAt_servidor_em_local = scheduledAt - (-50) = scheduledAt + 50ms (mais tarde)
-    //   invokeDeadline = scheduledAt + 50ms - 20ms = scheduledAt + 30ms
-    //   → espera 30ms a mais antes de invocar, correto!
-    if (isOpensEarly) {
-      const clockAdj         = clockOffsetQuality === "high" ? telegramClockOffsetMs : 0;
-      // scheduledAt no referencial local, mas corrigido para o servidor
-      const scheduledAtServer = scheduledAt - clockAdj; // em ms do relógio local
+    // Para grupos sem perfil ou não-opens_early: após o invokeDeadline, se vier
+    // CHAT_WRITE_FORBIDDEN o loop too_early trata normalmente em 1ms.
+    {
+      const clockAdj          = clockOffsetQuality === "high" ? telegramClockOffsetMs : 0;
+      const scheduledAtServer = scheduledAt - clockAdj;
       const invokeDeadline    = scheduledAtServer - estimatedOneWayRttMs;
+      const msUntilDeadline   = invokeDeadline - Date.now();
 
-      const msUntilDeadline = invokeDeadline - Date.now();
       console.log(
-        `[sniper][timing] opens_early → clockAdj=${clockAdj > 0 ? "+" : ""}${clockAdj}ms ` +
-        `halfRtt=${estimatedOneWayRttMs}ms invokeDeadline=${new Date(invokeDeadline).toISOString()} ` +
-        `(${msUntilDeadline > 0 ? "+" : ""}${Math.round(msUntilDeadline)}ms)`
+        `[sniper][timing] invokeDeadline → clockAdj=${clockAdj > 0 ? "+" : ""}${clockAdj}ms ` +
+        `halfRtt=${estimatedOneWayRttMs}ms deadline=${new Date(invokeDeadline).toISOString()} ` +
+        `(${msUntilDeadline > 0 ? "+" : ""}${Math.round(msUntilDeadline)}ms) ` +
+        `opens_early=${isOpensEarly}`
       );
 
       if (msUntilDeadline > SNIPER_SPIN_MAX_MS) {
         const sleepMs = msUntilDeadline - SNIPER_SPIN_MAX_MS;
-        console.log(`[sniper][timing] opens_early → sleep ${sleepMs}ms + spin até invokeDeadline`);
         await new Promise(r => setTimeout(r, sleepMs));
       }
-      // busy-spin de precisão até o invokeDeadline
+      // busy-spin de precisão até o deadline
       while (Date.now() < invokeDeadline) { /* spin */ }
-      console.log(`[sniper][timing] opens_early → invokeDeadline atingido, iniciando loop`);
-    } else {
-      const lagVsScheduled = Date.now() - scheduledAt;
-      console.log(
-        `[sniper][timing] invoke imediato | ` +
-        `${lagVsScheduled >= 0 ? "+" : ""}${lagVsScheduled}ms vs scheduledAt`
-      );
+      console.log(`[sniper][timing] invokeDeadline atingido (${Date.now() - scheduledAt > 0 ? "+" : ""}${Date.now() - scheduledAt}ms vs scheduledAt local)`);
     }
 
     sniperTokenBuckets.set(firstAccount.id, {
@@ -2307,7 +2302,7 @@ async function init(): Promise<void> {
     }
   }, CLOCK_OFFSET_REFRESH_MS);
 
-  console.log("[worker] Pronto v15. RTT-aware floor para opens_early. Loop agressivo para demais grupos.");
+  console.log("[worker] Pronto v16. Floor universal: todos os grupos esperam invokeDeadline antes do primeiro invoke.");
 }
 
 init().catch(err => {
