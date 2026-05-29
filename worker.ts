@@ -1,4 +1,4 @@
-// worker-v14.ts — dispatch worker Telegram, timing adaptativo por grupo
+// worker-v15.ts — dispatch worker Telegram, timing adaptativo por grupo
 //
 // ═══════════════════════════════════════════════════════════════════════════
 // HISTÓRICO DE FIXES (v1–v13 preservados para referência)
@@ -21,28 +21,41 @@
 //
 // ═══════════════════════════════════════════════════════════════════════════
 // Fix v14 — Loop sempre agressivo. Gate só bloqueia opens_early antes do horário
+// Fix v15 — RTT-aware busy-wait: compensa half-RTT no floor de opens_early
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// FILOSOFIA DO SNIPER (v14):
+// FILOSOFIA DO SNIPER (v15):
 //
 //   O loop de 1ms é sempre ativo desde o momento que o sniper entra.
 //   SNIPER_BEFORE_MS serve apenas para aquecer a conexão — não para criar sleep.
 //
 //   A ÚNICA restrição de timing é para grupos opens_early:
-//     invokeNotBefore = scheduledAt
-//   Isso evita mandar a mensagem antes do horário agendado.
-//   O loop fica em busy-wait (1ms) até scheduledAt e depois dispara.
+//     invokeNotBefore = scheduledAt - estimatedOneWayRttMs
 //
-//   Para todos os outros casos (sem perfil, grupo normal, grupo com delay):
-//     Invoke imediato ao entrar. Se o grupo ainda está fechado, recebe
-//     CHAT_WRITE_FORBIDDEN → tooEarlyCount++ → retry em 1ms.
-//     O loop classificado cuida de tudo via too_early.
+//   POR QUÊ: o invoke tem RTT (ida+volta). Se esperarmos até scheduledAt para
+//   COMEÇAR o invoke, o pacote chega ao servidor ~halfRtt ms DEPOIS do horário.
+//   Isso é seguro para grupos opens_early que permitem envio apenas a partir
+//   do horário — mas o sintoma relatado é o oposto: mensagem chegando ANTES.
+//
+//   O problema ocorre quando o relógio local está ADIANTADO em relação ao
+//   servidor Telegram (telegramClockOffsetMs < 0). Nesse caso Date.now()
+//   já passou de scheduledAt, mas o servidor ainda está antes do horário.
+//   O busy-wait não ajuda porque compara relógio local com scheduledAt local.
+//
+//   SOLUÇÃO v15:
+//     invokeDeadline = scheduledAt - estimatedOneWayRttMs
+//     onde estimatedOneWayRttMs = max(0, avgRtt/2) medido nas clock probes.
+//     O invoke começa quando Date.now() >= invokeDeadline, garantindo que
+//     o pacote CHEGA ao servidor exatamente em scheduledAt.
+//
+//     Se clockOffsetQuality = 'high', usa também telegramClockOffsetMs para
+//     ajustar scheduledAt para o referencial do servidor antes de subtrair RTT.
 //
 //   Resumo:
-//     opens_early → spin até scheduledAt, depois loop agressivo
+//     opens_early → spin até (scheduledAt_servidor - halfRtt), depois loop
 //     qualquer outro caso → loop agressivo imediato, sem sleep
 //
-// FIXES v13 MANTIDOS:
+// FIXES v13/v14 MANTIDOS:
 //   - Throttle progressivo suave (base 1ms, começa em 200 too_early)
 //   - guardMs sem CONNECTION_BUDGET
 //   - SNIPER_TRANSIENT_INTERVAL_MS = 1ms
@@ -224,6 +237,7 @@ const sniperTokenBuckets    = new Map<string, TokenBucket>();
 
 let telegramClockOffsetMs = 0;
 let clockOffsetQuality: "high" | "low" | "unknown" = "unknown";
+let estimatedOneWayRttMs  = 0; // half-RTT médio das clock probes — usado no floor de opens_early
 
 /* ─────────────────────────────────────────────────────────────────────────────
    QUERY REUTILIZADA
@@ -414,10 +428,17 @@ async function measureClockOffsetViaSelfSend(client: TelegramClient): Promise<nu
     return telegramClockOffsetMs;
   }
 
+  // Atualiza RTT estimado (half-RTT = tempo que o pacote leva até o servidor)
+  const filteredRtts = probe_rtt.filter((_, i) => probe_rtt[i] <= avgRtt + 2 * stdRtt);
+  if (filteredRtts.length > 0) {
+    const avgFilteredRtt = filteredRtts.reduce((a, b) => a + b, 0) / filteredRtts.length;
+    estimatedOneWayRttMs = Math.max(0, Math.round(avgFilteredRtt / 2));
+  }
+
   console.log(
     `[clock] Multi-probe self-send: ${filtered.length}/${CLOCK_PROBE_COUNT} probes válidos | ` +
     `offsets=[${filtered.map(o => Math.round(o)).join(",")}]ms | ` +
-    `mediana=${Math.round(median)}ms | avgRtt=${Math.round(avgRtt)}ms`
+    `mediana=${Math.round(median)}ms | avgRtt=${Math.round(avgRtt)}ms | halfRtt=${estimatedOneWayRttMs}ms`
   );
 
   return Math.round(median);
@@ -967,18 +988,40 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         : `sem perfil suficiente (${profile?.sample_count ?? 0}/3) → loop agressivo imediato`)
     );
 
-    // ── Floor para opens_early: espera até scheduledAt sem dormir ────────
-    // Para os demais casos: invoke imediato, o loop trata too_early normalmente
+    // ── Floor para opens_early: espera até que o invoke CHEGUE ao servidor em scheduledAt ──
+    // v15: compensa half-RTT para que o pacote chegue no servidor exatamente no horário.
+    //
+    // invokeDeadline = scheduledAt (no referencial do servidor) - halfRtt
+    // O clock offset (telegramClockOffsetMs) já está em "serverTime - localTime",
+    // portanto: scheduledAt_local - clockOffset dá scheduledAt_servidor em tempo local.
+    // Subtraindo halfRtt: momento local em que devemos INICIAR o invoke.
+    //
+    // Se offset = 0 e rtt = 40ms: invokeDeadline = scheduledAt - 20ms
+    // Se relógio local adiantado (offset = -50ms) e rtt = 40ms:
+    //   scheduledAt_servidor_em_local = scheduledAt - (-50) = scheduledAt + 50ms (mais tarde)
+    //   invokeDeadline = scheduledAt + 50ms - 20ms = scheduledAt + 30ms
+    //   → espera 30ms a mais antes de invocar, correto!
     if (isOpensEarly) {
-      const msUntilScheduled = scheduledAt - Date.now();
-      if (msUntilScheduled > SNIPER_SPIN_MAX_MS) {
-        const sleepMs = msUntilScheduled - SNIPER_SPIN_MAX_MS;
-        console.log(`[sniper][timing] opens_early → sleep ${sleepMs}ms + spin até scheduledAt`);
+      const clockAdj         = clockOffsetQuality === "high" ? telegramClockOffsetMs : 0;
+      // scheduledAt no referencial local, mas corrigido para o servidor
+      const scheduledAtServer = scheduledAt - clockAdj; // em ms do relógio local
+      const invokeDeadline    = scheduledAtServer - estimatedOneWayRttMs;
+
+      const msUntilDeadline = invokeDeadline - Date.now();
+      console.log(
+        `[sniper][timing] opens_early → clockAdj=${clockAdj > 0 ? "+" : ""}${clockAdj}ms ` +
+        `halfRtt=${estimatedOneWayRttMs}ms invokeDeadline=${new Date(invokeDeadline).toISOString()} ` +
+        `(${msUntilDeadline > 0 ? "+" : ""}${Math.round(msUntilDeadline)}ms)`
+      );
+
+      if (msUntilDeadline > SNIPER_SPIN_MAX_MS) {
+        const sleepMs = msUntilDeadline - SNIPER_SPIN_MAX_MS;
+        console.log(`[sniper][timing] opens_early → sleep ${sleepMs}ms + spin até invokeDeadline`);
         await new Promise(r => setTimeout(r, sleepMs));
       }
-      // busy-spin de precisão até o horário exato
-      while (Date.now() < scheduledAt) { /* spin */ }
-      console.log(`[sniper][timing] opens_early → scheduledAt atingido, iniciando loop`);
+      // busy-spin de precisão até o invokeDeadline
+      while (Date.now() < invokeDeadline) { /* spin */ }
+      console.log(`[sniper][timing] opens_early → invokeDeadline atingido, iniciando loop`);
     } else {
       const lagVsScheduled = Date.now() - scheduledAt;
       console.log(
@@ -2000,10 +2043,11 @@ const httpServer = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && url.pathname === "/clock") {
     return jsonResponse(res, 200, {
-      clock_offset_ms: telegramClockOffsetMs,
-      clock_quality: clockOffsetQuality,
-      local_time: new Date().toISOString(),
-      adjusted_time: new Date(Date.now() + telegramClockOffsetMs).toISOString(),
+      clock_offset_ms:        telegramClockOffsetMs,
+      clock_quality:          clockOffsetQuality,
+      estimated_one_way_rtt:  estimatedOneWayRttMs,
+      local_time:             new Date().toISOString(),
+      adjusted_time:          new Date(Date.now() + telegramClockOffsetMs).toISOString(),
     });
   }
 
@@ -2012,7 +2056,7 @@ const httpServer = http.createServer(async (req, res) => {
     if (!anyClient) return jsonResponse(res, 503, { error: "Sem client conectado" });
     const newOffset = await measureTelegramClockOffset(anyClient);
     telegramClockOffsetMs = newOffset;
-    return jsonResponse(res, 200, { ok: true, clock_offset_ms: newOffset, clock_quality: clockOffsetQuality });
+    return jsonResponse(res, 200, { ok: true, clock_offset_ms: newOffset, clock_quality: clockOffsetQuality, estimated_one_way_rtt: estimatedOneWayRttMs });
   }
 
   const listenMatch = url.pathname.match(/^\/groups\/([^/]+)\/listen$/);
@@ -2263,7 +2307,7 @@ async function init(): Promise<void> {
     }
   }, CLOCK_OFFSET_REFRESH_MS);
 
-  console.log("[worker] Pronto. Loop agressivo sempre ativo. Floor scheduledAt apenas para opens_early.");
+  console.log("[worker] Pronto v15. RTT-aware floor para opens_early. Loop agressivo para demais grupos.");
 }
 
 init().catch(err => {
