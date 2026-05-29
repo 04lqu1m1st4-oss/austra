@@ -1773,6 +1773,7 @@ async function reloadSchedules(): Promise<void> {
   ]);
 
   await Promise.all((expiredRetries ?? []).map(async expired => {
+    if (!expired || typeof expired !== "object" || "message" in expired) return;
     const expGroupId = (expired as any).group_id as string | undefined;
     if (expGroupId) {
       const ctrl = listenMap.get(expGroupId);
