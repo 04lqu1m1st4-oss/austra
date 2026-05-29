@@ -1,4 +1,4 @@
-// worker-v15.ts — dispatch worker Telegram, timing adaptativo por grupo
+// worker-v18.ts — dispatch worker Telegram, timing adaptativo por grupo
 //
 // ═══════════════════════════════════════════════════════════════════════════
 // HISTÓRICO DE FIXES (v1–v13 preservados para referência)
@@ -18,34 +18,53 @@
 //          tooEarlyCount, measureTelegramClockOffset, persistGroupDispatchSample estendido
 // Fix v12: Multi-probe Clock + Dual-mode Sniper + Rate Limit Shield
 // Fix v13: Throttle corrigido (base 1ms) + guardMs sem corte de CONNECTION_BUDGET
+// Fix v14: Loop sempre agressivo. Gate só bloqueia opens_early antes do horário
+// Fix v15: RTT-aware busy-wait: compensa half-RTT no floor de opens_early
+// Fix v16: Floor universal: todo grupo (com ou sem perfil) espera até invokeDeadline
+// Fix v17: Sinal do clockAdj invertido (bug): usava scheduledAt + offset (errado)
 //
 // ═══════════════════════════════════════════════════════════════════════════
-// Fix v14 — Loop sempre agressivo. Gate só bloqueia opens_early antes do horário
-// Fix v15 — RTT-aware busy-wait: compensa half-RTT no floor de opens_early
-// Fix v16 — Floor universal: todo grupo (com ou sem perfil) espera até invokeDeadline
-// Fix v17 — Corrige sinal do clockAdj: scheduledAt + offset (não minus)
+// Fix v18 — Corrige sinal do clockAdj: invokeDeadline = scheduledAt - offset - halfRtt
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// FILOSOFIA DO SNIPER (v17):
+// FILOSOFIA DO SNIPER (v18):
 //
 //   offset = serverTime - localTime
-//   → localTime + offset = serverTime
-//   → scheduledAt_em_servidor = scheduledAt + offset
 //
-//   Se offset = -865ms (servidor atrasado):
-//     scheduledAt_servidor = scheduledAt - 865ms
-//     invokeDeadline = scheduledAt - 865ms - halfRtt
-//     → invoca 865ms + halfRtt ANTES do horário local
-//     → pacote chega ao servidor exatamente no horário
+//   Queremos que o pacote CHEGUE ao servidor quando o relógio DO SERVIDOR
+//   marcar scheduledAt. Como o pacote leva halfRtt para chegar, precisamos
+//   invocar halfRtt antes — mas em qual referencial?
 //
-//   TODOS → spin até invokeDeadline
-//   Se vier too_early após deadline → loop agressivo 1ms normalmente
+//   No referencial LOCAL:
+//     servidorMarca_scheduledAt quando localTime = scheduledAt - offset
+//     (porque serverTime = localTime + offset, então localTime = serverTime - offset)
 //
-// FIXES v13/v14 MANTIDOS:
+//   Portanto:
+//     invokeDeadline = scheduledAt - offset - halfRtt
+//
+//   Exemplo: offset = -1129ms (servidor atrasado), halfRtt = 26ms
+//     invokeDeadline = scheduledAt - (-1129) - 26
+//                    = scheduledAt + 1129 - 26
+//                    = scheduledAt + 1103ms (local)
+//     → invoca 1103ms DEPOIS no relógio local
+//     → pacote chega ao servidor 26ms depois
+//     → servidor recebe quando seu relógio marca scheduledAt ✓
+//
+//   Exemplo: offset = +500ms (servidor adiantado), halfRtt = 20ms
+//     invokeDeadline = scheduledAt - 500 - 20 = scheduledAt - 520ms (local)
+//     → invoca 520ms ANTES no relógio local
+//     → pacote chega ao servidor 20ms depois
+//     → servidor recebe quando seu relógio marca scheduledAt ✓
+//
+// REGRA MNEMÔNICA: offset negativo = servidor atrasado = você espera mais (deadline depois)
+//                  offset positivo = servidor adiantado = você invoca antes (deadline antes)
+//
+// FIXES v13/v14/v16 MANTIDOS:
 //   - Throttle progressivo suave (base 1ms, começa em 200 too_early)
 //   - guardMs sem CONNECTION_BUDGET
 //   - SNIPER_TRANSIENT_INTERVAL_MS = 1ms
 //   - Rate limit shield 25 req/s
+//   - Floor universal para todos os grupos
 
 
 import { createClient } from "@supabase/supabase-js";
@@ -82,10 +101,10 @@ const OPEN_GROUP_LISTEN_TIMEOUT_MS  = 2 * 60 * 60_000;
 const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
 
 // Quanto antes do horário o sniper é acordado — apenas para ter conexão quente.
-// Não cria sleep: o invoke começa imediatamente ao entrar (exceto opens_early).
+// Não cria sleep: o invoke começa imediatamente ao entrar (exceto floor do invokeDeadline).
 const SNIPER_BEFORE_MS              = 100;
 
-// Spin de precisão no busy-wait do opens_early
+// Spin de precisão no busy-wait
 const SNIPER_SPIN_MAX_MS            = 2;
 
 const GROUP_PROFILE_SAMPLE_SIZE     = 20;
@@ -223,7 +242,7 @@ const sniperTokenBuckets    = new Map<string, TokenBucket>();
 
 let telegramClockOffsetMs = 0;
 let clockOffsetQuality: "high" | "low" | "unknown" = "unknown";
-let estimatedOneWayRttMs  = 0; // half-RTT médio das clock probes — usado no floor de opens_early
+let estimatedOneWayRttMs  = 0; // half-RTT médio das clock probes
 
 /* ─────────────────────────────────────────────────────────────────────────────
    QUERY REUTILIZADA
@@ -534,12 +553,10 @@ async function persistGroupDispatchSample(
     const estimatedOpenDelayMs   = medianTooEarlyCount * SNIPER_TOO_EARLY_BASE_INTERVAL_MS;
 
     // opens_early: grupo historicamente abre ANTES do horário agendado
-    // → precisa do floor em scheduledAt para não mandar antes da hora
     const opensEarlyByVsHorario  = p50 < -20;
     const opensEarlyByRatio      = openAtStartRatio > 0.6;
     const opens_early            = opensEarlyByVsHorario || opensEarlyByRatio;
 
-    // min_safe_guard_ms: apenas para referência/logging, não usado no gate v14
     const min_safe_guard_ms = opens_early
       ? Math.max(-30_000, p10 - 50)
       : Math.max(0, estimatedOpenDelayMs - 20);
@@ -872,16 +889,18 @@ async function sniperAttemptOnce(
 /* ─────────────────────────────────────────────────────────────────────────────
    SNIPER LOOP — GRUPOS FECHADOS
    ═══════════════════════════════════════════════════════════════════════════
-   FILOSOFIA v17:
-     Loop de 1ms SEMPRE agressivo desde o momento que o sniper entra.
-     ÚNICA exceção: floor universal até invokeDeadline antes do primeiro invoke.
+   FILOSOFIA v18:
+     Floor universal: todos os grupos esperam até invokeDeadline antes do 1º invoke.
 
-     invokeDeadline = scheduledAt + clockOffset - halfRtt
-       offset < 0 → servidor atrasado → invoca antes no relógio local
-       offset > 0 → servidor adiantado → invoca depois no relógio local
+     invokeDeadline = scheduledAt - clockOffset - halfRtt
 
-     Grupos fechados que ainda não abriram: after invokeDeadline, se vier
-     CHAT_WRITE_FORBIDDEN o loop too_early cuida dos retries em 1ms normalmente.
+     Onde:
+       clockOffset = serverTime - localTime
+       scheduledAt - clockOffset = momento local em que o servidor marca scheduledAt
+       - halfRtt = enviamos antes para o pacote chegar exatamente no horário
+
+     Após o invokeDeadline: loop agressivo de 1ms.
+     Se vier too_early: tooEarlyCount++ e retry em 1ms (throttle suave após 200).
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperFireClosed(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -962,7 +981,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       return;
     }
 
-    // ── Verificar perfil apenas para saber se opens_early ────────────────
+    // ── Verificar perfil para log ─────────────────────────────────────────
     const profile           = groupProfileCache.get(group.id);
     const hasSufficientData = (profile?.sample_count ?? 0) >= 3;
     const isOpensEarly      = hasSufficientData && profile!.opens_early;
@@ -973,30 +992,27 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         ? `p10=${profile!.offset_p10_ms}ms p50=${profile!.offset_p50_ms}ms p90=${profile!.offset_p90_ms}ms ` +
           `openAtStart=${(profile!.open_at_start_ratio * 100).toFixed(0)}% ` +
           `openDelay≈${profile!.estimated_open_delay_ms}ms n=${profile!.sample_count}`
-        : `sem perfil suficiente (${profile?.sample_count ?? 0}/3) → loop agressivo imediato`)
+        : `sem perfil suficiente (${profile?.sample_count ?? 0}/3) → loop agressivo após invokeDeadline`)
     );
 
-    // ── Floor universal (v17): todos os grupos esperam até invokeDeadline ────────────────
+    // ── Floor universal (v18): invokeDeadline = scheduledAt - offset - halfRtt ──
     //
     // offset = serverTime - localTime
-    // → scheduledAt no referencial do servidor = scheduledAt + offset
-    // → invokeDeadline = (scheduledAt + offset) - halfRtt
+    // Queremos invocar quando localTime = scheduledAt - offset - halfRtt
+    // pois nesse momento o servidor receberá o pacote quando seu relógio = scheduledAt.
     //
-    // Exemplo: offset=-865ms, halfRtt=22ms
-    //   invokeDeadline = scheduledAt - 865 - 22 = scheduledAt - 887ms (local)
-    //   → invoca 887ms antes no relógio local, pacote chega ao servidor no horário certo
-    //
-    // Sem medição de qualidade (unknown/low): clockAdj=0, só compensa halfRtt
+    // Sem medição de qualidade (unknown/low): clockAdj=0, só compensa halfRtt.
     {
-      const clockAdj          = clockOffsetQuality === "high" ? telegramClockOffsetMs : 0;
-      const scheduledAtServer = scheduledAt + clockAdj;  // fix v17: + em vez de -
-      const invokeDeadline    = scheduledAtServer - estimatedOneWayRttMs;
-      const msUntilDeadline   = invokeDeadline - Date.now();
+      const clockAdj       = clockOffsetQuality === "high" ? telegramClockOffsetMs : 0;
+      // FIX v18: invokeDeadline = scheduledAt - offset - halfRtt
+      const invokeDeadline = scheduledAt - clockAdj - estimatedOneWayRttMs;
+      const msUntilDeadline = invokeDeadline - Date.now();
 
       console.log(
-        `[sniper][timing] invokeDeadline → clockAdj=${clockAdj > 0 ? "+" : ""}${clockAdj}ms ` +
-        `halfRtt=${estimatedOneWayRttMs}ms deadline=${new Date(invokeDeadline).toISOString()} ` +
-        `(${msUntilDeadline > 0 ? "+" : ""}${Math.round(msUntilDeadline)}ms) ` +
+        `[sniper][timing] invokeDeadline(v18) → clockAdj=${clockAdj > 0 ? "+" : ""}${clockAdj}ms ` +
+        `halfRtt=${estimatedOneWayRttMs}ms ` +
+        `deadline=${new Date(invokeDeadline).toISOString()} ` +
+        `(${msUntilDeadline > 0 ? "+" : ""}${Math.round(msUntilDeadline)}ms até deadline) ` +
         `opens_early=${isOpensEarly}`
       );
 
@@ -1006,7 +1022,12 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       }
       // busy-spin de precisão até o deadline
       while (Date.now() < invokeDeadline) { /* spin */ }
-      console.log(`[sniper][timing] invokeDeadline atingido (${Date.now() - scheduledAt > 0 ? "+" : ""}${Date.now() - scheduledAt}ms vs scheduledAt local)`);
+
+      const vsScheduled = Date.now() - scheduledAt;
+      console.log(
+        `[sniper][timing] invokeDeadline atingido | ` +
+        `${vsScheduled >= 0 ? "+" : ""}${vsScheduled}ms vs scheduledAt local`
+      );
     }
 
     sniperTokenBuckets.set(firstAccount.id, {
@@ -2019,7 +2040,7 @@ const httpServer = http.createServer(async (req, res) => {
       clock_quality:          clockOffsetQuality,
       estimated_one_way_rtt:  estimatedOneWayRttMs,
       local_time:             new Date().toISOString(),
-      adjusted_time:          new Date(Date.now() + telegramClockOffsetMs).toISOString(),
+      adjusted_time:          new Date(Date.now() - telegramClockOffsetMs).toISOString(),
     });
   }
 
@@ -2257,7 +2278,7 @@ process.on("SIGINT",  shutdown);
    INICIALIZAÇÃO
    ───────────────────────────────────────────────────────────────────────────── */
 async function init(): Promise<void> {
-  console.log("[worker] Iniciando v17 — Fix sinal clockAdj: scheduledAt + offset (não minus)...");
+  console.log("[worker] Iniciando v18 — Fix invokeDeadline = scheduledAt - offset - halfRtt...");
   await prewarmAccounts();
   await reloadSchedules();
 
@@ -2279,7 +2300,7 @@ async function init(): Promise<void> {
     }
   }, CLOCK_OFFSET_REFRESH_MS);
 
-  console.log("[worker] Pronto v17. invokeDeadline = scheduledAt + clockOffset - halfRtt.");
+  console.log("[worker] Pronto v18. invokeDeadline = scheduledAt - clockOffset - halfRtt.");
 }
 
 init().catch(err => {
