@@ -1,7 +1,7 @@
-// worker-v12.ts — dispatch worker Telegram, timing adaptativo por grupo
+// worker-v13.ts — dispatch worker Telegram, timing adaptativo por grupo
 //
 // ═══════════════════════════════════════════════════════════════════════════
-// HISTÓRICO DE FIXES (v1–v11 preservados para referência)
+// HISTÓRICO DE FIXES (v1–v12 preservados para referência)
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Fix v1:  firingNow Set previne duplo disparo
@@ -16,86 +16,48 @@
 // Fix v10: Adaptive Gate — timing dinâmico p10/p50/p90, SNIPER_SPIN_MAX_MS=2ms
 // Fix v11: Smart Loop — sniperAttemptOnce classificado (too_early/fatal/flood/transient),
 //          tooEarlyCount, measureTelegramClockOffset, persistGroupDispatchSample estendido
+// Fix v12: Multi-probe Clock + Dual-mode Sniper + Rate Limit Shield
 //
 // ═══════════════════════════════════════════════════════════════════════════
-// Fix v12 — Multi-probe Clock + Dual-mode Sniper + Rate Limit Shield
+// Fix v13 — Regressão de performance: throttle e CONNECTION_BUDGET corrigidos
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// PROBLEMAS v11:
+// PROBLEMAS v12 IDENTIFICADOS EM PRODUÇÃO:
 //
-//   PROBLEMA A — measureTelegramClockOffset usa GetConfig com resolução de 1s.
-//     O servidor Telegram retorna `date` como Unix timestamp em SEGUNDOS inteiros.
-//     Isso significa que o offset calculado pode ter erro de até ±500ms — inútil
-//     para calibrar gates de precisão de milissegundos.
-//     Ex: servidor está em t=1000.7s → retorna 1000 → você calcula offset como
-//     se o servidor estivesse 700ms no passado, quando na verdade está 300ms à frente.
+//   REGRESSÃO A — TOO_EARLY_THROTTLE_STEPS subiu o intervalo base de ~1ms para
+//     3ms e escala até 20ms após 500 tentativas. Para grupos que abrem 2-5s
+//     depois do horário (maioria), isso significa ~600-1500 tentativas antes da
+//     abertura, chegando facilmente em 10-20ms por iteração. O sniper "perdeu"
+//     a janela de abertura porque o loop estava rodando devagar quando o grupo
+//     abriu. Sintoma: enviou vários segundos depois do esperado.
 //
-//   PROBLEMA B — Loop sniper martela o Telegram com SNIPER_ATTEMPT_INTERVAL_MS=1ms
-//     enquanto o grupo ainda está fechado (too_early). Com múltiplos grupos fechados
-//     simultâneos, isso pode gerar dezenas de req/s por conta, especialmente nas
-//     primeiras semanas antes do perfil estabilizar. Risco real de FloodWait no
-//     momento mais crítico (janela de abertura).
+//   REGRESSÃO B — CONNECTION_BUDGET_MS=250 na Solução C cortava o guardMs
+//     negativo em -250ms. Para grupos opens_early com p10=-500ms, o gate ficava
+//     em scheduledAt-250ms em vez de scheduledAt-500ms — o sniper chegava 250ms
+//     tarde para esses grupos.
 //
-//   PROBLEMA C — Para grupos opens_early, o sniper hoje INICIA antes do horário
-//     (extraLeadMs via scheduleTimer), mas dentro do sniperFireClosed ele ainda
-//     usa guardMs negativo como invokeNotBefore. Se o grupo abrir 400ms antes do
-//     horário e o perfil diz p10=-450ms, o invokeNotBefore = scheduledAt - 450ms.
-//     Mas o sniper só entra em sniperFireClosed com ~100ms + extraLeadMs de lead.
-//     Se extraLeadMs = abs(p10) + 100 = 550ms, ele entra com 650ms de antecedência,
-//     passa 200ms conectando, sobram 450ms para o gate → OK.
-//     MAS: se a conexão demorar 300ms (cold start), sobram apenas 350ms, e o gate
-//     já passou — o spin não acontece e o disparo é imediato. Isso é OK para
-//     opens_early, mas pode colidir com o problema B acima (loop sem gate
-//     martela enquanto grupo ainda fechado).
+//   REGRESSÃO C — O branch "transient" no loop usava SNIPER_TOO_EARLY_BASE_INTERVAL_MS
+//     (3ms) como fallback, quando antes usava ~1ms. Erros transientes (timeout de
+//     peer, etc.) passaram a custar 3x mais por iteração.
 //
-//   PROBLEMA D — Não há rate-limit shield por conta durante o loop sniper.
-//     Em disparos com 3+ contas na FASE 2, cada conta pode acumular tentativas
-//     rápidas independentes. Se o grupo demorar 500ms para abrir e houver 4 contas,
-//     cada uma fazendo ~500 tentativas no loop, isso é 2000 req em 500ms para o
-//     mesmo grupo. Mesmo com peers diferentes, o servidor Telegram pode ver isso
-//     como abuso coordenado.
+// CORREÇÕES v13:
 //
-// SOLUÇÕES v12 — 4 correções cirúrgicas sobre a base v11:
+//   FIX A — TOO_EARLY_THROTTLE_STEPS rebalanceado:
+//     Intervalo base mantido em 1ms (era 3ms).
+//     Throttle progressivo começa mais tarde e cresce menos agressivamente:
+//     [[200, 2], [1000, 5], [3000, 10], [Inf, 15]]
+//     Racional: grupos que abrem 5s depois do horário → ~5000ms / 1ms = 5000
+//     tentativas. Com throttle, ~2000 tentativas a 1ms + resto a 2ms. O rate
+//     limit shield (25 req/s) garante que não há flood mesmo com 1ms de intervalo.
 //
-// SOLUÇÃO A — measureTelegramClockOffset com multi-probe sub-segundo:
-//   Ao invés de GetConfig (1s resolução), usa messages.SendMessage com
-//   InputPeerSelf + randomId único → extrai o campo `date` da resposta Messages
-//   que tem resolução de 1s MAS o timestamp do round-trip permite estimativa
-//   sub-segundo via: offsetMs = (serverDate*1000 + 500) - (t0 + rtt/2).
-//   Na prática: faz 5 probes, descarta outliers (>2σ), usa mediana.
-//   Precisão esperada: ±50-100ms vs ±500ms antes.
-//   FALLBACK: se self-send falhar (conta sem acesso próprio), cai no GetConfig
-//   como antes (v11 behavior) com warning de precisão degradada.
+//   FIX B — CONNECTION_BUDGET_MS removido do clamp do guardMs negativo.
+//     Para opens_early, guardMs = max(-30000, p10 - 50) sem corte artificial.
+//     O extraLeadMs no scheduleTimer já garante que o sniper entra cedo o
+//     suficiente para a conexão estar pronta.
 //
-// SOLUÇÃO B — Throttle adaptativo no too_early loop:
-//   SNIPER_TOO_EARLY_BASE_INTERVAL_MS = 3ms (era 1ms efetivo).
-//   Após 50 tentativas too_early consecutivas → intervalo cresce para 5ms.
-//   Após 200 tentativas → 10ms.
-//   Após 500 tentativas → 20ms.
-//   Isso reduz req/s enquanto o grupo ainda está fechado SEM impactar a
-//   latência após abertura: assim que a conta recebe "sent", o loop para.
-//   O throttle reseta a cada ciclo de disparo.
-//   Constante TOO_EARLY_THROTTLE_STEPS: [[50,3],[200,5],[500,10],[Inf,20]]
-//
-// SOLUÇÃO C — opens_early gate mais inteligente:
-//   Para grupos opens_early, o invokeNotBefore agora usa:
-//     invokeNotBefore = scheduledAt + min(guardMs, -CONNECTION_BUDGET_MS)
-//   onde CONNECTION_BUDGET_MS = 250ms (tempo estimado para conexão estar pronta).
-//   Isso garante que nunca tentamos spin antes de ter a conexão estabelecida.
-//   Ao mesmo tempo, para grupos onde p10 < -500ms, o sniper deve entrar mais
-//   cedo (já tratado pelo extraLeadMs em scheduleTimer), então o gate negativo
-//   na prática só é atingido se a conexão foi rápida.
-//
-// SOLUÇÃO D — Rate limit shield por conta no loop sniper:
-//   SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT = 30 (limite conservador Telegram MTProto).
-//   Um token bucket por accountId dentro do loop: se a conta esgotou seu bucket,
-//   a próxima tentativa aguarda até o próximo slot (ceil(1000ms/30) ≈ 34ms).
-//   Isso é transparente para o resultado: assim que o slot abre e o grupo está
-//   aberto, o envio acontece. Mas elimina o risco de flood durante o warm-up.
-//
-// SQL NECESSÁRIO (adicional ao v11 — zero mudanças de schema):
-//   Nenhuma nova tabela ou coluna necessária.
-//   As migrações do v10 e v11 são suficientes.
+//   FIX C — Branch "transient" volta a usar 1ms de intervalo base (nova constante
+//     SNIPER_TRANSIENT_INTERVAL_MS separada de SNIPER_TOO_EARLY_BASE_INTERVAL_MS).
+
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -130,42 +92,36 @@ const MONITOR_HISTORY_LIMIT         = 150;
 const OPEN_GROUP_LISTEN_TIMEOUT_MS  = 2 * 60 * 60_000;
 const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
 
-// Sniper lead: começa 100ms antes do horário nominal.
-// Para opens_early, extraLeadMs é adicionado em scheduleTimer().
 const SNIPER_BEFORE_MS              = 100;
-
-// Spin máximo no busy-wait de precisão.
 const SNIPER_SPIN_MAX_MS            = 2;
-
-// Janela rolling para cálculo de percentis de timing.
 const GROUP_PROFILE_SAMPLE_SIZE     = 20;
-
-// v12 SOLUÇÃO A: intervalo de re-medição do clock offset (ms).
 const CLOCK_OFFSET_REFRESH_MS       = 5 * 60_000;
-
-// v12 SOLUÇÃO A: número de probes para estimativa de clock offset.
 const CLOCK_PROBE_COUNT             = 5;
 
-// v12 SOLUÇÃO C: budget de tempo para conexão estar pronta antes do gate.
-// O invokeNotBefore negativo nunca será mais cedo que scheduledAt - CONNECTION_BUDGET_MS.
-const CONNECTION_BUDGET_MS          = 250;
+// v13 FIX B: CONNECTION_BUDGET_MS REMOVIDO — não cortamos mais o guardMs negativo.
+// O extraLeadMs no scheduleTimer já garante entrada antecipada suficiente.
 
 const SNIPER_SEND_TIMEOUT_MS        = 800;
 
-// v12 SOLUÇÃO B: intervalo base no loop too_early (aumentado de 1ms para 3ms).
-const SNIPER_TOO_EARLY_BASE_INTERVAL_MS = 3;
+// v13 FIX A: intervalo base no loop too_early voltou para 1ms.
+// O rate limit shield (25 req/s) já protege contra flood.
+const SNIPER_TOO_EARLY_BASE_INTERVAL_MS = 1;
 
-// v12 SOLUÇÃO B: throttle progressivo após N tentativas too_early consecutivas.
-// Formato: [limiteDeAttempts, intervalMs]. Aplicado em ordem.
+// v13 FIX C: intervalo para erros transientes — separado do too_early.
+// 1ms também: erros transientes devem ser retentados rapidamente.
+const SNIPER_TRANSIENT_INTERVAL_MS  = 1;
+
+// v13 FIX A: throttle progressivo mais suave. Começa em 200 tentativas (não 50).
+// Com 1ms base e 25 req/s de shield, 200 tentativas = ~8s de grupo fechado antes
+// de o throttle entrar — adequado para grupos que abrem 1-10s depois do horário.
 const TOO_EARLY_THROTTLE_STEPS: Array<[number, number]> = [
-  [50,   3],
-  [200,  5],
-  [500,  10],
-  [Infinity, 20],
+  [200,      2],   // após 200 too_early: 2ms (antes era 3ms após 50)
+  [1000,     5],   // após 1000: 5ms  (~16s de espera acumulada)
+  [3000,    10],   // após 3000: 10ms (~1min acumulada — grupo muito fechado)
+  [Infinity, 15],  // além disso: 15ms (era 20ms — menos agressivo)
 ];
 
-// v12 SOLUÇÃO D: limite de requisições por segundo por conta no loop sniper.
-// Telegram MTProto permite ~30 req/s por DC por sessão (conservador: usamos 25).
+// Rate limit shield: 25 req/s por conta (conservador para MTProto).
 const SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT = 25;
 
 const SNIPER_PAUSE_EVERY_N          = 10;
@@ -230,12 +186,6 @@ interface DispatchResult {
   error?: string;
 }
 
-// Resultado classificado de uma tentativa de envio sniper.
-// "too_early"  = CHAT_WRITE_FORBIDDEN / CHAT_SEND_PLAIN_FORBIDDEN → grupo fechado, retry imediato
-// "sent"       = sucesso confirmado
-// "fatal"      = erro de autenticação/sessão, sem retry
-// "flood"      = FloodWait, aguarda waitSecs antes de retry
-// "transient"  = erro genérico (timeout, peer inválido, etc.) → retry normal
 type SniperOutcome = "sent" | "too_early" | "fatal" | "flood" | "transient";
 
 interface SniperAttemptResult {
@@ -245,7 +195,6 @@ interface SniperAttemptResult {
   errorCode?: string;
 }
 
-// Perfil de comportamento de timing de um grupo fechado.
 interface GroupBehaviorProfile {
   group_id:                string;
   offset_p10_ms:           number;
@@ -260,7 +209,6 @@ interface GroupBehaviorProfile {
   clock_offset_ms:         number;
 }
 
-// v12 SOLUÇÃO D: token bucket simples por accountId para rate limiting no sniper.
 interface TokenBucket {
   tokens:     number;
   lastRefill: number;
@@ -285,18 +233,9 @@ const sniperFiringNow       = new Set<string>();
 const connectingPromises    = new Map<string, Promise<TelegramClient>>();
 const groupProfileCache     = new Map<string, GroupBehaviorProfile>();
 const scheduleGroupMap      = new Map<string, string>();
-
-// v12: token buckets para rate limiting por conta no sniper.
-// Ciclo de vida: criado no início de sniperFireClosed, destruído no finally.
 const sniperTokenBuckets    = new Map<string, TokenBucket>();
 
-// v12: clock offset estimado entre o processo local e o servidor Telegram.
-// Positivo = local está atrasado (Telegram à frente). Negativo = local adiantado.
 let telegramClockOffsetMs = 0;
-
-// v12: flag indicando qualidade da medição de clock offset.
-// "high" = multi-probe self-send (~50-100ms de precisão)
-// "low"  = fallback GetConfig (~500ms de precisão, melhor que nada)
 let clockOffsetQuality: "high" | "low" | "unknown" = "unknown";
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -376,12 +315,12 @@ function makeRandomId(): bigInt.BigInteger {
   return bigInt(hi).shiftLeft(32).add(bigInt(lo));
 }
 
-// Retorna o intervalo de espera apropriado com base em tooEarlyCount.
+// v13 FIX A: throttle mais suave — começa em 200 tentativas, não 50.
 function getTooEarlyIntervalMs(tooEarlyCount: number): number {
   for (const [limit, intervalMs] of TOO_EARLY_THROTTLE_STEPS) {
     if (tooEarlyCount < limit) return intervalMs;
   }
-  return 20;
+  return 15;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -397,11 +336,9 @@ function evictPeersForAccount(accountId: string): void {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   v12 SOLUÇÃO D: TOKEN BUCKET RATE LIMITER
+   TOKEN BUCKET RATE LIMITER (v12, mantido em v13)
    ───────────────────────────────────────────────────────────────────────────── */
 
-// Retorna o número de ms a aguardar antes de fazer a próxima requisição.
-// Se 0, pode disparar agora. Chamado antes de cada sniperAttemptOnce.
 function acquireTokenBucket(accountId: string): number {
   const now   = Date.now();
   let bucket  = sniperTokenBuckets.get(accountId);
@@ -411,8 +348,7 @@ function acquireTokenBucket(accountId: string): number {
     sniperTokenBuckets.set(accountId, bucket);
   }
 
-  // Reabastece proporcionalmente ao tempo passado desde o último refill
-  const elapsed  = now - bucket.lastRefill;
+  const elapsed   = now - bucket.lastRefill;
   const newTokens = (elapsed / 1000) * SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT;
 
   if (newTokens >= 1) {
@@ -422,23 +358,17 @@ function acquireTokenBucket(accountId: string): number {
 
   if (bucket.tokens >= 1) {
     bucket.tokens--;
-    return 0; // pode disparar agora
+    return 0;
   }
 
-  // Sem tokens: calcula quanto falta para o próximo
   const msPerToken = 1000 / SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT;
   return Math.ceil(msPerToken - elapsed % msPerToken);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   v12 SOLUÇÃO A: MEDIÇÃO DE CLOCK OFFSET MULTI-PROBE
+   MEDIÇÃO DE CLOCK OFFSET MULTI-PROBE (v12, mantido em v13)
    ───────────────────────────────────────────────────────────────────────────── */
 
-// v12: medição de clock offset via self-send de mensagem teste.
-// A mensagem enviada para si mesmo retorna com campo `date` (Unix segundos)
-// que representa o timestamp do servidor Telegram.
-// Usa N probes, descarta outliers por desvio padrão, usa mediana.
-// Precisão esperada: ±50-100ms (vs ±500ms do GetConfig).
 async function measureClockOffsetViaSelfSend(client: TelegramClient): Promise<number> {
   const probes: number[] = [];
   const probe_rtt: number[] = [];
@@ -458,54 +388,41 @@ async function measureClockOffsetViaSelfSend(client: TelegramClient): Promise<nu
       const t1  = Date.now();
       const rtt = t1 - t0;
 
-      // O resultado pode ser Updates ou UpdateShortSentMessage
-      // Ambos podem ter um campo `date` (Unix segundos)
       let serverDateSec: number | null = null;
-
       if (result?.date) {
         serverDateSec = result.date;
       } else if (result?.updates) {
-        // Updates contém array de updates; procuramos o primeiro com date
         const upd = result.updates?.find?.((u: any) => u?.date);
         if (upd?.date) serverDateSec = upd.date;
       }
 
       if (serverDateSec != null) {
-        // O servidor retornou t em segundos inteiros.
-        // Melhor estimativa do tempo de processamento = t0 + rtt/2.
-        // O servidor arredondou para segundo, então o erro está em [0, 1000ms].
-        // Usamos serverDate * 1000 + 500 como estimativa do meio do segundo.
         const serverTimeMs   = serverDateSec * 1000 + 500;
         const localMidpoint  = t0 + rtt / 2;
         const offset         = serverTimeMs - localMidpoint;
-
         probes.push(offset);
         probe_rtt.push(rtt);
       }
 
-      // Pequeno delay entre probes para não parecer spam
       if (i < CLOCK_PROBE_COUNT - 1) {
         await new Promise(r => setTimeout(r, 200));
       }
     } catch {
-      // Probe falhou — ignora e continua
+      // probe falhou — ignora
     }
   }
 
   if (probes.length === 0) return telegramClockOffsetMs;
 
-  // Filtra outliers por desvio padrão (remove amostras com rtt > média + 2σ)
-  const avgRtt  = probe_rtt.reduce((a, b) => a + b, 0) / probe_rtt.length;
-  const stdRtt  = Math.sqrt(probe_rtt.map(r => (r - avgRtt) ** 2).reduce((a, b) => a + b, 0) / probe_rtt.length);
+  const avgRtt   = probe_rtt.reduce((a, b) => a + b, 0) / probe_rtt.length;
+  const stdRtt   = Math.sqrt(probe_rtt.map(r => (r - avgRtt) ** 2).reduce((a, b) => a + b, 0) / probe_rtt.length);
   const filtered = probes.filter((_, i) => probe_rtt[i] <= avgRtt + 2 * stdRtt);
 
   if (filtered.length === 0) return telegramClockOffsetMs;
 
-  // Mediana
   const sorted = [...filtered].sort((a, b) => a - b);
   const median = sorted[Math.floor(sorted.length / 2)];
 
-  // Rejeita estimativas absurdas (> 10s provavelmente é erro)
   if (Math.abs(median) > 10_000) {
     console.warn(`[clock] Offset mediano descartado (${Math.round(median)}ms > 10s) — mantendo ${telegramClockOffsetMs}ms`);
     return telegramClockOffsetMs;
@@ -520,9 +437,7 @@ async function measureClockOffsetViaSelfSend(client: TelegramClient): Promise<nu
   return Math.round(median);
 }
 
-// v12: medição com fallback. Tenta self-send (alta precisão), cai em GetConfig.
 async function measureTelegramClockOffset(client: TelegramClient): Promise<number> {
-  // Tenta self-send primeiro (v12 — alta precisão)
   try {
     const offset = await measureClockOffsetViaSelfSend(client);
     clockOffsetQuality = "high";
@@ -531,7 +446,6 @@ async function measureTelegramClockOffset(client: TelegramClient): Promise<numbe
     console.warn(`[clock] Self-send falhou (${err.message}) — caindo em GetConfig (baixa precisão)`);
   }
 
-  // Fallback: GetConfig (v11 behavior — precisão ±500ms)
   try {
     const t0     = Date.now();
     const config = await (client as any).invoke(new Api.help.GetConfig()) as any;
@@ -540,7 +454,7 @@ async function measureTelegramClockOffset(client: TelegramClient): Promise<numbe
     if (typeof config?.date !== "number") return telegramClockOffsetMs;
 
     const rttMs           = t1 - t0;
-    const serverTimeMs    = config.date * 1000 + 500; // +500ms: estimativa do meio do segundo
+    const serverTimeMs    = config.date * 1000 + 500;
     const localAtMidpoint = t0 + rttMs / 2;
     const offsetMs        = serverTimeMs - localAtMidpoint;
 
@@ -556,7 +470,7 @@ async function measureTelegramClockOffset(client: TelegramClient): Promise<numbe
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   PERFIS DE TIMING ADAPTATIVO (v10/v11/v12)
+   PERFIS DE TIMING ADAPTATIVO
    ───────────────────────────────────────────────────────────────────────────── */
 
 async function loadGroupProfiles(): Promise<void> {
@@ -624,6 +538,7 @@ async function persistGroupDispatchSample(
     const openAtStartRatio       = tooEarlyCounts.filter(c => c === 0).length / n;
     const sortedTooEarly         = [...tooEarlyCounts].sort((a, b) => a - b);
     const medianTooEarlyCount    = sortedTooEarly[Math.floor(n / 2)] ?? 0;
+    // v13: usa intervalo base 1ms para estimar o delay de abertura
     const estimatedOpenDelayMs   = medianTooEarlyCount * SNIPER_TOO_EARLY_BASE_INTERVAL_MS;
 
     const opensEarlyByVsHorario  = p50 < -20;
@@ -843,7 +758,7 @@ async function resolvePeer(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   ENVIO COM RETRY INTERNO (grupos abertos / fallback)
+   ENVIO COM RETRY INTERNO
    ───────────────────────────────────────────────────────────────────────────── */
 async function sendMessage(
   client: TelegramClient,
@@ -907,7 +822,7 @@ async function sendMessage(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   SNIPER — TENTATIVA CLASSIFICADA (v11 + v12)
+   SNIPER — TENTATIVA CLASSIFICADA
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperAttemptOnce(
   client: TelegramClient,
@@ -960,7 +875,7 @@ async function sniperAttemptOnce(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   SNIPER LOOP — GRUPOS FECHADOS (v12: throttle adaptativo + rate limit shield)
+   SNIPER LOOP — GRUPOS FECHADOS (v13: throttle corrigido + guardMs sem corte)
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperFireClosed(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -989,7 +904,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       schedule = data as unknown as Schedule;
     }
 
-    // v12 SOLUÇÃO A: scheduledAt ajustado pelo clock offset de alta precisão.
     const scheduledAtRaw  = new Date(schedule.next_run_at).getTime();
     const scheduledAt     = scheduledAtRaw - telegramClockOffsetMs;
 
@@ -1026,7 +940,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     const chatId    = group.telegram_chat_id;
     const budgetEnd = Date.now() + SNIPER_BUDGET_MS;
 
-    // Fase 0: conecta primeira conta
     const firstMember  = members[0];
     const firstAccount = firstMember.accounts!;
     const firstText    = firstMember.message_text ?? "";
@@ -1044,16 +957,16 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       return;
     }
 
-    // Adaptive Gate (v10/v11/v12)
+    // Adaptive Gate
     const profile           = groupProfileCache.get(group.id);
     const hasSufficientData = (profile?.sample_count ?? 0) >= 3;
 
     let guardMs: number;
     if (hasSufficientData) {
       if (profile!.opens_early) {
+        // v13 FIX B: sem CONNECTION_BUDGET_MS — permite guardMs até -30s.
+        // O extraLeadMs em scheduleTimer já garante que chegamos a tempo.
         guardMs = Math.max(-30_000, profile!.offset_p10_ms - 50);
-        // v12 SOLUÇÃO C: nunca tenta antes de ter o connection budget
-        guardMs = Math.max(guardMs, -CONNECTION_BUDGET_MS);
       } else {
         const baseDelay = Math.max(profile!.offset_p50_ms, profile!.estimated_open_delay_ms);
         guardMs = Math.max(0, baseDelay - 20);
@@ -1073,7 +986,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
     const invokeNotBefore = scheduledAt + guardMs;
 
-    // Sleep + Spin (máx 2ms de busy-spin)
+    // Sleep + Spin
     {
       const msUntilFire = invokeNotBefore - Date.now();
       if (msUntilFire > SNIPER_SPIN_MAX_MS) {
@@ -1088,7 +1001,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       while (Date.now() < invokeNotBefore) { /* busy-spin de precisão */ }
     }
 
-    // v12: inicializa token bucket para a primeira conta
     sniperTokenBuckets.set(firstAccount.id, {
       tokens:     SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT,
       lastRefill: Date.now(),
@@ -1104,7 +1016,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     while (Date.now() < budgetEnd) {
       attempt++;
 
-      // v12 SOLUÇÃO D: rate limit shield
+      // Rate limit shield
       const waitForToken = acquireTokenBucket(firstAccount.id);
       if (waitForToken > 0) {
         await new Promise(r => setTimeout(r, waitForToken));
@@ -1142,9 +1054,9 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
       if (result.outcome === "too_early") {
         tooEarlyCount++;
-        // v12 SOLUÇÃO B: throttle progressivo
+        // v13 FIX A: throttle mais suave — começa em 1ms e escala lentamente.
         const intervalMs = getTooEarlyIntervalMs(tooEarlyCount);
-        if (tooEarlyCount % 50 === 0) {
+        if (tooEarlyCount % 200 === 0) {
           console.log(`[sniper] ⏳ too_early×${tooEarlyCount} — intervalo atual: ${intervalMs}ms`);
         }
         await new Promise(r => setTimeout(r, intervalMs));
@@ -1173,11 +1085,11 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         }
       }
 
-      // transient
+      // v13 FIX C: transient usa SNIPER_TRANSIENT_INTERVAL_MS (1ms), não 3ms.
       if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
         await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
       } else {
-        await new Promise(r => setTimeout(r, SNIPER_TOO_EARLY_BASE_INTERVAL_MS));
+        await new Promise(r => setTimeout(r, SNIPER_TRANSIENT_INTERVAL_MS));
       }
     }
 
@@ -1219,7 +1131,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         const client         = await getClient(account);
         const memberRandomId = makeRandomId();
 
-        // v12 SOLUÇÃO D: rate limit shield para contas secundárias também
         sniperTokenBuckets.set(account.id, {
           tokens:     SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT,
           lastRefill: Date.now(),
@@ -1265,11 +1176,9 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         .catch(err => console.error("[sniper][monitor] Erro:", err.message));
     }
 
-    // Fase 4: atualiza schedule
     await updateScheduleAfterDispatch(schedule, results, firstSentAt, "closed");
 
   } finally {
-    // Limpa token buckets desta execução
     for (const m of (schedulePrefetchCache.get(scheduleId)?.groups?.group_members ?? [])) {
       if (m.accounts?.id) sniperTokenBuckets.delete(m.accounts.id);
     }
@@ -1677,7 +1586,6 @@ function scheduleTimer(
 
   const effectiveDelay = Math.max(0, delay);
 
-  // Pre-fetch 800ms antes
   if (effectiveDelay > PREFETCH_BEFORE_MS) {
     const prefetchDelay = effectiveDelay - PREFETCH_BEFORE_MS;
     const pt = setTimeout(async () => {
@@ -1703,7 +1611,6 @@ function scheduleTimer(
     prefetchTimers.set(scheduleId, pt);
   }
 
-  // Sniper com lead adaptativo para grupos closed
   if (groupType === "closed") {
     const resolvedGroupId   = groupId ?? scheduleGroupMap.get(scheduleId);
     const profile           = resolvedGroupId ? groupProfileCache.get(resolvedGroupId) : undefined;
@@ -1874,7 +1781,6 @@ async function prewarmAccounts(): Promise<void> {
       }
     }));
 
-    // Pre-resolve de peers
     try {
       const { data: groups } = await supabase
         .from("groups").select("telegram_chat_id, group_members(accounts(id))")
@@ -1900,10 +1806,8 @@ async function prewarmAccounts(): Promise<void> {
       console.warn(`[prewarm] Falha no pre-resolve: ${err.message}`);
     }
 
-    // Carrega perfis
     await loadGroupProfiles();
 
-    // v12: medição de clock offset de alta precisão no boot
     const anyClient = [...clients.values()].find(c => c.connected);
     if (anyClient) {
       telegramClockOffsetMs = await measureTelegramClockOffset(anyClient);
@@ -1930,7 +1834,6 @@ const httpServer = http.createServer(async (req, res) => {
 
   const url = new URL(req.url ?? "/", `http://localhost:${WORKER_PORT}`);
 
-  // GET /accounts/:id/chats
   const chatsMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chats$/);
   if (req.method === "GET" && chatsMatch) {
     const account = accountCache.get(chatsMatch[1]);
@@ -1948,7 +1851,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // GET /accounts/:id/chat-count
   const chatCountMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-count$/);
   if (req.method === "GET" && chatCountMatch) {
     const chatId  = url.searchParams.get("chat_id");
@@ -1989,7 +1891,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // GET /accounts/:id/chat-members
   const membersMatch = url.pathname.match(/^\/accounts\/([^/]+)\/chat-members$/);
   if (req.method === "GET" && membersMatch) {
     const chatId  = url.searchParams.get("chat_id");
@@ -2068,7 +1969,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // POST /accounts/:id/reload
   const reloadMatch = url.pathname.match(/^\/accounts\/([^/]+)\/reload$/);
   if (req.method === "POST" && reloadMatch) {
     const accountId = reloadMatch[1];
@@ -2092,7 +1992,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // GET /groups/:id/profile
   const profileMatch = url.pathname.match(/^\/groups\/([^/]+)\/profile$/);
   if (req.method === "GET" && profileMatch) {
     const groupId = profileMatch[1];
@@ -2103,7 +2002,6 @@ const httpServer = http.createServer(async (req, res) => {
     });
   }
 
-  // DELETE /groups/:id/profile
   if (req.method === "DELETE" && profileMatch) {
     const groupId = profileMatch[1];
     groupProfileCache.delete(groupId);
@@ -2112,7 +2010,6 @@ const httpServer = http.createServer(async (req, res) => {
     return jsonResponse(res, 200, { ok: true, message: "Perfil resetado — próximos 3 disparos reaprendem o timing" });
   }
 
-  // GET /clock
   if (req.method === "GET" && url.pathname === "/clock") {
     return jsonResponse(res, 200, {
       clock_offset_ms: telegramClockOffsetMs,
@@ -2122,7 +2019,6 @@ const httpServer = http.createServer(async (req, res) => {
     });
   }
 
-  // POST /clock/remeasure
   if (req.method === "POST" && url.pathname === "/clock/remeasure") {
     const anyClient = [...clients.values()].find(c => c.connected);
     if (!anyClient) return jsonResponse(res, 503, { error: "Sem client conectado" });
@@ -2131,7 +2027,6 @@ const httpServer = http.createServer(async (req, res) => {
     return jsonResponse(res, 200, { ok: true, clock_offset_ms: newOffset, clock_quality: clockOffsetQuality });
   }
 
-  // DELETE/POST /groups/:id/listen
   const listenMatch = url.pathname.match(/^\/groups\/([^/]+)\/listen$/);
   if (listenMatch) {
     const groupId = listenMatch[1];
@@ -2248,7 +2143,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // POST /groups/:id/dispatch
   const dispatchMatch = url.pathname.match(/^\/groups\/([^/]+)\/dispatch$/);
   if (req.method === "POST" && dispatchMatch) {
     const groupId = dispatchMatch[1];
@@ -2359,7 +2253,7 @@ process.on("SIGINT",  shutdown);
    INICIALIZAÇÃO
    ───────────────────────────────────────────────────────────────────────────── */
 async function init(): Promise<void> {
-  console.log("[worker] Iniciando v12 — Multi-probe Clock + Dual-mode Sniper + Rate Limit Shield...");
+  console.log("[worker] Iniciando v13 — Throttle corrigido + guardMs sem corte artificial...");
   await prewarmAccounts();
   await reloadSchedules();
 
@@ -2371,7 +2265,6 @@ async function init(): Promise<void> {
     }
   }, RELOAD_INTERVAL_MS);
 
-  // Re-medição periódica de clock offset (a cada 5min)
   setInterval(async () => {
     const anyClient = [...clients.values()].find(c => c.connected);
     if (!anyClient) return;
@@ -2382,7 +2275,7 @@ async function init(): Promise<void> {
     }
   }, CLOCK_OFFSET_REFRESH_MS);
 
-  console.log("[worker] Pronto. Multi-probe Clock + Adaptive Gate + Smart Loop + Rate Limit Shield ativos.");
+  console.log("[worker] Pronto. Throttle corrigido + Adaptive Gate sem CONNECTION_BUDGET + Rate Limit Shield ativos.");
 }
 
 init().catch(err => {
