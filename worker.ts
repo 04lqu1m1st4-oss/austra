@@ -1,7 +1,7 @@
-// worker-v19.ts — dispatch worker Telegram, timing adaptativo por grupo
+// worker-v20.ts — dispatch worker Telegram, timing adaptativo por grupo
 //
 // ═══════════════════════════════════════════════════════════════════════════
-// HISTÓRICO DE FIXES (v1–v18 preservados para referência)
+// HISTÓRICO DE FIXES (v1–v19 preservados para referência)
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Fix v1:  firingNow Set previne duplo disparo
@@ -14,55 +14,76 @@
 // Fix v8:  randomId estável por ciclo (deduplicação Telegram)
 // Fix v9:  SNIPER_BEFORE_MS=200ms warm-up + SNIPER_AFTER_GUARD_MS=15ms busy-wait
 // Fix v10: Adaptive Gate — timing dinâmico p10/p50/p90, SNIPER_SPIN_MAX_MS=2ms
-// Fix v11: Smart Loop — sniperAttemptOnce classificado (too_early/fatal/flood/transient),
-//          tooEarlyCount, measureTelegramClockOffset, persistGroupDispatchSample estendido
+// Fix v11: Smart Loop — sniperAttemptOnce classificado, tooEarlyCount,
+//          measureTelegramClockOffset, persistGroupDispatchSample estendido
 // Fix v12: Multi-probe Clock + Dual-mode Sniper + Rate Limit Shield
 // Fix v13: Throttle corrigido (base 1ms) + guardMs sem corte de CONNECTION_BUDGET
 // Fix v14: Loop sempre agressivo. Gate só bloqueia opens_early antes do horário
 // Fix v15: RTT-aware busy-wait: compensa half-RTT no floor de opens_early
-// Fix v16: Floor universal: todo grupo (com ou sem perfil) espera até invokeDeadline
-// Fix v17: Sinal do clockAdj invertido (bug): usava scheduledAt + offset (errado)
+// Fix v16: Floor universal: todo grupo espera até invokeDeadline
+// Fix v17: Sinal do clockAdj invertido (bug)
 // Fix v18: Corrige sinal do clockAdj: invokeDeadline = scheduledAt - offset - halfRtt
+// Fix v19: Remove clockAdj da fórmula: invokeDeadline = scheduledAt - halfRtt
 //
 // ═══════════════════════════════════════════════════════════════════════════
-// Fix v19 — Remove clockAdj da fórmula: invokeDeadline = scheduledAt - halfRtt
+// Fix v20 — invokeDeadline baseado em p10 histórico + eliminação do flag opens_early
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// DIAGNÓSTICO v18:
-//   clockOffset=-808ms, halfRtt=23ms
-//   invokeDeadline = scheduledAt - (-808) - 23 = scheduledAt + 785ms
-//   → sistema esperava 785ms DEPOIS do horário antes de invocar
-//   → mensagem chegava ~829ms atrasada
+// PROBLEMA RAIZ:
+//   O sistema disparava antes do horário porque o sniper acordava em
+//   (scheduledAt - SNIPER_BEFORE_MS) e iniciava o loop imediatamente,
+//   sem nenhum floor real. Com conexão quente e grupo aberto, o invoke
+//   chegava ao Telegram antes de scheduledAt.
 //
-// ROOT CAUSE:
-//   `scheduledAt` é um Unix timestamp absoluto em ms — mesmo referencial que
-//   Date.now(). Não há conversão de referencial a fazer. O offset
-//   (serverTime - localTime) descreve uma dessincronização de NTP no relógio
-//   do servidor Telegram, mas não afeta *quando* o pacote deve ser enviado:
-//   o pacote deve sair em (scheduledAt - halfRtt) UTC absoluto para chegar
-//   ao servidor no instante scheduledAt UTC absoluto.
+// SOLUÇÃO v20 — invokeDeadline = scheduledAt + p10 - halfRtt
 //
-//   O offset só seria necessário se você precisasse interpretar um timestamp
-//   retornado pelo servidor ("o servidor disse que X aconteceu às T") e
-//   convertê-lo para UTC real. Para decidir quando enviar, UTC absoluto
-//   menos RTT de viagem é suficiente e correto.
+//   p10 é o percentil 10 do histórico de quando o grupo REALMENTE abriu,
+//   medido como (sentAt - scheduledAt) em ms. Exemplos:
 //
-// FÓRMULA v19:
-//   invokeDeadline = scheduledAt - halfRtt
+//     p10 = 0ms   → grupo nunca abre antes do horário → floor = scheduledAt - halfRtt
+//                   (pacote chega exatamente em scheduledAt)
 //
-//   Exemplo: halfRtt=23ms, scheduledAt=T
-//     → invoca em T-23ms (local/UTC)
-//     → pacote chega ao servidor em T ✓
+//     p10 = -300ms → grupo historicamente abre 300ms antes → floor recuado para
+//                    scheduledAt - 300ms - halfRtt (pode tentar mais cedo)
 //
-//   O clockOffset continua sendo medido e logado para diagnóstico,
-//   mas não entra mais no cálculo do invokeDeadline.
+//     p10 = +500ms → grupo lento → floor avançado para scheduledAt + 500ms - halfRtt
+//                    (não perde tempo tentando antes)
 //
-// FIXES v13/v14/v16 MANTIDOS:
+//   INVARIANTE DE SEGURANÇA:
+//     Para grupos sem perfil suficiente (< 3 amostras), p10 = 0.
+//     Isso garante que o sistema NUNCA envia antes do horário sem respaldo
+//     histórico real. O recuo do floor só acontece se os dados confirmam.
+//
+//   Eliminação do flag opens_early:
+//     O flag binário opens_early era frágil — classificava o grupo uma vez
+//     e aplicava uma estratégia fixa independente da variabilidade semana a
+//     semana. Com p10/p90 contínuos, o sistema se adapta automaticamente:
+//     se p10 migra de 0 para -200ms ao longo de 20 semanas, o floor recua
+//     gradualmente. Sem reclassificação manual, sem reset de perfil.
+//
+// ZONAS DO LOOP (substituem o loop único de 1ms flat):
+//
+//   ZONA 1 — Antes de invokeDeadline: sleep
+//     O sniper pode acordar SNIPER_BEFORE_MS antes, mas não tenta nada.
+//     Usa esse tempo para garantir conexão quente.
+//
+//   ZONA 2 — Entre p10 e p90 (zona de incerteza real): loop 1ms
+//     O grupo pode abrir a qualquer momento nesse intervalo.
+//     Loop agressivo faz sentido aqui.
+//
+//   ZONA 3 — Depois de p90 (atraso incomum): loop 50ms
+//     Algo está fora do padrão. Reduz pressão no rate limit enquanto aguarda.
+//
+// scheduleTimer — ajuste do wake-up para opens_early histórico:
+//   Se p10 < 0, o sniper precisa acordar mais cedo que SNIPER_BEFORE_MS.
+//   sniperDelay = effectiveDelay - SNIPER_BEFORE_MS - Math.max(0, -p10)
+//   Isso garante que o floor seja atingível sem correria de última hora.
+//
+// FIXES v13/v14/v16/v19 MANTIDOS:
 //   - Throttle progressivo suave (base 1ms, começa em 200 too_early)
-//   - guardMs sem CONNECTION_BUDGET
-//   - SNIPER_TRANSIENT_INTERVAL_MS = 1ms
 //   - Rate limit shield 25 req/s
-//   - Floor universal para todos os grupos
+//   - SNIPER_TRANSIENT_INTERVAL_MS = 1ms
+//   - clockOffset medido e logado apenas para diagnóstico
 
 
 import { createClient } from "@supabase/supabase-js";
@@ -98,11 +119,11 @@ const MONITOR_HISTORY_LIMIT         = 150;
 const OPEN_GROUP_LISTEN_TIMEOUT_MS  = 2 * 60 * 60_000;
 const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
 
-// Quanto antes do horário o sniper é acordado — apenas para ter conexão quente.
-// Não cria sleep: o invoke começa imediatamente ao entrar (exceto floor do invokeDeadline).
+// Quanto antes do horário o sniper acorda — apenas para garantir conexão quente.
+// O invoke só começa em invokeDeadline = scheduledAt + p10 - halfRtt.
 const SNIPER_BEFORE_MS              = 100;
 
-// Spin de precisão no busy-wait
+// Busy-spin de precisão no busy-wait final
 const SNIPER_SPIN_MAX_MS            = 2;
 
 const GROUP_PROFILE_SAMPLE_SIZE     = 20;
@@ -111,12 +132,15 @@ const CLOCK_PROBE_COUNT             = 5;
 
 const SNIPER_SEND_TIMEOUT_MS        = 800;
 
-// Loop too_early: base 1ms, throttle suave só depois de muitas tentativas
+// Intervalo base do loop too_early (Zona 2) e transient
 const SNIPER_TOO_EARLY_BASE_INTERVAL_MS = 1;
 const SNIPER_TRANSIENT_INTERVAL_MS      = 1;
 
-// Throttle progressivo — só entra depois de 200 too_early para não prejudicar
-// grupos que abrem poucos ms depois do horário
+// Intervalo do loop na Zona 3 (depois de p90 — atraso incomum)
+const SNIPER_LATE_ZONE_INTERVAL_MS      = 50;
+
+// Throttle progressivo — só entra depois de muitas tentativas too_early para
+// não prejudicar grupos que abrem logo após o horário
 const TOO_EARLY_THROTTLE_STEPS: Array<[number, number]> = [
   [200,      2],
   [1000,     5],
@@ -132,6 +156,12 @@ const SNIPER_PAUSE_MS               = 5;
 const SNIPER_INTER_ACCOUNT_DELAY_MS = 1;
 const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
 const SNIPER_DONE_BLOCK_TTL_MS      = 500;
+
+// Defaults para grupos sem perfil suficiente (< 3 amostras):
+//   p10 = 0  → floor = scheduledAt - halfRtt (nunca antes do horário)
+//   p90 = 30_000ms → Zona 3 só ativa depois de 30s de too_early
+const DEFAULT_P10_MS = 0;
+const DEFAULT_P90_MS = 30_000;
 
 const WORKER_PORT   = parseInt(process.env.PORT ?? "3001", 10);
 const WORKER_SECRET = process.env.WORKER_SECRET ?? "";
@@ -203,7 +233,7 @@ interface GroupBehaviorProfile {
   offset_p10_ms:           number;
   offset_p50_ms:           number;
   offset_p90_ms:           number;
-  opens_early:             boolean;
+  // opens_early removido em v20 — substituído por p10/p90 contínuos
   min_safe_guard_ms:       number;
   sample_count:            number;
   open_at_start_ratio:     number;
@@ -240,7 +270,7 @@ const sniperTokenBuckets    = new Map<string, TokenBucket>();
 
 let telegramClockOffsetMs = 0;
 let clockOffsetQuality: "high" | "low" | "unknown" = "unknown";
-let estimatedOneWayRttMs  = 0; // half-RTT médio das clock probes
+let estimatedOneWayRttMs  = 0;
 
 /* ─────────────────────────────────────────────────────────────────────────────
    QUERY REUTILIZADA
@@ -324,6 +354,26 @@ function getTooEarlyIntervalMs(tooEarlyCount: number): number {
     if (tooEarlyCount < limit) return intervalMs;
   }
   return 15;
+}
+
+/**
+ * Retorna o p10 efetivo do grupo.
+ * INVARIANTE DE SEGURANÇA: retorna DEFAULT_P10_MS (0) se não há perfil
+ * suficiente, garantindo que o floor nunca recue sem respaldo histórico.
+ */
+function getEffectiveP10(profile: GroupBehaviorProfile | undefined): number {
+  if (!profile || profile.sample_count < 3) return DEFAULT_P10_MS;
+  return profile.offset_p10_ms;
+}
+
+/**
+ * Retorna o p90 efetivo do grupo.
+ * Sem perfil suficiente, usa DEFAULT_P90_MS (30s) para cobrir o range
+ * completo sem assumir nada sobre o comportamento do grupo.
+ */
+function getEffectiveP90(profile: GroupBehaviorProfile | undefined): number {
+  if (!profile || profile.sample_count < 3) return DEFAULT_P90_MS;
+  return profile.offset_p90_ms;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -431,7 +481,6 @@ async function measureClockOffsetViaSelfSend(client: TelegramClient): Promise<nu
     return telegramClockOffsetMs;
   }
 
-  // Atualiza RTT estimado (half-RTT = tempo que o pacote leva até o servidor)
   const filteredRtts = probe_rtt.filter((_, i) => probe_rtt[i] <= avgRtt + 2 * stdRtt);
   if (filteredRtts.length > 0) {
     const avgFilteredRtt = filteredRtts.reduce((a, b) => a + b, 0) / filteredRtts.length;
@@ -453,7 +502,7 @@ async function measureTelegramClockOffset(client: TelegramClient): Promise<numbe
     clockOffsetQuality = "high";
     return offset;
   } catch (err: any) {
-    console.warn(`[clock] Self-send falhou (${err.message}) — caindo em GetConfig (baixa precisão)`);
+    console.warn(`[clock] Self-send falhou (${err.message}) — caindo em GetConfig`);
   }
 
   try {
@@ -471,7 +520,7 @@ async function measureTelegramClockOffset(client: TelegramClient): Promise<numbe
     if (Math.abs(offsetMs) > 5_000) return telegramClockOffsetMs;
 
     clockOffsetQuality = "low";
-    console.log(`[clock] GetConfig fallback: offset=${Math.round(offsetMs)}ms (±500ms precisão) rtt=${rttMs}ms`);
+    console.log(`[clock] GetConfig fallback: offset=${Math.round(offsetMs)}ms rtt=${rttMs}ms`);
     return Math.round(offsetMs);
   } catch (err: any) {
     console.warn(`[clock] GetConfig também falhou: ${err.message}`);
@@ -488,7 +537,7 @@ async function loadGroupProfiles(): Promise<void> {
     const { data, error } = await supabase
       .from("group_profiles")
       .select(
-        "group_id, offset_p10_ms, offset_p50_ms, offset_p90_ms, opens_early, " +
+        "group_id, offset_p10_ms, offset_p50_ms, offset_p90_ms, " +
         "min_safe_guard_ms, sample_count, " +
         "open_at_start_ratio, median_too_early_count, estimated_open_delay_ms"
       );
@@ -550,12 +599,8 @@ async function persistGroupDispatchSample(
     const medianTooEarlyCount    = sortedTooEarly[Math.floor(n / 2)] ?? 0;
     const estimatedOpenDelayMs   = medianTooEarlyCount * SNIPER_TOO_EARLY_BASE_INTERVAL_MS;
 
-    // opens_early: grupo historicamente abre ANTES do horário agendado
-    const opensEarlyByVsHorario  = p50 < -20;
-    const opensEarlyByRatio      = openAtStartRatio > 0.6;
-    const opens_early            = opensEarlyByVsHorario || opensEarlyByRatio;
-
-    const min_safe_guard_ms = opens_early
+    // min_safe_guard_ms mantido para compatibilidade com versões anteriores
+    const min_safe_guard_ms = p10 < 0
       ? Math.max(-30_000, p10 - 50)
       : Math.max(0, estimatedOpenDelayMs - 20);
 
@@ -564,7 +609,6 @@ async function persistGroupDispatchSample(
       offset_p10_ms:          p10,
       offset_p50_ms:          p50,
       offset_p90_ms:          p90,
-      opens_early,
       min_safe_guard_ms,
       sample_count:           n,
       open_at_start_ratio:    openAtStartRatio,
@@ -583,7 +627,6 @@ async function persistGroupDispatchSample(
           offset_p10_ms:          p10,
           offset_p50_ms:          p50,
           offset_p90_ms:          p90,
-          opens_early,
           min_safe_guard_ms,
           sample_count:           n,
           open_at_start_ratio:    openAtStartRatio,
@@ -600,7 +643,6 @@ async function persistGroupDispatchSample(
       console.log(
         `[profiles] ✅ group=${groupId} ` +
         `p10=${p10}ms p50=${p50}ms p90=${p90}ms ` +
-        `opens_early=${opens_early} (vsHorário=${opensEarlyByVsHorario}, ratio=${opensEarlyByRatio}) ` +
         `openAtStart=${(openAtStartRatio * 100).toFixed(0)}% ` +
         `medianTooEarly=${medianTooEarlyCount} openDelay≈${estimatedOpenDelayMs}ms n=${n}`
       );
@@ -887,19 +929,20 @@ async function sniperAttemptOnce(
 /* ─────────────────────────────────────────────────────────────────────────────
    SNIPER LOOP — GRUPOS FECHADOS
    ═══════════════════════════════════════════════════════════════════════════
-   FILOSOFIA v19:
-     invokeDeadline = scheduledAt - halfRtt
+   FILOSOFIA v20:
+     invokeDeadline = scheduledAt + p10 - halfRtt
 
-     scheduledAt é um Unix timestamp absoluto (ms). Date.now() também.
-     Não há conversão de referencial: ambos vivem no mesmo epoch UTC.
-     O clockOffset do servidor Telegram é irrelevante para decidir quando
-     enviar — ele só descreve a dessincronização NTP do servidor, não muda
-     o momento UTC em que o pacote deve ser enviado.
+     p10 é o percentil 10 do histórico real de quando o grupo abriu.
+     Sem perfil suficiente, p10 = 0 → deadline = scheduledAt - halfRtt.
 
-     Enviamos halfRtt antes do scheduledAt (UTC absoluto) para que o pacote
-     chegue ao servidor exatamente em scheduledAt.
+     INVARIANTE: o sistema NUNCA envia antes do horário sem respaldo histórico.
+     O recuo do floor só acontece se os dados confirmam que o grupo já abriu
+     antes em semanas anteriores.
 
-     O clockOffset continua sendo medido e logado apenas para diagnóstico.
+   ZONAS DO LOOP:
+     Zona 1 → antes de invokeDeadline: sleep (conexão quente, sem tentativas)
+     Zona 2 → [p10, p90]: loop agressivo 1ms (zona de incerteza real)
+     Zona 3 → depois de p90: loop 50ms (atraso incomum, reduz pressão)
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperFireClosed(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -928,15 +971,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       schedule = data as unknown as Schedule;
     }
 
-    const scheduledAtRaw = new Date(schedule.next_run_at).getTime();
-    const scheduledAt    = scheduledAtRaw;
-
-    const timerLagMs = sniperEnteredAt - (scheduledAt - SNIPER_BEFORE_MS);
-    console.log(
-      `[sniper][timing] entrou ${Math.abs(timerLagMs)}ms ${timerLagMs >= 0 ? "após" : "antes d"} o planejado | ` +
-      `clockOffset(diag)=${telegramClockOffsetMs > 0 ? "+" : ""}${telegramClockOffsetMs}ms ` +
-      `(qualidade: ${clockOffsetQuality}) | scheduledAt=${new Date(scheduledAt).toISOString()}`
-    );
+    const scheduledAt = new Date(schedule.next_run_at).getTime();
 
     const group = schedule.groups;
     if (!group?.telegram_chat_id) {
@@ -980,57 +1015,54 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       return;
     }
 
-    // ── Verificar perfil para log ─────────────────────────────────────────
-    const profile           = groupProfileCache.get(group.id);
-    const hasSufficientData = (profile?.sample_count ?? 0) >= 3;
-    const isOpensEarly      = hasSufficientData && profile!.opens_early;
+    // ── Perfil do grupo ───────────────────────────────────────────────────
+    const profile  = groupProfileCache.get(group.id);
+    const p10      = getEffectiveP10(profile);
+    const p90      = getEffectiveP90(profile);
+    const hasProfile = (profile?.sample_count ?? 0) >= 3;
+
+    // ── invokeDeadline (v20): scheduledAt + p10 - halfRtt ────────────────
+    //
+    // INVARIANTE DE SEGURANÇA:
+    //   p10 = 0 para grupos sem perfil → deadline = scheduledAt - halfRtt
+    //   O pacote chega ao Telegram exatamente em scheduledAt.
+    //
+    //   p10 < 0 apenas se o histórico real confirma abertura antecipada.
+    //   p10 > 0 se o grupo consistentemente abre depois do horário.
+    //
+    const invokeDeadline  = scheduledAt + p10 - estimatedOneWayRttMs;
+    const p90Deadline     = scheduledAt + p90;
+    const msUntilDeadline = invokeDeadline - Date.now();
+
+    const timerLagMs = sniperEnteredAt - (scheduledAt - SNIPER_BEFORE_MS - Math.max(0, -p10));
 
     console.log(
-      `[sniper][adaptive] opens_early=${isOpensEarly} | ` +
-      (hasSufficientData
-        ? `p10=${profile!.offset_p10_ms}ms p50=${profile!.offset_p50_ms}ms p90=${profile!.offset_p90_ms}ms ` +
-          `openAtStart=${(profile!.open_at_start_ratio * 100).toFixed(0)}% ` +
-          `openDelay≈${profile!.estimated_open_delay_ms}ms n=${profile!.sample_count}`
-        : `sem perfil suficiente (${profile?.sample_count ?? 0}/3) → loop agressivo após invokeDeadline`)
+      `[sniper][timing] entrou ${Math.abs(timerLagMs)}ms ${timerLagMs >= 0 ? "após" : "antes d"}o planejado | ` +
+      `scheduledAt=${new Date(scheduledAt).toISOString()} | ` +
+      `p10=${p10}ms p90=${p90}ms (perfil: ${hasProfile ? `${profile!.sample_count} amostras` : "padrão"}) | ` +
+      `halfRtt=${estimatedOneWayRttMs}ms | clockOffset_diag=${telegramClockOffsetMs}ms`
     );
 
-    // ── Floor universal (v19): invokeDeadline = scheduledAt - halfRtt ────────
-    //
-    // FIX v19: clockAdj removido da fórmula.
-    //
-    // scheduledAt é Unix timestamp absoluto em ms — mesmo referencial que Date.now().
-    // O offset (serverTime - localTime) NÃO entra no cálculo: ele descreve
-    // dessincronização NTP do servidor Telegram, mas não muda o instante UTC
-    // em que o pacote deve sair. Para chegar ao servidor em scheduledAt (UTC),
-    // basta enviar halfRtt antes (em UTC).
-    //
-    // clockOffset continua sendo medido e logado para fins de diagnóstico.
-    {
-      // v19: apenas halfRtt, sem clockAdj
-      const invokeDeadline  = scheduledAt - estimatedOneWayRttMs;
-      const msUntilDeadline = invokeDeadline - Date.now();
+    console.log(
+      `[sniper][timing] invokeDeadline(v20) = scheduledAt + p10 - halfRtt = ` +
+      `${scheduledAt} + ${p10} - ${estimatedOneWayRttMs} = ${invokeDeadline} | ` +
+      `(${msUntilDeadline > 0 ? "+" : ""}${Math.round(msUntilDeadline)}ms até deadline)`
+    );
 
-      console.log(
-        `[sniper][timing] invokeDeadline(v19) → halfRtt=${estimatedOneWayRttMs}ms ` +
-        `clockOffset_diag=${telegramClockOffsetMs > 0 ? "+" : ""}${telegramClockOffsetMs}ms (apenas diagnóstico) ` +
-        `deadline=${new Date(invokeDeadline).toISOString()} ` +
-        `(${msUntilDeadline > 0 ? "+" : ""}${Math.round(msUntilDeadline)}ms até deadline) ` +
-        `opens_early=${isOpensEarly}`
-      );
-
-      if (msUntilDeadline > SNIPER_SPIN_MAX_MS) {
-        const sleepMs = msUntilDeadline - SNIPER_SPIN_MAX_MS;
-        await new Promise(r => setTimeout(r, sleepMs));
-      }
-      // busy-spin de precisão até o deadline
-      while (Date.now() < invokeDeadline) { /* spin */ }
-
-      const vsScheduled = Date.now() - scheduledAt;
-      console.log(
-        `[sniper][timing] invokeDeadline atingido | ` +
-        `${vsScheduled >= 0 ? "+" : ""}${vsScheduled}ms vs scheduledAt local`
-      );
+    // ── Zona 1: sleep até invokeDeadline ─────────────────────────────────
+    // Usa o tempo para garantir conexão quente. Sem tentativas.
+    if (msUntilDeadline > SNIPER_SPIN_MAX_MS) {
+      const sleepMs = msUntilDeadline - SNIPER_SPIN_MAX_MS;
+      await new Promise(r => setTimeout(r, sleepMs));
     }
+    // Busy-spin de precisão sub-milissegundo
+    while (Date.now() < invokeDeadline) { /* spin */ }
+
+    const vsScheduledAtDeadline = Date.now() - scheduledAt;
+    console.log(
+      `[sniper][timing] invokeDeadline atingido | ` +
+      `${vsScheduledAtDeadline >= 0 ? "+" : ""}${vsScheduledAtDeadline}ms vs scheduledAt`
+    );
 
     sniperTokenBuckets.set(firstAccount.id, {
       tokens:     SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT,
@@ -1047,6 +1079,10 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     while (Date.now() < budgetEnd) {
       attempt++;
 
+      // Determina a zona atual para ajustar o intervalo
+      const now_ms  = Date.now();
+      const isZone3 = now_ms > p90Deadline; // depois de p90 — atraso incomum
+
       // Rate limit shield
       const waitForToken = acquireTokenBucket(firstAccount.id);
       if (waitForToken > 0) {
@@ -1059,13 +1095,14 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         firstSentAt = new Date(result.sentAt!);
 
         const invokeRttMs = firstSentAt.getTime() - sniperEnteredAt;
-        const vsHorarioMs = firstSentAt.getTime() - scheduledAtRaw;
+        const vsHorarioMs = firstSentAt.getTime() - scheduledAt;
 
         console.log(`[sniper][timing] invoke RTT total: ${invokeRttMs}ms`);
         console.log(
-          `[sniper][timing] vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms ` +
-          `tentativa=${attempt} tooEarly=${tooEarlyCount} opens_early=${isOpensEarly} ` +
-          `(clockOffset_diag=${telegramClockOffsetMs}ms qual=${clockOffsetQuality})`
+          `[sniper][timing] vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms | ` +
+          `tentativa=${attempt} tooEarly=${tooEarlyCount} ` +
+          `zona=${isZone3 ? "3 (tardio)" : "2 (normal)"} | ` +
+          `p10=${p10}ms p90=${p90}ms`
         );
         console.log(`[sniper] ✓ ${firstAccount.phone_number} enviou na tentativa ${attempt} (${firstSentAt.toISOString()})`);
 
@@ -1083,11 +1120,21 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
       if (result.outcome === "too_early") {
         tooEarlyCount++;
-        const intervalMs = getTooEarlyIntervalMs(tooEarlyCount);
-        if (tooEarlyCount % 200 === 0) {
-          console.log(`[sniper] ⏳ too_early×${tooEarlyCount} — intervalo atual: ${intervalMs}ms`);
+
+        if (isZone3) {
+          // Zona 3: atraso incomum — reduz pressão no rate limit
+          if (tooEarlyCount % 50 === 0) {
+            console.log(`[sniper] ⏳ too_early×${tooEarlyCount} — Zona 3 (p90+${Date.now() - p90Deadline}ms) → ${SNIPER_LATE_ZONE_INTERVAL_MS}ms`);
+          }
+          await new Promise(r => setTimeout(r, SNIPER_LATE_ZONE_INTERVAL_MS));
+        } else {
+          // Zona 2: incerteza real — loop agressivo com throttle progressivo
+          const intervalMs = getTooEarlyIntervalMs(tooEarlyCount);
+          if (tooEarlyCount % 200 === 0) {
+            console.log(`[sniper] ⏳ too_early×${tooEarlyCount} — Zona 2 — intervalo: ${intervalMs}ms`);
+          }
+          await new Promise(r => setTimeout(r, intervalMs));
         }
-        await new Promise(r => setTimeout(r, intervalMs));
         continue;
       }
 
@@ -1113,11 +1160,11 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         }
       }
 
-      // transient: 1ms base
+      // transient: 1ms base (Zona 2) ou 50ms (Zona 3)
       if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
         await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
       } else {
-        await new Promise(r => setTimeout(r, SNIPER_TRANSIENT_INTERVAL_MS));
+        await new Promise(r => setTimeout(r, isZone3 ? SNIPER_LATE_ZONE_INTERVAL_MS : SNIPER_TRANSIENT_INTERVAL_MS));
       }
     }
 
@@ -1589,6 +1636,18 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    TIMER DE PRECISÃO + PRE-FETCH + SNIPER
+   ═══════════════════════════════════════════════════════════════════════════
+   v20: o sniperDelay é ajustado para garantir que o sniper acorde cedo o
+   suficiente quando p10 < 0 (grupo que historicamente abre antes do horário).
+
+   sniperDelay = effectiveDelay - SNIPER_BEFORE_MS - Math.max(0, -p10)
+
+   Exemplos:
+     p10 = 0    → sniperDelay = effectiveDelay - 100ms (comportamento padrão)
+     p10 = -300ms → sniperDelay = effectiveDelay - 100ms - 300ms = effectiveDelay - 400ms
+                    O sniper acorda 400ms antes e usa invokeDeadline = scheduledAt - 300ms - halfRtt
+     p10 = +500ms → sniperDelay = effectiveDelay - 100ms (sem ajuste negativo)
+                    O sniper acorda normalmente e espera dentro do sniperFireClosed
    ───────────────────────────────────────────────────────────────────────────── */
 function scheduleTimer(
   scheduleId: string,
@@ -1614,6 +1673,7 @@ function scheduleTimer(
 
   const effectiveDelay = Math.max(0, delay);
 
+  // Pre-fetch do schedule antes do fire
   if (effectiveDelay > PREFETCH_BEFORE_MS) {
     const prefetchDelay = effectiveDelay - PREFETCH_BEFORE_MS;
     const pt = setTimeout(async () => {
@@ -1639,13 +1699,14 @@ function scheduleTimer(
     prefetchTimers.set(scheduleId, pt);
   }
 
+  // Sniper para grupos fechados
   if (groupType === "closed") {
-    const resolvedGroupId   = groupId ?? scheduleGroupMap.get(scheduleId);
-    const profile           = resolvedGroupId ? groupProfileCache.get(resolvedGroupId) : undefined;
-    const hasSufficientData = (profile?.sample_count ?? 0) >= 3;
-    const isOpensEarly      = hasSufficientData && profile!.opens_early;
+    const resolvedGroupId = groupId ?? scheduleGroupMap.get(scheduleId);
+    const profile         = resolvedGroupId ? groupProfileCache.get(resolvedGroupId) : undefined;
+    const p10             = getEffectiveP10(profile);
 
-    const extraLeadMs       = isOpensEarly ? Math.max(0, -profile!.offset_p10_ms) + 100 : 0;
+    // Acorda mais cedo se p10 < 0 (grupo que historicamente abre antes do horário)
+    const extraLeadMs       = Math.max(0, -p10);
     const totalSniperLeadMs = SNIPER_BEFORE_MS + extraLeadMs;
 
     if (effectiveDelay > totalSniperLeadMs) {
@@ -1662,8 +1723,8 @@ function scheduleTimer(
       }, sniperDelay);
       sniperTimers.set(scheduleId, st);
 
-      if (isOpensEarly) {
-        console.log(`[sniper] ⏰ Opens_early — lead total=${totalSniperLeadMs}ms, acorda em ${Math.round(sniperDelay / 1000)}s`);
+      if (extraLeadMs > 0) {
+        console.log(`[sniper] ⏰ p10=${p10}ms → lead total=${totalSniperLeadMs}ms, acorda em ${Math.round(sniperDelay / 1000)}s`);
       } else {
         console.log(`[sniper] ⏰ Agendado para schedule ${scheduleId} em ${Math.round(sniperDelay / 1000)}s`);
       }
@@ -2021,10 +2082,14 @@ const httpServer = http.createServer(async (req, res) => {
   const profileMatch = url.pathname.match(/^\/groups\/([^/]+)\/profile$/);
   if (req.method === "GET" && profileMatch) {
     const groupId = profileMatch[1];
+    const profile = groupProfileCache.get(groupId);
     return jsonResponse(res, 200, {
-      profile: groupProfileCache.get(groupId) ?? null,
+      profile: profile ?? null,
+      effective_p10: getEffectiveP10(profile),
+      effective_p90: getEffectiveP90(profile),
       clock_offset_ms: telegramClockOffsetMs,
       clock_quality: clockOffsetQuality,
+      half_rtt_ms: estimatedOneWayRttMs,
     });
   }
 
@@ -2033,7 +2098,7 @@ const httpServer = http.createServer(async (req, res) => {
     groupProfileCache.delete(groupId);
     await supabase.from("group_profiles").delete().eq("group_id", groupId);
     await supabase.from("group_dispatch_samples").delete().eq("group_id", groupId);
-    return jsonResponse(res, 200, { ok: true, message: "Perfil resetado — próximos 3 disparos reaprendem o timing" });
+    return jsonResponse(res, 200, { ok: true, message: "Perfil resetado — próximos 3 disparos reaprendem o timing (p10=0, p90=30s por padrão)" });
   }
 
   if (req.method === "GET" && url.pathname === "/clock") {
@@ -2042,7 +2107,6 @@ const httpServer = http.createServer(async (req, res) => {
       clock_quality:          clockOffsetQuality,
       estimated_one_way_rtt:  estimatedOneWayRttMs,
       local_time:             new Date().toISOString(),
-      adjusted_time:          new Date(Date.now() - telegramClockOffsetMs).toISOString(),
     });
   }
 
@@ -2280,7 +2344,7 @@ process.on("SIGINT",  shutdown);
    INICIALIZAÇÃO
    ───────────────────────────────────────────────────────────────────────────── */
 async function init(): Promise<void> {
-  console.log("[worker] Iniciando v19 — invokeDeadline = scheduledAt - halfRtt (clockAdj removido)...");
+  console.log("[worker] Iniciando v20 — invokeDeadline = scheduledAt + p10 - halfRtt...");
   await prewarmAccounts();
   await reloadSchedules();
 
@@ -2302,7 +2366,7 @@ async function init(): Promise<void> {
     }
   }, CLOCK_OFFSET_REFRESH_MS);
 
-  console.log("[worker] Pronto v19. invokeDeadline = scheduledAt - halfRtt.");
+  console.log("[worker] Pronto v20. invokeDeadline = scheduledAt + p10 - halfRtt.");
 }
 
 init().catch(err => {
