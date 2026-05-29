@@ -905,14 +905,33 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     }
 
     const scheduledAtRaw  = new Date(schedule.next_run_at).getTime();
-    const scheduledAt     = scheduledAtRaw - telegramClockOffsetMs;
+    // v13 fix: offset = serverTime - localTime.
+    // Para disparar quando o servidor marcar scheduledAtRaw, disparamos quando
+    // localTime = scheduledAtRaw - offset  →  servidor verá scheduledAtRaw.
+    // Sinal correto: scheduledAt = scheduledAtRaw - telegramClockOffsetMs.
+    // Se offset < 0 (servidor atrás do local): scheduledAt > scheduledAtRaw → espera mais ✓
+    // Se offset > 0 (servidor à frente do local): scheduledAt < scheduledAtRaw → dispara antes ✓
+    //
+    // ATENÇÃO — BUG IDENTIFICADO EM PRODUÇÃO (28/05/2026):
+    // offset=-1122ms estava fazendo scheduledAt = scheduledAtRaw + 1122ms (subtração de negativo).
+    // Resultado: sniper esperou 1,1s a mais e chegou +1165ms vs horário.
+    // CORREÇÃO: a fórmula scheduledAt = scheduledAtRaw - offset JÁ É a correta matematicamente.
+    // O problema era que o sinal do offset estava ERRADO na medição (self-send retorna date
+    // do servidor em segundos inteiros; o +500ms de estimativa pode estar sistematicamente
+    // jogando o offset para negativo quando o servidor está ~300-700ms dentro do segundo).
+    //
+    // Solução: zeramos o uso do clockOffset no gate de timing (scheduledAt = scheduledAtRaw),
+    // mantendo o offset apenas para logging/diagnóstico. O gate adaptativo (guardMs) e o
+    // perfil de grupo já compensam o timing real via amostras empíricas (vsHorarioMs).
+    // Isso elimina o risco de o offset estimado incorretamente atrasar ou adiantar o disparo.
+    const scheduledAt     = scheduledAtRaw; // clock offset não aplicado ao gate (ver acima)
 
     const plannedSniperAt = scheduledAt - SNIPER_BEFORE_MS;
     const timerLagMs      = sniperEnteredAt - plannedSniperAt;
     console.log(
       `[sniper][timing] timer lag: ${timerLagMs}ms | ` +
-      `clockOffset=${telegramClockOffsetMs > 0 ? "+" : ""}${telegramClockOffsetMs}ms ` +
-      `(qualidade: ${clockOffsetQuality}) | scheduledAt(adj)=${new Date(scheduledAt).toISOString()}`
+      `clockOffset(diag)=${telegramClockOffsetMs > 0 ? "+" : ""}${telegramClockOffsetMs}ms ` +
+      `(qualidade: ${clockOffsetQuality}) | scheduledAt=${new Date(scheduledAt).toISOString()}`
     );
 
     const group = schedule.groups;
@@ -1035,7 +1054,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         console.log(
           `[sniper][timing] vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms ` +
           `tentativa=${attempt} tooEarly=${tooEarlyCount} ` +
-          `(clockOffset=${telegramClockOffsetMs}ms qual=${clockOffsetQuality})`
+          `(clockOffset_diag=${telegramClockOffsetMs}ms qual=${clockOffsetQuality})`
         );
         console.log(`[sniper][timing] vs gate: +${vsGateMs}ms | guardMs=${guardMs}ms`);
         console.log(`[sniper] ✓ ${firstAccount.phone_number} enviou na tentativa ${attempt} (${firstSentAt.toISOString()})`);
