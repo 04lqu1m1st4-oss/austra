@@ -575,6 +575,7 @@ async function loadGroupProfiles(): Promise<void> {
     }
 
     for (const row of data ?? []) {
+      if (!row || typeof row !== "object" || "message" in row) continue;
       groupProfileCache.set(row.group_id as string, {
         ...row,
         open_at_start_ratio:     (row as any).open_at_start_ratio     ?? 0,
