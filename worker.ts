@@ -1,7 +1,7 @@
-// worker-v18.ts — dispatch worker Telegram, timing adaptativo por grupo
+// worker-v19.ts — dispatch worker Telegram, timing adaptativo por grupo
 //
 // ═══════════════════════════════════════════════════════════════════════════
-// HISTÓRICO DE FIXES (v1–v13 preservados para referência)
+// HISTÓRICO DE FIXES (v1–v18 preservados para referência)
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Fix v1:  firingNow Set previne duplo disparo
@@ -22,42 +22,40 @@
 // Fix v15: RTT-aware busy-wait: compensa half-RTT no floor de opens_early
 // Fix v16: Floor universal: todo grupo (com ou sem perfil) espera até invokeDeadline
 // Fix v17: Sinal do clockAdj invertido (bug): usava scheduledAt + offset (errado)
+// Fix v18: Corrige sinal do clockAdj: invokeDeadline = scheduledAt - offset - halfRtt
 //
 // ═══════════════════════════════════════════════════════════════════════════
-// Fix v18 — Corrige sinal do clockAdj: invokeDeadline = scheduledAt - offset - halfRtt
+// Fix v19 — Remove clockAdj da fórmula: invokeDeadline = scheduledAt - halfRtt
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// FILOSOFIA DO SNIPER (v18):
+// DIAGNÓSTICO v18:
+//   clockOffset=-808ms, halfRtt=23ms
+//   invokeDeadline = scheduledAt - (-808) - 23 = scheduledAt + 785ms
+//   → sistema esperava 785ms DEPOIS do horário antes de invocar
+//   → mensagem chegava ~829ms atrasada
 //
-//   offset = serverTime - localTime
+// ROOT CAUSE:
+//   `scheduledAt` é um Unix timestamp absoluto em ms — mesmo referencial que
+//   Date.now(). Não há conversão de referencial a fazer. O offset
+//   (serverTime - localTime) descreve uma dessincronização de NTP no relógio
+//   do servidor Telegram, mas não afeta *quando* o pacote deve ser enviado:
+//   o pacote deve sair em (scheduledAt - halfRtt) UTC absoluto para chegar
+//   ao servidor no instante scheduledAt UTC absoluto.
 //
-//   Queremos que o pacote CHEGUE ao servidor quando o relógio DO SERVIDOR
-//   marcar scheduledAt. Como o pacote leva halfRtt para chegar, precisamos
-//   invocar halfRtt antes — mas em qual referencial?
+//   O offset só seria necessário se você precisasse interpretar um timestamp
+//   retornado pelo servidor ("o servidor disse que X aconteceu às T") e
+//   convertê-lo para UTC real. Para decidir quando enviar, UTC absoluto
+//   menos RTT de viagem é suficiente e correto.
 //
-//   No referencial LOCAL:
-//     servidorMarca_scheduledAt quando localTime = scheduledAt - offset
-//     (porque serverTime = localTime + offset, então localTime = serverTime - offset)
+// FÓRMULA v19:
+//   invokeDeadline = scheduledAt - halfRtt
 //
-//   Portanto:
-//     invokeDeadline = scheduledAt - offset - halfRtt
+//   Exemplo: halfRtt=23ms, scheduledAt=T
+//     → invoca em T-23ms (local/UTC)
+//     → pacote chega ao servidor em T ✓
 //
-//   Exemplo: offset = -1129ms (servidor atrasado), halfRtt = 26ms
-//     invokeDeadline = scheduledAt - (-1129) - 26
-//                    = scheduledAt + 1129 - 26
-//                    = scheduledAt + 1103ms (local)
-//     → invoca 1103ms DEPOIS no relógio local
-//     → pacote chega ao servidor 26ms depois
-//     → servidor recebe quando seu relógio marca scheduledAt ✓
-//
-//   Exemplo: offset = +500ms (servidor adiantado), halfRtt = 20ms
-//     invokeDeadline = scheduledAt - 500 - 20 = scheduledAt - 520ms (local)
-//     → invoca 520ms ANTES no relógio local
-//     → pacote chega ao servidor 20ms depois
-//     → servidor recebe quando seu relógio marca scheduledAt ✓
-//
-// REGRA MNEMÔNICA: offset negativo = servidor atrasado = você espera mais (deadline depois)
-//                  offset positivo = servidor adiantado = você invoca antes (deadline antes)
+//   O clockOffset continua sendo medido e logado para diagnóstico,
+//   mas não entra mais no cálculo do invokeDeadline.
 //
 // FIXES v13/v14/v16 MANTIDOS:
 //   - Throttle progressivo suave (base 1ms, começa em 200 too_early)
@@ -889,18 +887,19 @@ async function sniperAttemptOnce(
 /* ─────────────────────────────────────────────────────────────────────────────
    SNIPER LOOP — GRUPOS FECHADOS
    ═══════════════════════════════════════════════════════════════════════════
-   FILOSOFIA v18:
-     Floor universal: todos os grupos esperam até invokeDeadline antes do 1º invoke.
+   FILOSOFIA v19:
+     invokeDeadline = scheduledAt - halfRtt
 
-     invokeDeadline = scheduledAt - clockOffset - halfRtt
+     scheduledAt é um Unix timestamp absoluto (ms). Date.now() também.
+     Não há conversão de referencial: ambos vivem no mesmo epoch UTC.
+     O clockOffset do servidor Telegram é irrelevante para decidir quando
+     enviar — ele só descreve a dessincronização NTP do servidor, não muda
+     o momento UTC em que o pacote deve ser enviado.
 
-     Onde:
-       clockOffset = serverTime - localTime
-       scheduledAt - clockOffset = momento local em que o servidor marca scheduledAt
-       - halfRtt = enviamos antes para o pacote chegar exatamente no horário
+     Enviamos halfRtt antes do scheduledAt (UTC absoluto) para que o pacote
+     chegue ao servidor exatamente em scheduledAt.
 
-     Após o invokeDeadline: loop agressivo de 1ms.
-     Se vier too_early: tooEarlyCount++ e retry em 1ms (throttle suave após 200).
+     O clockOffset continua sendo medido e logado apenas para diagnóstico.
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperFireClosed(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -995,22 +994,25 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         : `sem perfil suficiente (${profile?.sample_count ?? 0}/3) → loop agressivo após invokeDeadline`)
     );
 
-    // ── Floor universal (v18): invokeDeadline = scheduledAt - offset - halfRtt ──
+    // ── Floor universal (v19): invokeDeadline = scheduledAt - halfRtt ────────
     //
-    // offset = serverTime - localTime
-    // Queremos invocar quando localTime = scheduledAt - offset - halfRtt
-    // pois nesse momento o servidor receberá o pacote quando seu relógio = scheduledAt.
+    // FIX v19: clockAdj removido da fórmula.
     //
-    // Sem medição de qualidade (unknown/low): clockAdj=0, só compensa halfRtt.
+    // scheduledAt é Unix timestamp absoluto em ms — mesmo referencial que Date.now().
+    // O offset (serverTime - localTime) NÃO entra no cálculo: ele descreve
+    // dessincronização NTP do servidor Telegram, mas não muda o instante UTC
+    // em que o pacote deve sair. Para chegar ao servidor em scheduledAt (UTC),
+    // basta enviar halfRtt antes (em UTC).
+    //
+    // clockOffset continua sendo medido e logado para fins de diagnóstico.
     {
-      const clockAdj       = clockOffsetQuality === "high" ? telegramClockOffsetMs : 0;
-      // FIX v18: invokeDeadline = scheduledAt - offset - halfRtt
-      const invokeDeadline = scheduledAt - clockAdj - estimatedOneWayRttMs;
+      // v19: apenas halfRtt, sem clockAdj
+      const invokeDeadline  = scheduledAt - estimatedOneWayRttMs;
       const msUntilDeadline = invokeDeadline - Date.now();
 
       console.log(
-        `[sniper][timing] invokeDeadline(v18) → clockAdj=${clockAdj > 0 ? "+" : ""}${clockAdj}ms ` +
-        `halfRtt=${estimatedOneWayRttMs}ms ` +
+        `[sniper][timing] invokeDeadline(v19) → halfRtt=${estimatedOneWayRttMs}ms ` +
+        `clockOffset_diag=${telegramClockOffsetMs > 0 ? "+" : ""}${telegramClockOffsetMs}ms (apenas diagnóstico) ` +
         `deadline=${new Date(invokeDeadline).toISOString()} ` +
         `(${msUntilDeadline > 0 ? "+" : ""}${Math.round(msUntilDeadline)}ms até deadline) ` +
         `opens_early=${isOpensEarly}`
@@ -1835,7 +1837,7 @@ async function prewarmAccounts(): Promise<void> {
     const anyClient = [...clients.values()].find(c => c.connected);
     if (anyClient) {
       telegramClockOffsetMs = await measureTelegramClockOffset(anyClient);
-      console.log(`[clock] ✅ Clock offset inicial: ${telegramClockOffsetMs > 0 ? "+" : ""}${telegramClockOffsetMs}ms (${clockOffsetQuality})`);
+      console.log(`[clock] ✅ Clock offset inicial: ${telegramClockOffsetMs > 0 ? "+" : ""}${telegramClockOffsetMs}ms (${clockOffsetQuality}) — apenas diagnóstico`);
     }
 
   } finally {
@@ -2278,7 +2280,7 @@ process.on("SIGINT",  shutdown);
    INICIALIZAÇÃO
    ───────────────────────────────────────────────────────────────────────────── */
 async function init(): Promise<void> {
-  console.log("[worker] Iniciando v18 — Fix invokeDeadline = scheduledAt - offset - halfRtt...");
+  console.log("[worker] Iniciando v19 — invokeDeadline = scheduledAt - halfRtt (clockAdj removido)...");
   await prewarmAccounts();
   await reloadSchedules();
 
@@ -2295,12 +2297,12 @@ async function init(): Promise<void> {
     if (!anyClient) return;
     const newOffset = await measureTelegramClockOffset(anyClient);
     if (newOffset !== telegramClockOffsetMs) {
-      console.log(`[clock] Offset atualizado: ${telegramClockOffsetMs}ms → ${newOffset}ms (${clockOffsetQuality})`);
+      console.log(`[clock] Offset atualizado: ${telegramClockOffsetMs}ms → ${newOffset}ms (${clockOffsetQuality}) — apenas diagnóstico`);
       telegramClockOffsetMs = newOffset;
     }
   }, CLOCK_OFFSET_REFRESH_MS);
 
-  console.log("[worker] Pronto v18. invokeDeadline = scheduledAt - clockOffset - halfRtt.");
+  console.log("[worker] Pronto v19. invokeDeadline = scheduledAt - halfRtt.");
 }
 
 init().catch(err => {
