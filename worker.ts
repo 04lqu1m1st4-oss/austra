@@ -1,90 +1,99 @@
-// worker-v20.ts — dispatch worker Telegram, timing adaptativo por grupo
+// worker-flat.ts — dispatch worker Telegram, sem camadas de abstração
 //
-// ═══════════════════════════════════════════════════════════════════════════
-// HISTÓRICO DE FIXES (v1–v19 preservados para referência)
-// ═══════════════════════════════════════════════════════════════════════════
+// Fix v1: firingNow Set previne duplo disparo quando reloadSchedules
+//         roda enquanto fireSchedule ainda está executando (race condition
+//         entre RETRY_BUDGET_MS=50s e RELOAD_INTERVAL_MS=30s)
 //
-// Fix v1:  firingNow Set previne duplo disparo
-// Fix v2:  BUG reconnect loop, peerCache stale, backoff, prewarm awaited
-// Fix v3:  AUTH_KEY_DUPLICATED via race em getClient() → connectingPromises
-// Fix v4:  invoke direto, pre-fetch, pre-resolve peers, noWebpage, randomId
-// Fix v5:  sniperFireClosed() — loop ultra-agressivo para grupos fechados
-// Fix v6:  duplo disparo, groupType perdido, FloodWait, reloadClient, keepalive
-// Fix v7:  timing logs + SNIPER_BEFORE_MS aumentado para 45ms
-// Fix v8:  randomId estável por ciclo (deduplicação Telegram)
-// Fix v9:  SNIPER_BEFORE_MS=200ms warm-up + SNIPER_AFTER_GUARD_MS=15ms busy-wait
-// Fix v10: Adaptive Gate — timing dinâmico p10/p50/p90, SNIPER_SPIN_MAX_MS=2ms
-// Fix v11: Smart Loop — sniperAttemptOnce classificado, tooEarlyCount,
-//          measureTelegramClockOffset, persistGroupDispatchSample estendido
-// Fix v12: Multi-probe Clock + Dual-mode Sniper + Rate Limit Shield
-// Fix v13: Throttle corrigido (base 1ms) + guardMs sem corte de CONNECTION_BUDGET
-// Fix v14: Loop sempre agressivo. Gate só bloqueia opens_early antes do horário
-// Fix v15: RTT-aware busy-wait: compensa half-RTT no floor de opens_early
-// Fix v16: Floor universal: todo grupo espera até invokeDeadline
-// Fix v17: Sinal do clockAdj invertido (bug)
-// Fix v18: Corrige sinal do clockAdj: invokeDeadline = scheduledAt - offset - halfRtt
-// Fix v19: Remove clockAdj da fórmula: invokeDeadline = scheduledAt - halfRtt
+// Fix v2 (2025-05):
+//   BUG #1 — reconnect loop infinito:
+//     _loopStarted=true antes de connect() suprime o updateLoop sem quebrar
+//     o fluxo de reconexão (autoReconnect, _handleReconnect não dependem do flag).
 //
-// ═══════════════════════════════════════════════════════════════════════════
-// Fix v20 — invokeDeadline baseado em p10 histórico + eliminação do flag opens_early
-// ═══════════════════════════════════════════════════════════════════════════
+//   BUG #2 — peerCache stale após reconexão:
+//     Ao desconectar/reconectar um account, todos os peers desse account
+//     são removidos do cache. accessHash gerado com sessão anterior é inválido.
 //
-// PROBLEMA RAIZ:
-//   O sistema disparava antes do horário porque o sniper acordava em
-//   (scheduledAt - SNIPER_BEFORE_MS) e iniciava o loop imediatamente,
-//   sem nenhum floor real. Com conexão quente e grupo aberto, o invoke
-//   chegava ao Telegram antes de scheduledAt.
+//   BUG #3 — sem delay entre tentativas no sendMessage:
+//     Adicionado backoff exponencial (1s → 2s → 4s → 8s) entre tentativas.
 //
-// SOLUÇÃO v20 — invokeDeadline = scheduledAt + p10 - halfRtt
+//   BUG #4 — getDialogs warm-up não era awaited:
+//     Warm-up movido para prewarmAccounts() com await + pre-resolve de peers.
 //
-//   p10 é o percentil 10 do histórico de quando o grupo REALMENTE abriu,
-//   medido como (sentAt - scheduledAt) em ms. Exemplos:
+// Fix v3 (2025-05):
+//   BUG #5 — AUTH_KEY_DUPLICATED (406) via race condition em getClient():
+//     connectingPromises Map<accountId, Promise<TelegramClient>> serializa
+//     conexões concorrentes para o mesmo account.
 //
-//     p10 = 0ms   → grupo nunca abre antes do horário → floor = scheduledAt - halfRtt
-//                   (pacote chega exatamente em scheduledAt)
+// Otimizações v4 (2025-05) — latência mínima no caminho crítico:
 //
-//     p10 = -300ms → grupo historicamente abre 300ms antes → floor recuado para
-//                    scheduledAt - 300ms - halfRtt (pode tentar mais cedo)
+//   OPT #1 — invoke direto em vez de client.sendMessage():
+//   OPT #2 — pre-fetch do schedule antes do fire
+//   OPT #3 — pre-resolve de peers no prewarm
+//   OPT #4 — noWebpage: true + randomId único por tentativa
 //
-//     p10 = +500ms → grupo lento → floor avançado para scheduledAt + 500ms - halfRtt
-//                    (não perde tempo tentando antes)
+// Fix v5 (2025-05) — sniper loop para grupos fechados:
+//   OPT #5 — sniperFireClosed(): loop ultra-agressivo para grupos fechados
 //
-//   INVARIANTE DE SEGURANÇA:
-//     Para grupos sem perfil suficiente (< 3 amostras), p10 = 0.
-//     Isso garante que o sistema NUNCA envia antes do horário sem respaldo
-//     histórico real. O recuo do floor só acontece se os dados confirmam.
+// Fix v6 (2025-05) — correções de bugs críticos:
 //
-//   Eliminação do flag opens_early:
-//     O flag binário opens_early era frágil — classificava o grupo uma vez
-//     e aplicava uma estratégia fixa independente da variabilidade semana a
-//     semana. Com p10/p90 contínuos, o sistema se adapta automaticamente:
-//     se p10 migra de 0 para -200ms ao longo de 20 semanas, o floor recua
-//     gradualmente. Sem reclassificação manual, sem reset de perfil.
+//   BUG #A — duplo disparo sniper + fireSchedule no mesmo ciclo:
+//     Ao terminar (sucesso ou falha), sniperFireClosed() registra o scheduleId
+//     em firingNow com TTL de 60s. Isso bloqueia o fireSchedule do mesmo ciclo
+//     que ainda está pendente no setTimeout.
 //
-// ZONAS DO LOOP (substituem o loop único de 1ms flat):
+//   BUG #B — groupType perdido após o 1º ciclo:
+//     updateScheduleAfterDispatch() agora recebe e repassa groupType para
+//     scheduleTimer(). Sem isso, grupos fechados perdiam o sniper silenciosamente
+//     a partir do 2º ciclo.
 //
-//   ZONA 1 — Antes de invokeDeadline: sleep
-//     O sniper pode acordar SNIPER_BEFORE_MS antes, mas não tenta nada.
-//     Usa esse tempo para garantir conexão quente.
+//   BUG #C — FloodWait no sniper gera ~30.000 chamadas em 30s:
+//     Sniper agora detecta FloodWait e aguarda o tempo exato antes de retomar.
+//     Se o wait excede o budget, encerra o loop graciosamente.
 //
-//   ZONA 2 — Entre p10 e p90 (zona de incerteza real): loop 1ms
-//     O grupo pode abrir a qualquer momento nesse intervalo.
-//     Loop agressivo faz sentido aqui.
+//   BUG #D — reloadClient() deleta mutex sem await da promise inflight:
+//     Aguarda a promise em andamento antes de deletar connectingPromises,
+//     evitando AUTH_KEY_DUPLICATED por conexão dupla simultânea.
 //
-//   ZONA 3 — Depois de p90 (atraso incomum): loop 50ms
-//     Algo está fora do padrão. Reduz pressão no rate limit enquanto aguarda.
+//   BUG #E — prewarmAccounts() a cada 30s chama getDialogs em todas as contas:
+//     Prewarm completo (getDialogs + peer pre-resolve) só roda no boot.
+//     O interval periódico chama reconnectDeadClients() — apenas reconecta
+//     clientes offline sem recarregar dialogs.
 //
-// scheduleTimer — ajuste do wake-up para opens_early histórico:
-//   Se p10 < 0, o sniper precisa acordar mais cedo que SNIPER_BEFORE_MS.
-//   sniperDelay = effectiveDelay - SNIPER_BEFORE_MS - Math.max(0, -p10)
-//   Isso garante que o floor seja atingível sem correria de última hora.
+//   BUG #F — makeRandomId com entropia insuficiente (colisão em envios paralelos):
+//     Usa 64 bits reais via shiftLeft(32) na biblioteca big-integer.
 //
-// FIXES v13/v14/v16/v19 MANTIDOS:
-//   - Throttle progressivo suave (base 1ms, começa em 200 too_early)
-//   - Rate limit shield 25 req/s
-//   - SNIPER_TRANSIENT_INTERVAL_MS = 1ms
-//   - clockOffset medido e logado apenas para diagnóstico
-
+//   BUG #G — keepalive sem jitter: spike de N contas simultâneas a cada 45s:
+//     Cada setInterval recebe até 10s de jitter aleatório no boot.
+//
+// Fix v7 (2025-05) — timing logs + calibração SNIPER_BEFORE_MS:
+//
+//   OPT #6 — SNIPER_BEFORE_MS aumentado de 20 para 45ms:
+//     Railway US East → Telegram DC1/DC3 Miami: RTT medido ~50ms (round-trip).
+//     Invoke one-way ~25ms + event loop lag Node.js ~5-15ms = precisa de ~40ms
+//     de antecipação mínima. 45ms dá ~5ms de margem.
+//     Calibrar com os logs [sniper][timing] após alguns disparos reais.
+//
+//   OPT #7 — logs de timing no sniper para diagnóstico preciso:
+//     [sniper][timing] timer lag: Xms   → quanto o setTimeout atrasou
+//     [sniper][timing] invoke RTT: Xms  → tempo real do MTProto
+//     [sniper][timing] vs horário: Xms  → negativo=antes, positivo=atrasado
+//     Com esses dados é possível calibrar SNIPER_BEFORE_MS no valor exato.
+//
+// Fix v8 (2025-05) — randomId estável por ciclo de tentativas:
+//   BUG #H — timeout pós-envio com retry gera mensagem duplicada:
+//     Se o invoke chegar ao Telegram mas o ACK for perdido na rede, o retry
+//     com randomId novo é tratado como mensagem nova pelo Telegram.
+//     sendMessage() e sniperSendOnce() agora geram o randomId UMA vez por
+//     ciclo e reutilizam nos retries — Telegram deduplica automaticamente.
+//
+// Fix v9 (2025-05) — guard de scheduledAt no sniper loop (fase 1):
+//   BUG #I — disparo antes do horário quando grupo abre cedo:
+//     Se a humana abre o grupo antes do scheduledAt, o loop sniper disparava
+//     imediatamente ao conseguir o invoke, causando banimento.
+//     Agora, antes de cada sniperSendOnce() da fase 1, o loop verifica se
+//     já passou o scheduledAt. Se não passou, dorme exatamente o tempo
+//     restante antes de invocar. O invoke só acontece em ou após scheduledAt.
+//     Métrica de sucesso: [sniper][timing] vs horário sempre >= 0ms.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -109,7 +118,7 @@ const RETRY_BUDGET_MS               = 50_000;
 const RELOAD_INTERVAL_MS            = 30_000;
 const LOOKAHEAD_MS                  = 2 * 60 * 1000;
 const KEEPALIVE_INTERVAL_MS         = 45_000;
-const KEEPALIVE_JITTER_MAX_MS       = 10_000;
+const KEEPALIVE_JITTER_MAX_MS       = 10_000; // BUG #G: jitter para evitar spike simultâneo
 const PREFETCH_BEFORE_MS            = 800;
 const MONITOR_DELAY_CLOSED_MS       = 6_000;
 const MONITOR_MAX_OPEN_MS           = 5 * 60_000;
@@ -118,50 +127,19 @@ const LISTEN_POLL_MS                = 400;
 const MONITOR_HISTORY_LIMIT         = 150;
 const OPEN_GROUP_LISTEN_TIMEOUT_MS  = 2 * 60 * 60_000;
 const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
-
-// Quanto antes do horário o sniper acorda — apenas para garantir conexão quente.
-// O invoke só começa em invokeDeadline = scheduledAt + p10 - halfRtt.
-const SNIPER_BEFORE_MS              = 100;
-
-// Busy-spin de precisão no busy-wait final
-const SNIPER_SPIN_MAX_MS            = 2;
-
-const GROUP_PROFILE_SAMPLE_SIZE     = 20;
-const CLOCK_OFFSET_REFRESH_MS       = 5 * 60_000;
-const CLOCK_PROBE_COUNT             = 5;
-
+// OPT #6: era 20ms. Railway US East → DC Miami RTT ~50ms → one-way ~25ms.
+// 45ms cobre o one-way + event loop lag do Node (~5-15ms) com ~5ms de margem.
+// Ajuste fino baseado nos logs [sniper][timing] vs horário abaixo.
+const SNIPER_BEFORE_MS              = 45;
 const SNIPER_SEND_TIMEOUT_MS        = 800;
-
-// Intervalo base do loop too_early (Zona 2) e transient
-const SNIPER_TOO_EARLY_BASE_INTERVAL_MS = 1;
-const SNIPER_TRANSIENT_INTERVAL_MS      = 1;
-
-// Intervalo do loop na Zona 3 (depois de p90 — atraso incomum)
-const SNIPER_LATE_ZONE_INTERVAL_MS      = 50;
-
-// Throttle progressivo — só entra depois de muitas tentativas too_early para
-// não prejudicar grupos que abrem logo após o horário
-const TOO_EARLY_THROTTLE_STEPS: Array<[number, number]> = [
-  [200,      2],
-  [1000,     5],
-  [3000,    10],
-  [Infinity, 15],
-];
-
-// Rate limit shield: 25 req/s por conta
-const SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT = 25;
-
+const SNIPER_ATTEMPT_INTERVAL_MS    = 1;
 const SNIPER_PAUSE_EVERY_N          = 10;
 const SNIPER_PAUSE_MS               = 5;
 const SNIPER_INTER_ACCOUNT_DELAY_MS = 1;
 const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
-const SNIPER_DONE_BLOCK_TTL_MS      = 500;
 
-// Defaults para grupos sem perfil suficiente (< 3 amostras):
-//   p10 = 0  → floor = scheduledAt - halfRtt (nunca antes do horário)
-//   p90 = 30_000ms → Zona 3 só ativa depois de 30s de too_early
-const DEFAULT_P10_MS = 0;
-const DEFAULT_P90_MS = 30_000;
+// BUG #A: após o sniper terminar, bloqueia fireSchedule do mesmo ciclo por este TTL
+const SNIPER_DONE_BLOCK_TTL_MS      = 500;
 
 const WORKER_PORT   = parseInt(process.env.PORT ?? "3001", 10);
 const WORKER_SECRET = process.env.WORKER_SECRET ?? "";
@@ -219,34 +197,6 @@ interface DispatchResult {
   error?: string;
 }
 
-type SniperOutcome = "sent" | "too_early" | "fatal" | "flood" | "transient";
-
-interface SniperAttemptResult {
-  outcome: SniperOutcome;
-  sentAt?: number;
-  floodWaitSecs?: number;
-  errorCode?: string;
-}
-
-interface GroupBehaviorProfile {
-  group_id:                string;
-  offset_p10_ms:           number;
-  offset_p50_ms:           number;
-  offset_p90_ms:           number;
-  // opens_early removido em v20 — substituído por p10/p90 contínuos
-  min_safe_guard_ms:       number;
-  sample_count:            number;
-  open_at_start_ratio:     number;
-  median_too_early_count:  number;
-  estimated_open_delay_ms: number;
-  clock_offset_ms:         number;
-}
-
-interface TokenBucket {
-  tokens:     number;
-  lastRefill: number;
-}
-
 /* ─────────────────────────────────────────────────────────────────────────────
    ESTADO GLOBAL
    ───────────────────────────────────────────────────────────────────────────── */
@@ -264,13 +214,6 @@ const listenMap             = new Map<string, AbortController>();
 const firingNow             = new Set<string>();
 const sniperFiringNow       = new Set<string>();
 const connectingPromises    = new Map<string, Promise<TelegramClient>>();
-const groupProfileCache     = new Map<string, GroupBehaviorProfile>();
-const scheduleGroupMap      = new Map<string, string>();
-const sniperTokenBuckets    = new Map<string, TokenBucket>();
-
-let telegramClockOffsetMs = 0;
-let clockOffsetQuality: "high" | "low" | "unknown" = "unknown";
-let estimatedOneWayRttMs  = 0;
 
 /* ─────────────────────────────────────────────────────────────────────────────
    QUERY REUTILIZADA
@@ -343,37 +286,11 @@ function isRetryDue(schedule: Schedule, now: Date): boolean {
   return now >= new Date(last.getTime() + interval * 1000);
 }
 
+// BUG #F: 64 bits reais de entropia — shiftLeft(32) na big-integer lib.
 function makeRandomId(): bigInt.BigInteger {
   const hi = Math.floor(Math.random() * 0xFFFFFFFF);
   const lo = Math.floor(Math.random() * 0xFFFFFFFF);
   return bigInt(hi).shiftLeft(32).add(bigInt(lo));
-}
-
-function getTooEarlyIntervalMs(tooEarlyCount: number): number {
-  for (const [limit, intervalMs] of TOO_EARLY_THROTTLE_STEPS) {
-    if (tooEarlyCount < limit) return intervalMs;
-  }
-  return 15;
-}
-
-/**
- * Retorna o p10 efetivo do grupo.
- * INVARIANTE DE SEGURANÇA: retorna DEFAULT_P10_MS (0) se não há perfil
- * suficiente, garantindo que o floor nunca recue sem respaldo histórico.
- */
-function getEffectiveP10(profile: GroupBehaviorProfile | undefined): number {
-  if (!profile || profile.sample_count < 3) return DEFAULT_P10_MS;
-  return profile.offset_p10_ms;
-}
-
-/**
- * Retorna o p90 efetivo do grupo.
- * Sem perfil suficiente, usa DEFAULT_P90_MS (30s) para cobrir o range
- * completo sem assumir nada sobre o comportamento do grupo.
- */
-function getEffectiveP90(profile: GroupBehaviorProfile | undefined): number {
-  if (!profile || profile.sample_count < 3) return DEFAULT_P90_MS;
-  return profile.offset_p90_ms;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -385,270 +302,6 @@ function evictPeersForAccount(accountId: string): void {
     if (key.startsWith(`${accountId}:`)) {
       peerCache.delete(key);
     }
-  }
-}
-
-/* ─────────────────────────────────────────────────────────────────────────────
-   TOKEN BUCKET RATE LIMITER
-   ───────────────────────────────────────────────────────────────────────────── */
-
-function acquireTokenBucket(accountId: string): number {
-  const now   = Date.now();
-  let bucket  = sniperTokenBuckets.get(accountId);
-
-  if (!bucket) {
-    bucket = { tokens: SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT, lastRefill: now };
-    sniperTokenBuckets.set(accountId, bucket);
-  }
-
-  const elapsed   = now - bucket.lastRefill;
-  const newTokens = (elapsed / 1000) * SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT;
-
-  if (newTokens >= 1) {
-    bucket.tokens    = Math.min(SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT, bucket.tokens + Math.floor(newTokens));
-    bucket.lastRefill = now;
-  }
-
-  if (bucket.tokens >= 1) {
-    bucket.tokens--;
-    return 0;
-  }
-
-  const msPerToken = 1000 / SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT;
-  return Math.ceil(msPerToken - elapsed % msPerToken);
-}
-
-/* ─────────────────────────────────────────────────────────────────────────────
-   MEDIÇÃO DE CLOCK OFFSET MULTI-PROBE
-   ───────────────────────────────────────────────────────────────────────────── */
-
-async function measureClockOffsetViaSelfSend(client: TelegramClient): Promise<number> {
-  const probes: number[] = [];
-  const probe_rtt: number[] = [];
-
-  for (let i = 0; i < CLOCK_PROBE_COUNT; i++) {
-    try {
-      const t0 = Date.now();
-      const result = await Promise.race([
-        client.invoke(new Api.messages.SendMessage({
-          peer:      new Api.InputPeerSelf(),
-          message:   `[clock-probe-${Date.now()}]`,
-          randomId:  makeRandomId(),
-          noWebpage: true,
-        })) as Promise<any>,
-        new Promise<never>((_, r) => setTimeout(() => r(new Error("PROBE_TIMEOUT")), 3_000)),
-      ]);
-      const t1  = Date.now();
-      const rtt = t1 - t0;
-
-      let serverDateSec: number | null = null;
-      if (result?.date) {
-        serverDateSec = result.date;
-      } else if (result?.updates) {
-        const upd = result.updates?.find?.((u: any) => u?.date);
-        if (upd?.date) serverDateSec = upd.date;
-      }
-
-      if (serverDateSec != null) {
-        const serverTimeMs   = serverDateSec * 1000 + 500;
-        const localMidpoint  = t0 + rtt / 2;
-        const offset         = serverTimeMs - localMidpoint;
-        probes.push(offset);
-        probe_rtt.push(rtt);
-      }
-
-      if (i < CLOCK_PROBE_COUNT - 1) {
-        await new Promise(r => setTimeout(r, 200));
-      }
-    } catch {
-      // probe falhou — ignora
-    }
-  }
-
-  if (probes.length === 0) return telegramClockOffsetMs;
-
-  const avgRtt   = probe_rtt.reduce((a, b) => a + b, 0) / probe_rtt.length;
-  const stdRtt   = Math.sqrt(probe_rtt.map(r => (r - avgRtt) ** 2).reduce((a, b) => a + b, 0) / probe_rtt.length);
-  const filtered = probes.filter((_, i) => probe_rtt[i] <= avgRtt + 2 * stdRtt);
-
-  if (filtered.length === 0) return telegramClockOffsetMs;
-
-  const sorted = [...filtered].sort((a, b) => a - b);
-  const median = sorted[Math.floor(sorted.length / 2)];
-
-  if (Math.abs(median) > 10_000) {
-    console.warn(`[clock] Offset mediano descartado (${Math.round(median)}ms > 10s) — mantendo ${telegramClockOffsetMs}ms`);
-    return telegramClockOffsetMs;
-  }
-
-  const filteredRtts = probe_rtt.filter((_, i) => probe_rtt[i] <= avgRtt + 2 * stdRtt);
-  if (filteredRtts.length > 0) {
-    const avgFilteredRtt = filteredRtts.reduce((a, b) => a + b, 0) / filteredRtts.length;
-    estimatedOneWayRttMs = Math.max(0, Math.round(avgFilteredRtt / 2));
-  }
-
-  console.log(
-    `[clock] Multi-probe self-send: ${filtered.length}/${CLOCK_PROBE_COUNT} probes válidos | ` +
-    `offsets=[${filtered.map(o => Math.round(o)).join(",")}]ms | ` +
-    `mediana=${Math.round(median)}ms | avgRtt=${Math.round(avgRtt)}ms | halfRtt=${estimatedOneWayRttMs}ms`
-  );
-
-  return Math.round(median);
-}
-
-async function measureTelegramClockOffset(client: TelegramClient): Promise<number> {
-  try {
-    const offset = await measureClockOffsetViaSelfSend(client);
-    clockOffsetQuality = "high";
-    return offset;
-  } catch (err: any) {
-    console.warn(`[clock] Self-send falhou (${err.message}) — caindo em GetConfig`);
-  }
-
-  try {
-    const t0     = Date.now();
-    const config = await (client as any).invoke(new Api.help.GetConfig()) as any;
-    const t1     = Date.now();
-
-    if (typeof config?.date !== "number") return telegramClockOffsetMs;
-
-    const rttMs           = t1 - t0;
-    const serverTimeMs    = config.date * 1000 + 500;
-    const localAtMidpoint = t0 + rttMs / 2;
-    const offsetMs        = serverTimeMs - localAtMidpoint;
-
-    if (Math.abs(offsetMs) > 5_000) return telegramClockOffsetMs;
-
-    clockOffsetQuality = "low";
-    console.log(`[clock] GetConfig fallback: offset=${Math.round(offsetMs)}ms rtt=${rttMs}ms`);
-    return Math.round(offsetMs);
-  } catch (err: any) {
-    console.warn(`[clock] GetConfig também falhou: ${err.message}`);
-    return telegramClockOffsetMs;
-  }
-}
-
-/* ─────────────────────────────────────────────────────────────────────────────
-   PERFIS DE TIMING ADAPTATIVO
-   ───────────────────────────────────────────────────────────────────────────── */
-
-async function loadGroupProfiles(): Promise<void> {
-  try {
-    const { data, error } = await supabase
-      .from("group_profiles")
-      .select(
-        "group_id, offset_p10_ms, offset_p50_ms, offset_p90_ms, " +
-        "min_safe_guard_ms, sample_count, " +
-        "open_at_start_ratio, median_too_early_count, estimated_open_delay_ms"
-      );
-
-    if (error) {
-      console.warn("[profiles] Falha ao carregar perfis de grupo:", error.message);
-      return;
-    }
-
-    for (const row of data ?? []) {
-      if (!row || typeof row !== "object" || !('group_id' in row)) continue;
-      groupProfileCache.set((row as any).group_id as string, {
-        ...(row as any),
-        open_at_start_ratio:     (row as any).open_at_start_ratio     ?? 0,
-        median_too_early_count:  (row as any).median_too_early_count  ?? 0,
-        estimated_open_delay_ms: (row as any).estimated_open_delay_ms ?? 0,
-        clock_offset_ms:         0,
-      } as GroupBehaviorProfile);
-    }
-
-    console.log(`[profiles] ✅ ${groupProfileCache.size} perfis de timing carregados`);
-  } catch (err: any) {
-    console.warn("[profiles] Erro ao carregar perfis:", err.message);
-  }
-}
-
-async function persistGroupDispatchSample(
-  groupId: string,
-  vsHorarioMs: number,
-  tooEarlyCount: number
-): Promise<void> {
-  try {
-    const { error: insertErr } = await supabase
-      .from("group_dispatch_samples")
-      .insert({ group_id: groupId, vs_horario_ms: vsHorarioMs, too_early_count: tooEarlyCount });
-
-    if (insertErr) console.warn(`[profiles] Falha ao inserir amostra para ${groupId}:`, insertErr.message);
-
-    const { data, error: fetchErr } = await supabase
-      .from("group_dispatch_samples")
-      .select("vs_horario_ms, too_early_count")
-      .eq("group_id", groupId)
-      .order("created_at", { ascending: false })
-      .limit(GROUP_PROFILE_SAMPLE_SIZE);
-
-    if (fetchErr || !data || data.length === 0) return;
-
-    const vsHorarioSamples = data.map(r => r.vs_horario_ms as number);
-    const sortedVs         = [...vsHorarioSamples].sort((a, b) => a - b);
-    const n                = sortedVs.length;
-
-    const p10 = sortedVs[Math.max(0, Math.floor(n * 0.10))] ?? sortedVs[0];
-    const p50 = sortedVs[Math.max(0, Math.floor(n * 0.50))] ?? sortedVs[0];
-    const p90 = sortedVs[Math.min(n - 1, Math.floor(n * 0.90))] ?? sortedVs[n - 1];
-
-    const tooEarlyCounts         = data.map(r => (r.too_early_count as number) ?? 0);
-    const openAtStartRatio       = tooEarlyCounts.filter(c => c === 0).length / n;
-    const sortedTooEarly         = [...tooEarlyCounts].sort((a, b) => a - b);
-    const medianTooEarlyCount    = sortedTooEarly[Math.floor(n / 2)] ?? 0;
-    const estimatedOpenDelayMs   = medianTooEarlyCount * SNIPER_TOO_EARLY_BASE_INTERVAL_MS;
-
-    // min_safe_guard_ms mantido para compatibilidade com versões anteriores
-    const min_safe_guard_ms = p10 < 0
-      ? Math.max(-30_000, p10 - 50)
-      : Math.max(0, estimatedOpenDelayMs - 20);
-
-    const profile: GroupBehaviorProfile = {
-      group_id:               groupId,
-      offset_p10_ms:          p10,
-      offset_p50_ms:          p50,
-      offset_p90_ms:          p90,
-      min_safe_guard_ms,
-      sample_count:           n,
-      open_at_start_ratio:    openAtStartRatio,
-      median_too_early_count: medianTooEarlyCount,
-      estimated_open_delay_ms: estimatedOpenDelayMs,
-      clock_offset_ms:        telegramClockOffsetMs,
-    };
-
-    groupProfileCache.set(groupId, profile);
-
-    const { error: upsertErr } = await supabase
-      .from("group_profiles")
-      .upsert(
-        {
-          group_id:               groupId,
-          offset_p10_ms:          p10,
-          offset_p50_ms:          p50,
-          offset_p90_ms:          p90,
-          min_safe_guard_ms,
-          sample_count:           n,
-          open_at_start_ratio:    openAtStartRatio,
-          median_too_early_count: medianTooEarlyCount,
-          estimated_open_delay_ms: estimatedOpenDelayMs,
-          updated_at:             new Date().toISOString(),
-        },
-        { onConflict: "group_id" }
-      );
-
-    if (upsertErr) {
-      console.warn(`[profiles] Falha ao salvar perfil para ${groupId}:`, upsertErr.message);
-    } else {
-      console.log(
-        `[profiles] ✅ group=${groupId} ` +
-        `p10=${p10}ms p50=${p50}ms p90=${p90}ms ` +
-        `openAtStart=${(openAtStartRatio * 100).toFixed(0)}% ` +
-        `medianTooEarly=${medianTooEarlyCount} openDelay≈${estimatedOpenDelayMs}ms n=${n}`
-      );
-    }
-  } catch (err: any) {
-    console.warn(`[profiles] Erro ao persistir amostra para ${groupId}:`, err.message);
   }
 }
 
@@ -689,14 +342,17 @@ async function getClient(account: Account): Promise<TelegramClient> {
     );
 
     (client as any)._loopStarted = true;
+
     await client.connect();
 
     clients.set(account.id, client);
     sessions.set(account.id, account.session_string);
 
+    // BUG #G: jitter aleatório de até 10s
     const jitter   = Math.floor(Math.random() * KEEPALIVE_JITTER_MAX_MS);
     const interval = setInterval(async () => {
       if (!client.connected) {
+        console.warn(`[keepalive] ${account.phone_number} desconectou — removendo do pool`);
         clients.delete(account.id);
         evictPeersForAccount(account.id);
         keepaliveTimers.delete(account.id);
@@ -706,7 +362,9 @@ async function getClient(account: Account): Promise<TelegramClient> {
       try {
         await Promise.race([
           client.getMe(),
-          new Promise<never>((_, r) => setTimeout(() => r(new Error("keepalive timeout")), 10_000)),
+          new Promise<never>((_, r) =>
+            setTimeout(() => r(new Error("keepalive timeout")), 10_000)
+          ),
         ]);
       } catch (err: any) {
         console.warn(`[keepalive] Ping falhou para ${account.phone_number}: ${err.message}`);
@@ -718,9 +376,10 @@ async function getClient(account: Account): Promise<TelegramClient> {
 
         const authDead =
           err.message?.includes("AUTH_KEY_UNREGISTERED") ||
-          err.message?.includes("USER_DEACTIVATED")      ||
+          err.message?.includes("USER_DEACTIVATED") ||
           err.message?.includes("SESSION_REVOKED");
         if (authDead) {
+          console.warn(`[keepalive] Sessão morta: ${account.phone_number} — desativando no banco`);
           supabase.from("accounts").update({ is_active: false }).eq("id", account.id).then(({ error: e }) => {
             if (e) console.error(`[keepalive] Falha ao desativar ${account.id}:`, e.message);
           });
@@ -741,6 +400,7 @@ async function getClient(account: Account): Promise<TelegramClient> {
   }
 }
 
+// BUG #D: aguarda promise inflight antes de deletar o mutex
 async function reloadClient(account: Account): Promise<TelegramClient> {
   const inflight = connectingPromises.get(account.id);
   if (inflight) {
@@ -811,6 +471,7 @@ async function resolvePeer(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    ENVIO COM RETRY INTERNO
+   BUG #H: randomId gerado uma vez por ciclo e reutilizado nos retries.
    ───────────────────────────────────────────────────────────────────────────── */
 async function sendMessage(
   client: TelegramClient,
@@ -818,9 +479,10 @@ async function sendMessage(
   telegramChatId: string,
   messageText: string
 ): Promise<void> {
-  const budgetEnd      = Date.now() + RETRY_BUDGET_MS;
+  const budgetEnd = Date.now() + RETRY_BUDGET_MS;
+  // BUG #H: gerado uma vez — reutilizado em todos os retries do mesmo ciclo.
   const stableRandomId = makeRandomId();
-  let attempt          = 0;
+  let attempt = 0;
 
   while (Date.now() < budgetEnd) {
     attempt++;
@@ -831,41 +493,80 @@ async function sendMessage(
       await Promise.race([
         (async () => {
           const peer = await resolvePeer(client, telegramChatId, account.id);
+
           try {
             await client.invoke(new Api.messages.SendMessage({
-              peer: peer as any, message: messageText, randomId: stableRandomId, noWebpage: true,
+              peer:      peer as any,
+              message:   messageText,
+              randomId:  stableRandomId,
+              noWebpage: true,
             }));
+
           } catch (err: any) {
             const errMsg = String(err?.message ?? "");
-            if (errMsg.includes("PEER_ID_INVALID") || errMsg.includes("CHANNEL_INVALID") || errMsg.includes("CHANNEL_PRIVATE")) {
+
+            if (
+              errMsg.includes("PEER_ID_INVALID") ||
+              errMsg.includes("CHANNEL_INVALID") ||
+              errMsg.includes("CHANNEL_PRIVATE")
+            ) {
               peerCache.delete(`${account.id}:${telegramChatId}`);
             }
-            const isFlood = err?.seconds != null || err?.constructor?.name === "FloodWaitError" || /flood/i.test(errMsg);
+
+            const isFlood =
+              err?.seconds != null ||
+              err?.constructor?.name === "FloodWaitError" ||
+              /flood/i.test(errMsg);
+
             if (isFlood) {
-              const waitSecs = typeof err.seconds === "number" ? err.seconds : parseInt(errMsg.match(/(\d+)/)?.[1] ?? "30", 10);
-              const waitMs   = waitSecs * 1000;
+              const waitSecs: number =
+                typeof err.seconds === "number"
+                  ? err.seconds
+                  : parseInt(errMsg.match(/(\d+)/)?.[1] ?? "30", 10);
+              const waitMs = waitSecs * 1000;
+              console.warn(`[send] FloodWait ${waitSecs}s — ${account.phone_number}`);
+
               if (waitMs < budgetEnd - Date.now() - 500) {
                 await new Promise(r => setTimeout(r, waitMs));
                 peerCache.delete(`${account.id}:${telegramChatId}`);
                 const freshPeer = await resolvePeer(client, telegramChatId, account.id);
-                await client.invoke(new Api.messages.SendMessage({ peer: freshPeer as any, message: messageText, randomId: stableRandomId, noWebpage: true }));
+                await client.invoke(new Api.messages.SendMessage({
+                  peer:      freshPeer as any,
+                  message:   messageText,
+                  randomId:  stableRandomId,
+                  noWebpage: true,
+                }));
                 return;
               }
               throw new Error(`FLOOD_WAIT_${waitSecs}_EXCEEDS_BUDGET`);
             }
+
             throw err;
           }
         })(),
-        new Promise<never>((_, r) => setTimeout(() => r(new Error(`TIMEOUT tentativa ${attempt}`)), Math.min(SEND_TIMEOUT_MS, timeLeft - 100))),
+        new Promise<never>((_, r) =>
+          setTimeout(
+            () => r(new Error(`TIMEOUT tentativa ${attempt}`)),
+            Math.min(SEND_TIMEOUT_MS, timeLeft - 100)
+          )
+        ),
       ]);
+
       if (attempt > 1) console.log(`[send] ✓ ${account.phone_number} — enviou na tentativa ${attempt}`);
       return;
+
     } catch (err: any) {
       const remaining = budgetEnd - Date.now();
       if (remaining > 500) {
         const backoffMs   = Math.min(1_000 * Math.pow(2, attempt - 1), SEND_RETRY_BACKOFF_MAX_MS);
         const safeBackoff = Math.min(backoffMs, remaining - 500);
-        if (safeBackoff > 0) await new Promise(r => setTimeout(r, safeBackoff));
+        console.warn(
+          `[send] tentativa ${attempt} falhou — aguardando ${safeBackoff}ms ` +
+          `(${Math.round(remaining / 1000)}s restantes): ${err.message}`
+        );
+        if (safeBackoff > 0) {
+          await new Promise(r => setTimeout(r, safeBackoff));
+        }
       }
     }
   }
@@ -874,75 +575,33 @@ async function sendMessage(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   SNIPER — TENTATIVA CLASSIFICADA
+   SNIPER — ENVIO ÚNICO COM TIMEOUT CURTO (sem retry interno)
+   BUG #H: randomId recebido como parâmetro — gerado uma vez no loop do sniper.
    ───────────────────────────────────────────────────────────────────────────── */
-async function sniperAttemptOnce(
+async function sniperSendOnce(
   client: TelegramClient,
   account: Account,
   telegramChatId: string,
   messageText: string,
   randomId: bigInt.BigInteger
-): Promise<SniperAttemptResult> {
-  try {
-    const peer = await resolvePeer(client, telegramChatId, account.id);
-    await Promise.race([
-      client.invoke(new Api.messages.SendMessage({
-        peer: peer as any, message: messageText, randomId, noWebpage: true,
-      })),
-      new Promise<never>((_, r) => setTimeout(() => r(new Error("SNIPER_TIMEOUT")), SNIPER_SEND_TIMEOUT_MS)),
-    ]);
-    return { outcome: "sent", sentAt: Date.now() };
-  } catch (err: any) {
-    const msg = String(err?.message ?? "");
+): Promise<void> {
+  const peer = await resolvePeer(client, telegramChatId, account.id);
 
-    if (
-      msg.includes("CHAT_WRITE_FORBIDDEN")       ||
-      msg.includes("CHAT_SEND_PLAIN_FORBIDDEN")  ||
-      msg.includes("CHAT_SEND_MEDIA_FORBIDDEN")  ||
-      msg.includes("CHAT_RESTRICTED")
-    ) {
-      return { outcome: "too_early", errorCode: msg };
-    }
-
-    if (msg.includes("MESSAGE_ID_INVALID") || msg.includes("RANDOM_ID_DUPLICATE")) {
-      return { outcome: "sent", sentAt: Date.now() };
-    }
-
-    if (msg.includes("AUTH_KEY_UNREGISTERED") || msg.includes("USER_DEACTIVATED") || msg.includes("SESSION_REVOKED")) {
-      return { outcome: "fatal", errorCode: msg };
-    }
-
-    const isFlood = err?.seconds != null || err?.constructor?.name === "FloodWaitError" || /flood/i.test(msg);
-    if (isFlood) {
-      const floodWaitSecs = typeof err.seconds === "number" ? err.seconds : parseInt(msg.match(/(\d+)/)?.[1] ?? "5", 10);
-      return { outcome: "flood", floodWaitSecs, errorCode: msg };
-    }
-
-    if (msg.includes("PEER_ID_INVALID") || msg.includes("CHANNEL_INVALID") || msg.includes("CHANNEL_PRIVATE")) {
-      peerCache.delete(`${account.id}:${telegramChatId}`);
-    }
-
-    return { outcome: "transient", errorCode: msg };
-  }
+  await Promise.race([
+    client.invoke(new Api.messages.SendMessage({
+      peer:      peer as any,
+      message:   messageText,
+      randomId,
+      noWebpage: true,
+    })),
+    new Promise<never>((_, r) =>
+      setTimeout(() => r(new Error("SNIPER_TIMEOUT")), SNIPER_SEND_TIMEOUT_MS)
+    ),
+  ]);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
    SNIPER LOOP — GRUPOS FECHADOS
-   ═══════════════════════════════════════════════════════════════════════════
-   FILOSOFIA v20:
-     invokeDeadline = scheduledAt + p10 - halfRtt
-
-     p10 é o percentil 10 do histórico real de quando o grupo abriu.
-     Sem perfil suficiente, p10 = 0 → deadline = scheduledAt - halfRtt.
-
-     INVARIANTE: o sistema NUNCA envia antes do horário sem respaldo histórico.
-     O recuo do floor só acontece se os dados confirmam que o grupo já abriu
-     antes em semanas anteriores.
-
-   ZONAS DO LOOP:
-     Zona 1 → antes de invokeDeadline: sleep (conexão quente, sem tentativas)
-     Zona 2 → [p10, p90]: loop agressivo 1ms (zona de incerteza real)
-     Zona 3 → depois de p90: loop 50ms (atraso incomum, reduz pressão)
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperFireClosed(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -951,6 +610,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
   }
   sniperFiringNow.add(scheduleId);
 
+  // OPT #7: captura o timestamp exato de entrada para medir o lag do timer
   const sniperEnteredAt = Date.now();
 
   try {
@@ -962,8 +622,11 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       console.log(`[sniper] ⚡ Schedule ${scheduleId} servido do pre-fetch cache`);
     } else {
       const { data, error } = await supabase
-        .from("schedules").select(SCHEDULE_SELECT)
-        .eq("id", scheduleId).eq("is_active", true).single();
+        .from("schedules")
+        .select(SCHEDULE_SELECT)
+        .eq("id", scheduleId)
+        .eq("is_active", true)
+        .single();
       if (error || !data) {
         console.warn(`[sniper] Schedule ${scheduleId} não encontrado ou inativo.`);
         return;
@@ -971,9 +634,14 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       schedule = data as unknown as Schedule;
     }
 
-    const scheduledAt = new Date(schedule.next_run_at).getTime();
+    // OPT #7: log do lag do timer (quanto o setTimeout atrasou em relação ao planejado)
+    const scheduledAt      = new Date(schedule.next_run_at).getTime();
+    const plannedSniperAt  = scheduledAt - SNIPER_BEFORE_MS;
+    const timerLagMs       = sniperEnteredAt - plannedSniperAt;
+    console.log(`[sniper][timing] timer lag: ${timerLagMs}ms (SNIPER_BEFORE_MS=${SNIPER_BEFORE_MS}, ideal=0)`);
 
     const group = schedule.groups;
+
     if (!group?.telegram_chat_id) {
       console.warn(`[sniper] Schedule ${scheduleId}: sem telegram_chat_id — pulando.`);
       return;
@@ -997,7 +665,11 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
     const chatId    = group.telegram_chat_id;
     const budgetEnd = Date.now() + SNIPER_BUDGET_MS;
+    const results:  DispatchResult[] = [];
 
+    console.log(`[sniper] 🎯 Iniciando loop agressivo para schedule ${scheduleId} — ${members.length} conta(s)`);
+
+    // ── FASE 1: loop agressivo na primeira conta ──────────────────────────
     const firstMember  = members[0];
     const firstAccount = firstMember.accounts!;
     const firstText    = firstMember.message_text ?? "";
@@ -1007,176 +679,126 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       firstClient = await getClient(firstAccount);
     } catch (err: any) {
       console.error(`[sniper] Falha ao conectar ${firstAccount.phone_number}: ${err.message}`);
-      const results: DispatchResult[] = [{
-        account_id: firstAccount.id, message_text: firstMember.message_text,
-        status: "failed", retryable: isRetryableError(err.message), error: err.message,
-      }];
+      results.push({
+        account_id:   firstAccount.id,
+        message_text: firstMember.message_text,
+        status:       "failed",
+        retryable:    isRetryableError(err.message),
+        error:        err.message,
+      });
       await updateScheduleAfterDispatch(schedule, results, now, "closed");
       return;
     }
 
-    // ── Perfil do grupo ───────────────────────────────────────────────────
-    const profile  = groupProfileCache.get(group.id);
-    const p10      = getEffectiveP10(profile);
-    const p90      = getEffectiveP90(profile);
-    const hasProfile = (profile?.sample_count ?? 0) >= 3;
-
-    // ── invokeDeadline (v20): scheduledAt + p10 - halfRtt ────────────────
-    //
-    // INVARIANTE DE SEGURANÇA:
-    //   p10 = 0 para grupos sem perfil → deadline = scheduledAt - halfRtt
-    //   O pacote chega ao Telegram exatamente em scheduledAt.
-    //
-    //   p10 < 0 apenas se o histórico real confirma abertura antecipada.
-    //   p10 > 0 se o grupo consistentemente abre depois do horário.
-    //
-    const invokeDeadline  = scheduledAt + p10 - estimatedOneWayRttMs;
-    const p90Deadline     = scheduledAt + p90;
-    const msUntilDeadline = invokeDeadline - Date.now();
-
-    const timerLagMs = sniperEnteredAt - (scheduledAt - SNIPER_BEFORE_MS - Math.max(0, -p10));
-
-    console.log(
-      `[sniper][timing] entrou ${Math.abs(timerLagMs)}ms ${timerLagMs >= 0 ? "após" : "antes d"}o planejado | ` +
-      `scheduledAt=${new Date(scheduledAt).toISOString()} | ` +
-      `p10=${p10}ms p90=${p90}ms (perfil: ${hasProfile ? `${profile!.sample_count} amostras` : "padrão"}) | ` +
-      `halfRtt=${estimatedOneWayRttMs}ms | clockOffset_diag=${telegramClockOffsetMs}ms`
-    );
-
-    console.log(
-      `[sniper][timing] invokeDeadline(v20) = scheduledAt + p10 - halfRtt = ` +
-      `${scheduledAt} + ${p10} - ${estimatedOneWayRttMs} = ${invokeDeadline} | ` +
-      `(${msUntilDeadline > 0 ? "+" : ""}${Math.round(msUntilDeadline)}ms até deadline)`
-    );
-
-    // ── Zona 1: sleep até invokeDeadline ─────────────────────────────────
-    // Usa o tempo para garantir conexão quente. Sem tentativas.
-    if (msUntilDeadline > SNIPER_SPIN_MAX_MS) {
-      const sleepMs = msUntilDeadline - SNIPER_SPIN_MAX_MS;
-      await new Promise(r => setTimeout(r, sleepMs));
-    }
-    // Busy-spin de precisão sub-milissegundo
-    while (Date.now() < invokeDeadline) { /* spin */ }
-
-    const vsScheduledAtDeadline = Date.now() - scheduledAt;
-    console.log(
-      `[sniper][timing] invokeDeadline atingido | ` +
-      `${vsScheduledAtDeadline >= 0 ? "+" : ""}${vsScheduledAtDeadline}ms vs scheduledAt`
-    );
-
-    sniperTokenBuckets.set(firstAccount.id, {
-      tokens:     SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT,
-      lastRefill: Date.now(),
-    });
-
-    // ── Fase 1: loop agressivo na primeira conta ──────────────────────────
-    const results: DispatchResult[] = [];
     let attempt        = 0;
-    let tooEarlyCount  = 0;
     let firstSentAt: Date | null = null;
+    // BUG #H: gerado uma vez — reutilizado em todos os retries do loop sniper.
     const firstRandomId = makeRandomId();
 
     while (Date.now() < budgetEnd) {
       attempt++;
 
-      // Determina a zona atual para ajustar o intervalo
-      const now_ms  = Date.now();
-      const isZone3 = now_ms > p90Deadline; // depois de p90 — atraso incomum
-
-      // Rate limit shield
-      const waitForToken = acquireTokenBucket(firstAccount.id);
-      if (waitForToken > 0) {
-        await new Promise(r => setTimeout(r, waitForToken));
+      // ── BUG #I: guard de scheduledAt ─────────────────────────────────────
+      // Nunca invocar SendMessage antes do horário agendado.
+      // O loop pode estar rodando (aquecendo peer, aguardando grupo abrir),
+      // mas o invoke só acontece em ou após scheduledAt.
+      const msUntilScheduled = scheduledAt - Date.now();
+      if (msUntilScheduled > 0) {
+        console.log(`[sniper] ⏳ Aguardando scheduledAt (faltam ${msUntilScheduled}ms) — tentativa ${attempt}`);
+        await new Promise(r => setTimeout(r, msUntilScheduled));
+        // Após o sleep, verifica budget novamente
+        if (Date.now() >= budgetEnd) break;
       }
+      // ─────────────────────────────────────────────────────────────────────
 
-      const result = await sniperAttemptOnce(firstClient, firstAccount, chatId, firstText, firstRandomId);
+      try {
+        await sniperSendOnce(firstClient, firstAccount, chatId, firstText, firstRandomId);
+        firstSentAt = new Date();
 
-      if (result.outcome === "sent") {
-        firstSentAt = new Date(result.sentAt!);
+        // OPT #7: logs de timing para calibração de SNIPER_BEFORE_MS
+        const invokeRttMs  = firstSentAt.getTime() - sniperEnteredAt;
+        const vsHorarioMs  = firstSentAt.getTime() - scheduledAt;
+        console.log(`[sniper][timing] invoke RTT: ${invokeRttMs}ms (tempo real do MTProto+network)`);
+        console.log(`[sniper][timing] vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms (negativo=antes, positivo=atrasado) tentativa=${attempt}`);
 
-        const invokeRttMs = firstSentAt.getTime() - sniperEnteredAt;
-        const vsHorarioMs = firstSentAt.getTime() - scheduledAt;
-
-        console.log(`[sniper][timing] invoke RTT total: ${invokeRttMs}ms`);
-        console.log(
-          `[sniper][timing] vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms | ` +
-          `tentativa=${attempt} tooEarly=${tooEarlyCount} ` +
-          `zona=${isZone3 ? "3 (tardio)" : "2 (normal)"} | ` +
-          `p10=${p10}ms p90=${p90}ms`
-        );
-        console.log(`[sniper] ✓ ${firstAccount.phone_number} enviou na tentativa ${attempt} (${firstSentAt.toISOString()})`);
-
+        console.log(`[sniper] ✓ Primeira conta ${firstAccount.phone_number} enviou na tentativa ${attempt} (${firstSentAt.toISOString()})`);
         results.push({
-          account_id: firstAccount.id, message_text: firstMember.message_text,
-          status: "sent", retryable: false,
+          account_id:   firstAccount.id,
+          message_text: firstMember.message_text,
+          status:       "sent",
+          retryable:    false,
         });
-
-        persistGroupDispatchSample(group.id, vsHorarioMs, tooEarlyCount).catch(e =>
-          console.warn("[profiles] Erro ao persistir amostra:", e.message)
-        );
-
         break;
-      }
+      } catch (err: any) {
+        const errMsg = String(err?.message ?? "");
+        const isFatal =
+          errMsg.includes("AUTH_KEY_UNREGISTERED") ||
+          errMsg.includes("USER_DEACTIVATED")      ||
+          errMsg.includes("SESSION_REVOKED");
 
-      if (result.outcome === "too_early") {
-        tooEarlyCount++;
-
-        if (isZone3) {
-          // Zona 3: atraso incomum — reduz pressão no rate limit
-          if (tooEarlyCount % 50 === 0) {
-            console.log(`[sniper] ⏳ too_early×${tooEarlyCount} — Zona 3 (p90+${Date.now() - p90Deadline}ms) → ${SNIPER_LATE_ZONE_INTERVAL_MS}ms`);
-          }
-          await new Promise(r => setTimeout(r, SNIPER_LATE_ZONE_INTERVAL_MS));
-        } else {
-          // Zona 2: incerteza real — loop agressivo com throttle progressivo
-          const intervalMs = getTooEarlyIntervalMs(tooEarlyCount);
-          if (tooEarlyCount % 200 === 0) {
-            console.log(`[sniper] ⏳ too_early×${tooEarlyCount} — Zona 2 — intervalo: ${intervalMs}ms`);
-          }
-          await new Promise(r => setTimeout(r, intervalMs));
+        if (isFatal) {
+          console.error(`[sniper] Erro fatal na conta ${firstAccount.phone_number}: ${errMsg}`);
+          results.push({
+            account_id:   firstAccount.id,
+            message_text: firstMember.message_text,
+            status:       "failed",
+            retryable:    false,
+            error:        errMsg,
+          });
+          await updateScheduleAfterDispatch(schedule, results, now, "closed");
+          return;
         }
-        continue;
-      }
 
-      if (result.outcome === "fatal") {
-        console.error(`[sniper] Erro fatal na conta ${firstAccount.phone_number}: ${result.errorCode}`);
-        results.push({
-          account_id: firstAccount.id, message_text: firstMember.message_text,
-          status: "failed", retryable: false, error: result.errorCode,
-        });
-        await updateScheduleAfterDispatch(schedule, results, now, "closed");
-        return;
-      }
+        // BUG #C: FloodWait — aguarda tempo exato antes de retomar
+        const isFlood =
+          err?.seconds != null ||
+          err?.constructor?.name === "FloodWaitError" ||
+          /flood/i.test(errMsg);
 
-      if (result.outcome === "flood") {
-        const waitMs = (result.floodWaitSecs ?? 5) * 1000;
-        console.warn(`[sniper] FloodWait ${result.floodWaitSecs}s`);
-        if (waitMs < budgetEnd - Date.now() - 500) {
-          await new Promise(r => setTimeout(r, waitMs));
-          continue;
-        } else {
-          console.warn(`[sniper] FloodWait excede budget — encerrando loop`);
-          break;
+        if (isFlood) {
+          const waitSecs = typeof err.seconds === "number"
+            ? err.seconds
+            : parseInt(errMsg.match(/(\d+)/)?.[1] ?? "5", 10);
+          const waitMs = waitSecs * 1000;
+          console.warn(`[sniper] FloodWait ${waitSecs}s — pausando loop (budget restante: ${Math.round((budgetEnd - Date.now()) / 1000)}s)`);
+          if (waitMs < budgetEnd - Date.now() - 500) {
+            await new Promise(r => setTimeout(r, waitMs));
+            continue;
+          } else {
+            console.warn(`[sniper] FloodWait ${waitSecs}s excede budget — encerrando loop`);
+            break;
+          }
         }
-      }
 
-      // transient: 1ms base (Zona 2) ou 50ms (Zona 3)
-      if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
-        await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
-      } else {
-        await new Promise(r => setTimeout(r, isZone3 ? SNIPER_LATE_ZONE_INTERVAL_MS : SNIPER_TRANSIENT_INTERVAL_MS));
+        if (
+          errMsg.includes("PEER_ID_INVALID") ||
+          errMsg.includes("CHANNEL_INVALID") ||
+          errMsg.includes("CHANNEL_PRIVATE")
+        ) {
+          peerCache.delete(`${firstAccount.id}:${chatId}`);
+        }
+
+        if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
+          await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
+        } else {
+          await new Promise(r => setTimeout(r, SNIPER_ATTEMPT_INTERVAL_MS));
+        }
       }
     }
 
-    // Log da primeira conta
+    // Log da primeira conta em background
     supabase.from("dispatch_logs").insert({
-      user_id: schedule.user_id, group_id: group.id,
-      account_id: firstAccount.id, schedule_id: schedule.id,
-      status: firstSentAt ? "sent" : "failed",
-      message_text: firstMember.message_text, position_rank: 1,
-      group_name_snapshot: group.name, chat_name_snapshot: group.telegram_chat_name,
-      sent_at: firstSentAt ? firstSentAt.toISOString() : null,
-      error_message: firstSentAt ? null : `BUDGET_EXCEEDED após ${attempt} tentativas`,
+      user_id:             schedule.user_id,
+      group_id:            group.id,
+      account_id:          firstAccount.id,
+      schedule_id:         schedule.id,
+      status:              firstSentAt ? "sent" : "failed",
+      message_text:        firstMember.message_text,
+      position_rank:       1,
+      group_name_snapshot: group.name,
+      chat_name_snapshot:  group.telegram_chat_name,
+      sent_at:             firstSentAt ? firstSentAt.toISOString() : null,
+      error_message:       firstSentAt ? null : `BUDGET_EXCEEDED após ${attempt} tentativas`,
     }).then(({ error: e }) => {
       if (e) console.error(`[sniper][log] Falha ao inserir log para ${firstAccount.id}:`, e.message);
     });
@@ -1184,15 +806,17 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     if (!firstSentAt) {
       console.warn(`[sniper] Budget esgotado para schedule ${scheduleId} após ${attempt} tentativas`);
       results.push({
-        account_id: firstAccount.id, message_text: firstMember.message_text,
-        status: "failed", retryable: true,
-        error: `SNIPER_BUDGET_EXCEEDED após ${attempt} tentativas`,
+        account_id:   firstAccount.id,
+        message_text: firstMember.message_text,
+        status:       "failed",
+        retryable:    true,
+        error:        `SNIPER_BUDGET_EXCEEDED após ${attempt} tentativas`,
       });
       await updateScheduleAfterDispatch(schedule, results, now, "closed");
       return;
     }
 
-    // ── Fase 2: demais contas em sequência ───────────────────────────────
+    // ── FASE 2: demais contas em sequência com delay de 1ms ──────────────
     for (let i = 1; i < members.length; i++) {
       await new Promise(r => setTimeout(r, SNIPER_INTER_ACCOUNT_DELAY_MS));
 
@@ -1203,44 +827,48 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       let   error: string | undefined;
 
       try {
-        const client         = await getClient(account);
+        const client = await getClient(account);
+        // BUG #H: cada conta da fase 2 recebe seu próprio randomId estável.
         const memberRandomId = makeRandomId();
-
-        sniperTokenBuckets.set(account.id, {
-          tokens:     SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT,
-          lastRefill: Date.now(),
+        await sniperSendOnce(client, account, chatId, text, memberRandomId);
+        sentAt = new Date();
+        console.log(`[sniper] ✓ Conta ${i + 1}/${members.length} ${account.phone_number} enviou`);
+        results.push({
+          account_id:   account.id,
+          message_text: member.message_text,
+          status:       "sent",
+          retryable:    false,
         });
-
-        const waitForToken = acquireTokenBucket(account.id);
-        if (waitForToken > 0) await new Promise(r => setTimeout(r, waitForToken));
-
-        const res = await sniperAttemptOnce(client, account, chatId, text, memberRandomId);
-        if (res.outcome === "sent") {
-          sentAt = new Date(res.sentAt!);
-          console.log(`[sniper] ✓ Conta ${i + 1}/${members.length} ${account.phone_number} enviou`);
-          results.push({ account_id: account.id, message_text: member.message_text, status: "sent", retryable: false });
-        } else {
-          throw new Error(res.errorCode ?? res.outcome);
-        }
       } catch (err: any) {
         error = String(err?.message ?? "");
         console.error(`[sniper] ✗ Conta ${i + 1}/${members.length} ${account.phone_number}: ${error}`);
-        results.push({ account_id: account.id, message_text: member.message_text, status: "failed", retryable: isRetryableError(error), error });
+        results.push({
+          account_id:   account.id,
+          message_text: member.message_text,
+          status:       "failed",
+          retryable:    isRetryableError(error),
+          error,
+        });
       }
 
       supabase.from("dispatch_logs").insert({
-        user_id: schedule.user_id, group_id: group.id,
-        account_id: account.id, schedule_id: schedule.id,
-        status: sentAt ? "sent" : "failed", message_text: member.message_text,
-        position_rank: i + 1, group_name_snapshot: group.name,
-        chat_name_snapshot: group.telegram_chat_name,
-        sent_at: sentAt ? sentAt.toISOString() : null, error_message: error ?? null,
+        user_id:             schedule.user_id,
+        group_id:            group.id,
+        account_id:          account.id,
+        schedule_id:         schedule.id,
+        status:              sentAt ? "sent" : "failed",
+        message_text:        member.message_text,
+        position_rank:       i + 1,
+        group_name_snapshot: group.name,
+        chat_name_snapshot:  group.telegram_chat_name,
+        sent_at:             sentAt ? sentAt.toISOString() : null,
+        error_message:       error ?? null,
       }).then(({ error: e }) => {
         if (e) console.error(`[sniper][log] Falha ao inserir log para ${account.id}:`, e.message);
       });
     }
 
-    // ── Fase 3: monitoramento de posições ────────────────────────────────
+    // ── FASE 3: monitoramento de posições ─────────────────────────────────
     const sentForMonitor = results
       .filter(r => r.status === "sent")
       .map(r => ({ account_id: r.account_id, message_text: r.message_text ?? "" }))
@@ -1251,13 +879,13 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         .catch(err => console.error("[sniper][monitor] Erro:", err.message));
     }
 
+    // ── FASE 4: atualiza schedule no banco ────────────────────────────────
     await updateScheduleAfterDispatch(schedule, results, firstSentAt, "closed");
 
   } finally {
-    for (const m of (schedulePrefetchCache.get(scheduleId)?.groups?.group_members ?? [])) {
-      if (m.accounts?.id) sniperTokenBuckets.delete(m.accounts.id);
-    }
     sniperFiringNow.delete(scheduleId);
+
+    // BUG #A: bloqueia o fireSchedule do mesmo ciclo por TTL
     firingNow.add(scheduleId);
     setTimeout(() => firingNow.delete(scheduleId), SNIPER_DONE_BLOCK_TTL_MS);
   }
@@ -1268,12 +896,17 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
    ───────────────────────────────────────────────────────────────────────────── */
 async function getAlreadySentIds(schedule: Schedule): Promise<Set<string>> {
   const cycleStart = schedule.retry_until
-    ? new Date(new Date(schedule.retry_until).getTime() - schedule.retry_window_seconds * 1000).toISOString()
+    ? new Date(
+        new Date(schedule.retry_until).getTime() - schedule.retry_window_seconds * 1000
+      ).toISOString()
     : schedule.next_run_at;
 
   const { data, error } = await supabase
-    .from("dispatch_logs").select("account_id")
-    .eq("schedule_id", schedule.id).eq("status", "sent").gte("sent_at", cycleStart);
+    .from("dispatch_logs")
+    .select("account_id")
+    .eq("schedule_id", schedule.id)
+    .eq("status", "sent")
+    .gte("sent_at", cycleStart);
 
   if (error) {
     console.warn(`[dedup] Falha ao buscar enviados do schedule ${schedule.id}:`, error.message);
@@ -1295,10 +928,10 @@ async function monitorPositions(
   if (sentMembers.length === 0) return;
 
   const account = accountCache.get(sentMembers[0].account_id);
-  if (!account) return;
+  if (!account) { console.warn("[monitor] Conta não encontrada no cache — ignorando"); return; }
 
   const client = await getClient(account).catch(() => null);
-  if (!client) return;
+  if (!client) { console.warn("[monitor] Sem client — ignorando monitoramento"); return; }
 
   const windowStartUnix = Math.floor((dispatchedAt.getTime() - 15_000) / 1000);
   const deadline        = Date.now() + (groupType === "closed"
@@ -1308,13 +941,17 @@ async function monitorPositions(
 
   if (groupType === "closed") await new Promise(r => setTimeout(r, MONITOR_DELAY_CLOSED_MS));
 
+  console.log(`[monitor] Iniciando para schedule ${scheduleId} (${groupType})`);
+
   while (Date.now() < deadline) {
     try {
       const peer   = await resolvePeer(client, telegramChatId, account.id);
       const result = await client.invoke(
         new Api.messages.GetHistory({
-          peer: peer as any, limit: MONITOR_HISTORY_LIMIT,
-          offsetDate: 0, offsetId: 0, maxId: 0, minId: 0, hash: bigInt(0), addOffset: 0,
+          peer: peer as any,
+          limit: MONITOR_HISTORY_LIMIT,
+          offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
+          hash: bigInt(0), addOffset: 0,
         })
       ) as any;
 
@@ -1323,7 +960,10 @@ async function monitorPositions(
         .reverse();
 
       if (windowMsgs.length === 0) {
-        if (groupType === "closed") return;
+        if (groupType === "closed") {
+          console.warn("[monitor] Sem mensagens na janela (grupo fechado) — abortando");
+          return;
+        }
         await new Promise(r => setTimeout(r, MONITOR_POLL_MS));
         continue;
       }
@@ -1339,19 +979,26 @@ async function monitorPositions(
         const idx = windowMsgs.findIndex((m: any) => m.message === sm.message_text);
         if (idx < 0) return;
         const rank = idx + 1;
+        console.log(`[monitor] ${sm.account_id}: posição #${rank} em ${telegramChatId}`);
         return supabase.from("dispatch_logs")
           .update({ position_rank: rank })
-          .eq("schedule_id", scheduleId).eq("account_id", sm.account_id)
-          .eq("status", "sent").gte("sent_at", cutoff);
+          .eq("schedule_id", scheduleId)
+          .eq("account_id", sm.account_id)
+          .eq("status", "sent")
+          .gte("sent_at", cutoff);
       }));
 
       console.log(`[monitor] ✓ Posições salvas para schedule ${scheduleId}`);
       return;
+
     } catch (err: any) {
+      console.warn(`[monitor] Erro ao buscar histórico: ${err.message}`);
       if (groupType === "closed") return;
       await new Promise(r => setTimeout(r, MONITOR_POLL_MS));
     }
   }
+
+  console.warn(`[monitor] Timeout — posições não registradas para schedule ${scheduleId}`);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -1373,13 +1020,18 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
   (async () => {
     try {
       let client = await getClient(account).catch(() => null);
-      if (!client) { listenMap.delete(group.id); return; }
+      if (!client) {
+        console.warn(`[listen] Sem client — abortando listener para ${schedule.id}`);
+        listenMap.delete(group.id);
+        return;
+      }
 
       try { await resolvePeer(client, group.telegram_chat_id!, account.id); } catch {}
 
       while (Date.now() < deadline && !ctrl.signal.aborted) {
         try {
           if (!client.connected) {
+            console.warn(`[listen] Client desconectou — reconectando para ${schedule.id}`);
             client = await getClient(account);
             try { await resolvePeer(client, group.telegram_chat_id!, account.id); } catch {}
           }
@@ -1388,12 +1040,16 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
           const result = await client.invoke(
             new Api.messages.GetHistory({
               peer: peer as any, limit: 10,
-              offsetDate: 0, offsetId: 0, maxId: 0, minId: 0, hash: bigInt(0), addOffset: 0,
+              offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
+              hash: bigInt(0), addOffset: 0,
             })
           ) as any;
 
           const recentMsgs = (result.messages ?? []).filter(
-            (m: any) => (m.className === "Message" || m._ === "message") && m.date >= startUnix && m.id > lastSeenMsgId
+            (m: any) =>
+              (m.className === "Message" || m._ === "message") &&
+              m.date >= startUnix &&
+              m.id > lastSeenMsgId
           );
           if (recentMsgs.length > 0) {
             lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
@@ -1406,7 +1062,9 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
           });
 
           if (gotSignal && !ctrl.signal.aborted) {
+            console.log(`[listen] ✓ Sinal detectado — disparando schedule ${schedule.id}`);
             listenMap.delete(group.id);
+
             const dispatchedAt = new Date();
             const alreadySent  = await getAlreadySentIds(schedule);
             const results      = await dispatchToGroup(schedule, group, alreadySent);
@@ -1419,18 +1077,29 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
               monitorPositions(group.telegram_chat_id!, sentForMonitor, schedule.id, dispatchedAt, "open")
                 .catch(err => console.error("[listen] Erro no monitoramento:", err.message));
             }
+
             await updateScheduleAfterDispatch(schedule, results, dispatchedAt, "open");
             return;
           }
+
         } catch (err: any) {
-          if (!ctrl.signal.aborted) await new Promise(r => setTimeout(r, 2_000));
+          if (!ctrl.signal.aborted) {
+            console.warn(`[listen] Erro ao buscar histórico (${schedule.id}): ${err.message}`);
+            await new Promise(r => setTimeout(r, 2_000));
+          }
         }
+
         if (!ctrl.signal.aborted) await new Promise(r => setTimeout(r, LISTEN_POLL_MS));
       }
 
       listenMap.delete(group.id);
-      if (ctrl.signal.aborted) return;
 
+      if (ctrl.signal.aborted) {
+        console.log(`[listen] ⏹ Listener abortado para schedule ${schedule.id}`);
+        return;
+      }
+
+      console.warn(`[listen] ⏰ Timeout 2h — nenhum sinal para schedule ${schedule.id}`);
       const nowISO = new Date().toISOString();
       let nextRun: string;
       try { nextRun = nextWeeklyOccurrence(schedule.cron_expression); }
@@ -1439,11 +1108,15 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
         return;
       }
       await supabase.from("schedules").update({
-        next_run_at: nextRun, retry_until: null, retry_count: 0,
-        last_attempt_at: nowISO, last_attempt_status: "timeout",
-        last_attempt_error: "Timeout aguardando sinal do admin",
+        next_run_at:         nextRun,
+        retry_until:         null,
+        retry_count:         0,
+        last_attempt_at:     nowISO,
+        last_attempt_status: "timeout",
+        last_attempt_error:  "Timeout aguardando sinal do admin",
       }).eq("id", schedule.id);
-      scheduleTimer(schedule.id, nextRun, "open", schedule.group_id);
+      scheduleTimer(schedule.id, nextRun, "open");
+
     } catch (err: any) {
       console.error(`[listen] Erro inesperado para schedule ${schedule.id}:`, err.message);
       listenMap.delete(group.id);
@@ -1468,7 +1141,13 @@ async function dispatchToGroup(
     const positionRank = i + 1;
 
     if (alreadySent.has(account.id)) {
-      return { account_id: account.id, message_text: member.message_text, status: "skipped" as const, retryable: false };
+      console.log(`[dispatch] ↷ ${account.phone_number} — já enviou neste ciclo`);
+      return {
+        account_id:   account.id,
+        message_text: member.message_text,
+        status:       "skipped" as const,
+        retryable:    false,
+      };
     }
 
     let status: "sent" | "failed" = "failed";
@@ -1480,17 +1159,27 @@ async function dispatchToGroup(
       await sendMessage(client, account, group.telegram_chat_id!, member.message_text ?? "");
       status = "sent";
       alreadySent.add(account.id);
+      console.log(`[dispatch] ✓ ${account.phone_number}`);
     } catch (err) {
       error     = err instanceof Error ? err.message : String(err);
       retryable = isRetryableError(error);
+      console.error(
+        `[dispatch] ✗ ${account.phone_number} [${retryable ? "retryável" : "permanente"}]: ${error}`
+      );
     }
 
     supabase.from("dispatch_logs").insert({
-      user_id: schedule.user_id, group_id: group.id,
-      account_id: account.id, schedule_id: schedule.id,
-      status, message_text: member.message_text, position_rank: positionRank,
-      group_name_snapshot: group.name, chat_name_snapshot: group.telegram_chat_name,
-      sent_at: status === "sent" ? new Date().toISOString() : null, error_message: error ?? null,
+      user_id:             schedule.user_id,
+      group_id:            group.id,
+      account_id:          account.id,
+      schedule_id:         schedule.id,
+      status,
+      message_text:        member.message_text,
+      position_rank:       positionRank,
+      group_name_snapshot: group.name,
+      chat_name_snapshot:  group.telegram_chat_name,
+      sent_at:             status === "sent" ? new Date().toISOString() : null,
+      error_message:       error ?? null,
     }).then(({ error: e }) => {
       if (e) console.error(`[log] Falha ao inserir dispatch_log para ${account.id}:`, e.message);
     });
@@ -1501,6 +1190,7 @@ async function dispatchToGroup(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    ATUALIZAÇÃO DO SCHEDULE APÓS DISPARO
+   BUG #B: recebe groupType e repassa para scheduleTimer.
    ───────────────────────────────────────────────────────────────────────────── */
 async function updateScheduleAfterDispatch(
   schedule: Schedule,
@@ -1522,55 +1212,78 @@ async function updateScheduleAfterDispatch(
     permanentFails.length === 0 &&
     (sentCount + skippedCount) > 0;
 
-  const resolvedGroupType = groupType ?? schedule.groups?.group_type;
-  const groupId           = schedule.group_id ?? schedule.groups?.id;
-  if (groupId) scheduleGroupMap.set(schedule.id, groupId);
-
   if (allOk) {
     let nextRun: string;
     try {
       nextRun = nextWeeklyOccurrence(schedule.cron_expression);
     } catch (err) {
+      console.error(`[schedule] cron inválido em ${schedule.id}, desativando:`, err);
       await supabase.from("schedules").update({ is_active: false }).eq("id", schedule.id);
       return;
     }
 
     supabase.from("schedules").update({
-      next_run_at: nextRun, last_run_at: nowISO, retry_until: null, retry_count: 0,
-      last_attempt_at: nowISO, last_attempt_status: "sent", last_attempt_error: null,
+      next_run_at:         nextRun,
+      last_run_at:         nowISO,
+      retry_until:         null,
+      retry_count:         0,
+      last_attempt_at:     nowISO,
+      last_attempt_status: "sent",
+      last_attempt_error:  null,
     }).eq("id", schedule.id).then(({ error: e }) => {
       if (e) console.error(`[schedule] Falha ao atualizar ${schedule.id}:`, e.message);
     });
 
-    scheduleTimer(schedule.id, nextRun, resolvedGroupType, groupId);
+    console.log(`[schedule] ✓ Schedule ${schedule.id} OK. Próxima: ${nextRun}`);
+    scheduleTimer(schedule.id, nextRun, groupType ?? schedule.groups?.group_type);
+
   } else {
     const newRetryCount = schedule.retry_count + 1;
     const retryUntil    = schedule.retry_until ??
       new Date(now.getTime() + schedule.retry_window_seconds * 1000).toISOString();
     const interval      = calcRetryInterval(
-      newRetryCount, schedule.retry_interval_seconds, schedule.retry_interval_max_seconds
+      newRetryCount,
+      schedule.retry_interval_seconds,
+      schedule.retry_interval_max_seconds
     );
-    const failErrors = results.filter(r => r.error).map(r => `[${r.account_id}] ${r.error}`).join("; ");
+    const failErrors = results
+      .filter(r => r.error)
+      .map(r => `[${r.account_id}] ${r.error}`)
+      .join("; ");
+
+    console.warn(
+      `[schedule] ⚠ ${schedule.id}: ${retryableFails.length} falha(s) retryável(eis), ` +
+      `${permanentFails.length} permanente(s). Retry #${newRetryCount} em ~${interval}s`
+    );
 
     await supabase.from("schedules").update({
-      retry_until: retryUntil, retry_count: newRetryCount,
-      last_attempt_at: nowISO, last_attempt_status: "retrying",
-      last_attempt_error: failErrors || null,
+      retry_until:         retryUntil,
+      retry_count:         newRetryCount,
+      last_attempt_at:     nowISO,
+      last_attempt_status: "retrying",
+      last_attempt_error:  failErrors || null,
     }).eq("id", schedule.id);
 
     const retryAt = new Date(now.getTime() + interval * 1000);
     if (retryAt < new Date(retryUntil)) {
-      scheduleTimer(schedule.id, retryAt.toISOString(), resolvedGroupType, groupId);
+      scheduleTimer(schedule.id, retryAt.toISOString(), groupType ?? schedule.groups?.group_type);
     }
   }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   DISPARO DE SCHEDULE (grupos abertos + fallback fechados)
+   DISPARO DE SCHEDULE (grupos abertos + fallback para fechados sem sniper)
    ───────────────────────────────────────────────────────────────────────────── */
 async function fireSchedule(scheduleId: string): Promise<void> {
-  if (sniperFiringNow.has(scheduleId)) return;
-  if (firingNow.has(scheduleId)) return;
+  if (sniperFiringNow.has(scheduleId)) {
+    console.warn(`[fire] Schedule ${scheduleId} em execução no sniper — ignorando fireSchedule`);
+    return;
+  }
+
+  if (firingNow.has(scheduleId)) {
+    console.warn(`[fire] Schedule ${scheduleId} já em execução — ignorando disparo duplicado`);
+    return;
+  }
   firingNow.add(scheduleId);
 
   try {
@@ -1579,16 +1292,28 @@ async function fireSchedule(scheduleId: string): Promise<void> {
     let schedule = schedulePrefetchCache.get(scheduleId);
     if (schedule) {
       schedulePrefetchCache.delete(scheduleId);
+      console.log(`[fire] ⚡ Schedule ${scheduleId} servido do pre-fetch cache`);
     } else {
       const { data, error } = await supabase
-        .from("schedules").select(SCHEDULE_SELECT)
-        .eq("id", scheduleId).eq("is_active", true).single();
-      if (error || !data) return;
+        .from("schedules")
+        .select(SCHEDULE_SELECT)
+        .eq("id", scheduleId)
+        .eq("is_active", true)
+        .single();
+
+      if (error || !data) {
+        console.warn(`[fire] Schedule ${scheduleId} não encontrado ou inativo.`);
+        return;
+      }
       schedule = data as unknown as Schedule;
     }
 
     const group = schedule.groups;
-    if (!group?.telegram_chat_id) return;
+
+    if (!group?.telegram_chat_id) {
+      console.warn(`[fire] Schedule ${scheduleId}: sem telegram_chat_id — pulando.`);
+      return;
+    }
 
     if (group.group_members) {
       group.group_members = group.group_members.map(m => ({
@@ -1597,38 +1322,61 @@ async function fireSchedule(scheduleId: string): Promise<void> {
       }));
     }
 
+    console.log(`[fire] ⚡ Disparando schedule ${scheduleId} às ${now.toISOString()}`);
+
     if (group.group_type === "open") {
-      if (listenMap.has(group.id)) return;
+      if (listenMap.has(group.id)) {
+        console.log(`[fire] Listener já ativo para grupo ${group.id} — ignorando`);
+        return;
+      }
 
       const firstAccount = (group.group_members ?? [])
         .filter(m => m.is_active && m.accounts?.is_active)
         .sort((a, b) => a.position - b.position)[0]?.accounts ?? null;
 
-      if (!firstAccount) return;
+      if (!firstAccount) {
+        console.warn(`[fire] Nenhuma conta ativa no grupo — abortando.`);
+        return;
+      }
 
       startGroupListener(schedule, group, firstAccount as Account);
 
       await supabase.from("schedules").update({
-        retry_until: new Date(now.getTime() + OPEN_GROUP_LISTEN_TIMEOUT_MS).toISOString(),
-        last_attempt_at: now.toISOString(),
-        last_attempt_status: "waiting_admin", last_attempt_error: null,
+        retry_until:         new Date(now.getTime() + OPEN_GROUP_LISTEN_TIMEOUT_MS).toISOString(),
+        last_attempt_at:     now.toISOString(),
+        last_attempt_status: "waiting_admin",
+        last_attempt_error:  null,
       }).eq("id", scheduleId);
       return;
     }
 
-    const alreadySent = schedule.retry_until ? await getAlreadySentIds(schedule) : new Set<string>();
-    const results     = await dispatchToGroup(schedule, group, alreadySent);
+    // Grupo fechado chegou aqui sem sniper (retry via banco, boot tardio, etc.)
+    const alreadySent = schedule.retry_until
+      ? await getAlreadySentIds(schedule)
+      : new Set<string>();
+
+    if (alreadySent.size > 0) {
+      console.log(`[dedup] ${alreadySent.size} account(s) já enviaram neste ciclo — pulando.`);
+    }
+
+    const results = await dispatchToGroup(schedule, group, alreadySent);
 
     const sentForMonitor = results
       .filter(r => r.status === "sent")
       .map(r => ({ account_id: r.account_id, message_text: r.message_text ?? "" }))
       .filter(r => r.message_text);
     if (sentForMonitor.length > 0) {
-      monitorPositions(group.telegram_chat_id, sentForMonitor, scheduleId, now, group.group_type ?? "closed")
-        .catch(err => console.error("[monitor] Erro:", err.message));
+      monitorPositions(
+        group.telegram_chat_id,
+        sentForMonitor,
+        scheduleId,
+        now,
+        group.group_type ?? "closed"
+      ).catch(err => console.error("[monitor] Erro não capturado:", err.message));
     }
 
     await updateScheduleAfterDispatch(schedule, results, now, group.group_type);
+
   } finally {
     firingNow.delete(scheduleId);
   }
@@ -1636,33 +1384,14 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    TIMER DE PRECISÃO + PRE-FETCH + SNIPER
-   ═══════════════════════════════════════════════════════════════════════════
-   v20: o sniperDelay é ajustado para garantir que o sniper acorde cedo o
-   suficiente quando p10 < 0 (grupo que historicamente abre antes do horário).
-
-   sniperDelay = effectiveDelay - SNIPER_BEFORE_MS - Math.max(0, -p10)
-
-   Exemplos:
-     p10 = 0    → sniperDelay = effectiveDelay - 100ms (comportamento padrão)
-     p10 = -300ms → sniperDelay = effectiveDelay - 100ms - 300ms = effectiveDelay - 400ms
-                    O sniper acorda 400ms antes e usa invokeDeadline = scheduledAt - 300ms - halfRtt
-     p10 = +500ms → sniperDelay = effectiveDelay - 100ms (sem ajuste negativo)
-                    O sniper acorda normalmente e espera dentro do sniperFireClosed
    ───────────────────────────────────────────────────────────────────────────── */
-function scheduleTimer(
-  scheduleId: string,
-  nextRunAt: string,
-  groupType?: "open" | "closed",
-  groupId?: string
-): void {
+function scheduleTimer(scheduleId: string, nextRunAt: string, groupType?: "open" | "closed"): void {
   const delay = new Date(nextRunAt).getTime() - Date.now();
 
   if (delay < -5_000) {
     console.warn(`[timer] Schedule ${scheduleId} ignorado — muito no passado (${nextRunAt})`);
     return;
   }
-
-  if (groupId) scheduleGroupMap.set(scheduleId, groupId);
 
   const prev = scheduledTimers.get(scheduleId);
   if (prev) clearTimeout(prev);
@@ -1673,16 +1402,23 @@ function scheduleTimer(
 
   const effectiveDelay = Math.max(0, delay);
 
-  // Pre-fetch do schedule antes do fire
+  // OPT #2: pre-fetch do schedule PREFETCH_BEFORE_MS antes do fire.
   if (effectiveDelay > PREFETCH_BEFORE_MS) {
     const prefetchDelay = effectiveDelay - PREFETCH_BEFORE_MS;
     const pt = setTimeout(async () => {
       prefetchTimers.delete(scheduleId);
       try {
         const { data, error } = await supabase
-          .from("schedules").select(SCHEDULE_SELECT)
-          .eq("id", scheduleId).eq("is_active", true).single();
-        if (error || !data) return;
+          .from("schedules")
+          .select(SCHEDULE_SELECT)
+          .eq("id", scheduleId)
+          .eq("is_active", true)
+          .single();
+
+        if (error || !data) {
+          console.warn(`[prefetch] Schedule ${scheduleId} inativo ou removido — ignorando`);
+          return;
+        }
 
         const s = data as unknown as Schedule;
         if (s.groups?.group_members) {
@@ -1691,54 +1427,49 @@ function scheduleTimer(
             accounts: m.accounts ? (accountCache.get(m.accounts.id) ?? m.accounts) : null,
           }));
         }
+
         schedulePrefetchCache.set(scheduleId, s);
+        console.log(`[prefetch] ✅ Schedule ${scheduleId} pré-carregado (${PREFETCH_BEFORE_MS}ms antes do fire)`);
       } catch (err: any) {
-        console.warn(`[prefetch] Falha ao pré-carregar ${scheduleId}: ${err.message}`);
+        console.warn(`[prefetch] Falha ao pré-carregar schedule ${scheduleId}: ${err.message}`);
       }
     }, prefetchDelay);
     prefetchTimers.set(scheduleId, pt);
   }
 
-  // Sniper para grupos fechados
-  if (groupType === "closed") {
-    const resolvedGroupId = groupId ?? scheduleGroupMap.get(scheduleId);
-    const profile         = resolvedGroupId ? groupProfileCache.get(resolvedGroupId) : undefined;
-    const p10             = getEffectiveP10(profile);
-
-    // Acorda mais cedo se p10 < 0 (grupo que historicamente abre antes do horário)
-    const extraLeadMs       = Math.max(0, -p10);
-    const totalSniperLeadMs = SNIPER_BEFORE_MS + extraLeadMs;
-
-    if (effectiveDelay > totalSniperLeadMs) {
-      const sniperDelay = effectiveDelay - totalSniperLeadMs;
-      const st = setTimeout(async () => {
-        sniperTimers.delete(scheduleId);
-        const cached = schedulePrefetchCache.get(scheduleId);
-        if (cached && cached.groups?.group_type !== "closed") return;
-        try {
-          await sniperFireClosed(scheduleId);
-        } catch (err) {
-          console.error(`[sniper] Erro inesperado ao disparar ${scheduleId}:`, err);
-        }
-      }, sniperDelay);
-      sniperTimers.set(scheduleId, st);
-
-      if (extraLeadMs > 0) {
-        console.log(`[sniper] ⏰ p10=${p10}ms → lead total=${totalSniperLeadMs}ms, acorda em ${Math.round(sniperDelay / 1000)}s`);
-      } else {
-        console.log(`[sniper] ⏰ Agendado para schedule ${scheduleId} em ${Math.round(sniperDelay / 1000)}s`);
+  // OPT #5: sniper para grupos fechados.
+  if (groupType === "closed" && effectiveDelay > SNIPER_BEFORE_MS) {
+    const sniperDelay = effectiveDelay - SNIPER_BEFORE_MS;
+    const st = setTimeout(async () => {
+      sniperTimers.delete(scheduleId);
+      const cached = schedulePrefetchCache.get(scheduleId);
+      if (cached && cached.groups?.group_type !== "closed") {
+        console.log(`[sniper] Schedule ${scheduleId} não é closed — pulando sniper`);
+        return;
       }
-    }
+      try {
+        await sniperFireClosed(scheduleId);
+      } catch (err) {
+        console.error(`[sniper] Erro inesperado ao disparar ${scheduleId}:`, err);
+      }
+    }, sniperDelay);
+    sniperTimers.set(scheduleId, st);
+    console.log(`[sniper] ⏰ Sniper agendado para schedule ${scheduleId} em ${Math.round(sniperDelay / 1000)}s`);
   }
 
   const timer = setTimeout(async () => {
     scheduledTimers.delete(scheduleId);
-    try { await fireSchedule(scheduleId); }
-    catch (err) { console.error(`[timer] Erro inesperado ao disparar ${scheduleId}:`, err); }
+    try {
+      await fireSchedule(scheduleId);
+    } catch (err) {
+      console.error(`[timer] Erro inesperado ao disparar ${scheduleId}:`, err);
+    }
   }, effectiveDelay);
 
   scheduledTimers.set(scheduleId, timer);
-  console.log(`[timer] ⏰ Schedule ${scheduleId} — dispara em ${Math.round(effectiveDelay / 1000)}s`);
+
+  const fireAt = new Date(Date.now() + effectiveDelay).toISOString();
+  console.log(`[timer] ⏰ Schedule ${scheduleId} — dispara em ${Math.round(effectiveDelay / 1000)}s (${fireAt})`);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -1755,24 +1486,35 @@ async function reloadSchedules(): Promise<void> {
     { data: expiredRetries },
   ] = await Promise.all([
     supabase.from("schedules")
-      .select("id, next_run_at, group_id, groups(id, group_type)")
-      .eq("is_active", true).is("retry_until", null).lte("next_run_at", lookaheadISO),
+      .select("id, next_run_at, groups(group_type)")
+      .eq("is_active", true)
+      .is("retry_until", null)
+      .lte("next_run_at", lookaheadISO),
 
     supabase.from("schedules")
       .select(SCHEDULE_SELECT)
-      .eq("is_active", true).not("retry_until", "is", null).gt("retry_until", nowISO),
+      .eq("is_active", true)
+      .not("retry_until", "is", null)
+      .gt("retry_until", nowISO),
 
     supabase.from("schedules")
       .select("id, cron_expression, group_id")
-      .eq("is_active", true).not("retry_until", "is", null).lte("retry_until", nowISO),
+      .eq("is_active", true)
+      .not("retry_until", "is", null)
+      .lte("retry_until", nowISO),
   ]);
 
   await Promise.all((expiredRetries ?? []).map(async expired => {
-    if (!expired || typeof expired !== "object" || "message" in expired) return;
+    console.warn(`[reload] Schedule ${expired.id}: retry expirou sem sucesso. Avançando.`);
+
     const expGroupId = (expired as any).group_id as string | undefined;
     if (expGroupId) {
       const ctrl = listenMap.get(expGroupId);
-      if (ctrl) { ctrl.abort(); listenMap.delete(expGroupId); }
+      if (ctrl) {
+        ctrl.abort();
+        listenMap.delete(expGroupId);
+        console.log(`[reload] Listener cancelado para grupo ${expGroupId}`);
+      }
     }
 
     let nextRun: string;
@@ -1783,30 +1525,36 @@ async function reloadSchedules(): Promise<void> {
     }
 
     await supabase.from("schedules").update({
-      next_run_at: nextRun, last_run_at: nowISO, retry_until: null, retry_count: 0,
-      last_attempt_at: nowISO, last_attempt_status: "failed",
-      last_attempt_error: "Retry expirou sem sucesso total",
+      next_run_at:         nextRun,
+      last_run_at:         nowISO,
+      retry_until:         null,
+      retry_count:         0,
+      last_attempt_at:     nowISO,
+      last_attempt_status: "failed",
+      last_attempt_error:  "Retry expirou sem sucesso total",
     }).eq("id", expired.id);
-    scheduleTimer(expired.id, nextRun, undefined, expGroupId);
+    scheduleTimer(expired.id, nextRun);
   }));
 
   for (const s of futureSchedules ?? []) {
     if (!scheduledTimers.has(s.id)) {
       const gType = (s as any).groups?.group_type as "open" | "closed" | undefined;
-      const gId   = (s as any).group_id as string | undefined ?? (s as any).groups?.id as string | undefined;
-      scheduleTimer(s.id, s.next_run_at, gType, gId);
+      scheduleTimer(s.id, s.next_run_at, gType);
     }
   }
 
   for (const s of retrySchedules ?? []) {
     const schedule = s as unknown as Schedule;
+
     if (listenMap.has(schedule.group_id)) continue;
+
     if (
       isRetryDue(schedule, now) &&
       !scheduledTimers.has(schedule.id) &&
       !firingNow.has(schedule.id) &&
       !sniperFiringNow.has(schedule.id)
     ) {
+      console.log(`[reload] Schedule ${schedule.id} em retry — disparando agora.`);
       fireSchedule(schedule.id).catch(err =>
         console.error(`[reload] Erro no retry do schedule ${schedule.id}:`, err)
       );
@@ -1816,6 +1564,7 @@ async function reloadSchedules(): Promise<void> {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    RECONEXÃO LEVE
+   BUG #E: só reconecta clientes offline, sem getDialogs.
    ───────────────────────────────────────────────────────────────────────────── */
 async function reconnectDeadClients(): Promise<void> {
   const reconnectPromises: Promise<void>[] = [];
@@ -1824,19 +1573,22 @@ async function reconnectDeadClients(): Promise<void> {
     if (!client.connected) {
       const account = accountCache.get(accountId);
       if (!account) continue;
+      console.warn(`[reconnect] ${account.phone_number} offline — reconectando`);
       reconnectPromises.push(
         getClient(account)
           .then(() => console.log(`[reconnect] ✓ ${account.phone_number} reconectado`))
-          .catch(err => console.warn(`[reconnect] Falha: ${err.message}`))
+          .catch(err => console.warn(`[reconnect] Falha ao reconectar ${account.phone_number}: ${err.message}`))
       );
     }
   }
 
-  if (reconnectPromises.length > 0) await Promise.allSettled(reconnectPromises);
+  if (reconnectPromises.length > 0) {
+    await Promise.allSettled(reconnectPromises);
+  }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   PRE-WARM DE CONTAS + PERFIS + CLOCK
+   PRE-WARM DE CONTAS — roda apenas no boot
    ───────────────────────────────────────────────────────────────────────────── */
 let prewarmRunning = false;
 async function prewarmAccounts(): Promise<void> {
@@ -1844,7 +1596,8 @@ async function prewarmAccounts(): Promise<void> {
   prewarmRunning = true;
   try {
     const { data, error } = await supabase
-      .from("accounts").select("id, name, phone_number, api_id, api_hash, session_string, is_active")
+      .from("accounts")
+      .select("id, name, phone_number, api_id, api_hash, session_string, is_active")
       .eq("is_active", true);
 
     if (error) { console.warn("[prewarm] Falha ao buscar contas:", error.message); return; }
@@ -1856,27 +1609,34 @@ async function prewarmAccounts(): Promise<void> {
       try {
         const client = await getClient(account);
         await client.getDialogs({ limit: 100 });
-        console.log(`[prewarm] ✓ ${account.phone_number}`);
+        console.log(`[prewarm] ✓ Dialogs prontos: ${account.phone_number}`);
       } catch (err: any) {
         const authDead =
           err.message?.includes("AUTH_KEY_UNREGISTERED") ||
-          err.message?.includes("USER_DEACTIVATED")      ||
+          err.message?.includes("USER_DEACTIVATED") ||
           err.message?.includes("SESSION_REVOKED");
         if (authDead) {
+          console.warn(`[prewarm] Sessão morta: ${account.phone_number} — desativando.`);
           await supabase.from("accounts").update({ is_active: false }).eq("id", account.id);
+        } else {
+          console.warn(`[prewarm] Falha ao conectar ${account.phone_number}: ${err.message}`);
         }
       }
     }));
 
+    // OPT #3: pre-resolve de peers para todos os grupos ativos.
     try {
       const { data: groups } = await supabase
-        .from("groups").select("telegram_chat_id, group_members(accounts(id))")
-        .not("telegram_chat_id", "is", null).eq("group_members.is_active", true);
+        .from("groups")
+        .select("telegram_chat_id, group_members(accounts(id))")
+        .not("telegram_chat_id", "is", null)
+        .eq("group_members.is_active", true);
 
       const resolvePromises: Promise<unknown>[] = [];
       for (const group of groups ?? []) {
         if (!group.telegram_chat_id) continue;
         const chatId = String(group.telegram_chat_id);
+
         for (const member of (group as any).group_members ?? []) {
           const accountId = member?.accounts?.id ?? member?.accounts?.[0]?.id;
           if (!accountId) continue;
@@ -1884,21 +1644,19 @@ async function prewarmAccounts(): Promise<void> {
           if (!acc) continue;
           const cl = clients.get(acc.id);
           if (!cl?.connected) continue;
-          resolvePromises.push(resolvePeer(cl, chatId, acc.id).catch(() => {}));
+
+          resolvePromises.push(
+            resolvePeer(cl, chatId, acc.id)
+              .then(() => console.log(`[prewarm] ✓ Peer pré-resolvido: ${chatId} via ${acc.phone_number}`))
+              .catch(() => {})
+          );
         }
       }
+
       await Promise.allSettled(resolvePromises);
       console.log(`[prewarm] ✓ Pre-resolve de peers concluído (${resolvePromises.length} entradas)`);
     } catch (err: any) {
-      console.warn(`[prewarm] Falha no pre-resolve: ${err.message}`);
-    }
-
-    await loadGroupProfiles();
-
-    const anyClient = [...clients.values()].find(c => c.connected);
-    if (anyClient) {
-      telegramClockOffsetMs = await measureTelegramClockOffset(anyClient);
-      console.log(`[clock] ✅ Clock offset inicial: ${telegramClockOffsetMs > 0 ? "+" : ""}${telegramClockOffsetMs}ms (${clockOffsetQuality}) — apenas diagnóstico`);
+      console.warn(`[prewarm] Falha no pre-resolve de peers: ${err.message}`);
     }
 
   } finally {
@@ -1930,10 +1688,16 @@ const httpServer = http.createServer(async (req, res) => {
       const dialogs = await client.getDialogs({ limit: 200 });
       const chats   = dialogs
         .filter(d => d.isGroup || d.isChannel)
-        .map(d => ({ id: String(d.id), name: d.title ?? d.name ?? "Sem nome", type: d.isChannel ? "channel" : "group", accessHash: null }))
+        .map(d => ({
+          id:         String(d.id),
+          name:       d.title ?? d.name ?? "Sem nome",
+          type:       d.isChannel ? "channel" : "group",
+          accessHash: null,
+        }))
         .sort((a, b) => a.name.localeCompare(b.name));
       return jsonResponse(res, 200, chats);
     } catch (err: any) {
+      console.error("[http] /chats erro:", err.message);
       return jsonResponse(res, 500, { error: err.message });
     }
   }
@@ -1952,9 +1716,13 @@ const httpServer = http.createServer(async (req, res) => {
 
       try {
         const result = await client.invoke(
-          new Api.channels.GetFullChannel({ channel: new Api.InputChannel({ channelId: bigInt(rawId), accessHash: bigInt(0) }) })
+          new Api.channels.GetFullChannel({
+            channel: new Api.InputChannel({ channelId: bigInt(rawId), accessHash: bigInt(0) }),
+          })
         ) as any;
-        if (typeof result?.fullChat?.participantsCount === "number") count = result.fullChat.participantsCount;
+        if (typeof result?.fullChat?.participantsCount === "number") {
+          count = result.fullChat.participantsCount;
+        }
       } catch {}
 
       if (count === null) {
@@ -1963,17 +1731,38 @@ const httpServer = http.createServer(async (req, res) => {
           const absRaw  = rawId.replace(/^100/, "");
           const dialog  = dialogs.find(d => {
             const s = String(d.id).replace(/^-/, "");
-            return s === rawId || s === absRaw || String(d.id) === chatId || `-100${s}` === chatId || `-${s}` === chatId;
+            return s === rawId || s === absRaw ||
+                   String(d.id) === chatId ||
+                   `-100${s}` === chatId ||
+                   `-${s}` === chatId;
           });
           if (dialog?.entity) {
             const ent = dialog.entity as any;
             count = typeof ent.participantsCount === "number" ? ent.participantsCount : null;
+          }
+          if (count === null && dialog) {
+            const p = (dialog as any).participantsCount;
+            if (typeof p === "number") count = p;
+          }
+        } catch {}
+      }
+
+      if (count === null) {
+        try {
+          const full = await client.invoke(
+            new Api.messages.GetFullChat({ chatId: bigInt(rawId.replace(/^100/, "")) })
+          ) as any;
+          if (typeof full?.fullChat?.participantsCount === "number") {
+            count = full.fullChat.participantsCount;
+          } else if (full?.fullChat?.participants?.participants) {
+            count = full.fullChat.participants.participants.length;
           }
         } catch {}
       }
 
       return jsonResponse(res, 200, { count });
     } catch (err: any) {
+      console.error("[http] /chat-count erro:", err.message);
       return jsonResponse(res, 500, { error: err.message });
     }
   }
@@ -2005,7 +1794,7 @@ const httpServer = http.createServer(async (req, res) => {
             const result = await client.invoke(
               new Api.channels.GetParticipants({
                 channel: entity as Api.Channel,
-                filter: new Api.ChannelParticipantsRecent(),
+                filter:  new Api.ChannelParticipantsRecent(),
                 offset: 0, limit: 200, hash: bigInt(0),
               })
             );
@@ -2013,10 +1802,10 @@ const httpServer = http.createServer(async (req, res) => {
               members = result.users
                 .filter((u): u is Api.User => u.className === "User" && !u.bot)
                 .map(u => ({
-                  id: String(u.id),
-                  name: [u.firstName, u.lastName].filter(Boolean).join(" ") || null,
+                  id:       String(u.id),
+                  name:     [u.firstName, u.lastName].filter(Boolean).join(" ") || null,
                   username: u.username ? `@${u.username}` : null,
-                  phone: u.phone ? `+${u.phone}` : null,
+                  phone:    u.phone ? `+${u.phone}` : null,
                 }));
             }
           }
@@ -2038,10 +1827,10 @@ const httpServer = http.createServer(async (req, res) => {
                 const u = userMap.get(String((p as any).userId));
                 if (!u || u.bot) return null;
                 return {
-                  id: String(u.id),
-                  name: [u.firstName, u.lastName].filter(Boolean).join(" ") || null,
+                  id:       String(u.id),
+                  name:     [u.firstName, u.lastName].filter(Boolean).join(" ") || null,
                   username: u.username ? `@${u.username}` : null,
-                  phone: u.phone ? `+${u.phone}` : null,
+                  phone:    u.phone ? `+${u.phone}` : null,
                 };
               })
               .filter((m): m is MemberOut => m !== null);
@@ -2052,6 +1841,7 @@ const httpServer = http.createServer(async (req, res) => {
       members.sort((a, b) => (a.name ?? "").localeCompare(b.name ?? ""));
       return jsonResponse(res, 200, members);
     } catch (err: any) {
+      console.error("[http] /chat-members erro:", err.message);
       return jsonResponse(res, 500, { error: err.message });
     }
   }
@@ -2060,12 +1850,16 @@ const httpServer = http.createServer(async (req, res) => {
   if (req.method === "POST" && reloadMatch) {
     const accountId = reloadMatch[1];
     const { data: row, error } = await supabase
-      .from("accounts").select("id, name, phone_number, api_id, api_hash, session_string, is_active")
-      .eq("id", accountId).single();
+      .from("accounts")
+      .select("id, name, phone_number, api_id, api_hash, session_string, is_active")
+      .eq("id", accountId)
+      .single();
+
     if (error || !row) return jsonResponse(res, 404, { error: "Conta não encontrada" });
 
     const account = row as Account;
     accountCache.set(accountId, account);
+
     if (!account.is_active || !account.session_string) {
       return jsonResponse(res, 200, { ok: true, skipped: true, reason: "conta inativa ou sem sessão" });
     }
@@ -2073,49 +1867,12 @@ const httpServer = http.createServer(async (req, res) => {
     try {
       const client = await reloadClient(account);
       await client.getDialogs({ limit: 100 });
+      console.log(`[http] /reload ✓ ${account.phone_number} recarregada`);
       return jsonResponse(res, 200, { ok: true });
     } catch (err: any) {
+      console.error("[http] /reload erro:", err.message);
       return jsonResponse(res, 500, { error: err.message });
     }
-  }
-
-  const profileMatch = url.pathname.match(/^\/groups\/([^/]+)\/profile$/);
-  if (req.method === "GET" && profileMatch) {
-    const groupId = profileMatch[1];
-    const profile = groupProfileCache.get(groupId);
-    return jsonResponse(res, 200, {
-      profile: profile ?? null,
-      effective_p10: getEffectiveP10(profile),
-      effective_p90: getEffectiveP90(profile),
-      clock_offset_ms: telegramClockOffsetMs,
-      clock_quality: clockOffsetQuality,
-      half_rtt_ms: estimatedOneWayRttMs,
-    });
-  }
-
-  if (req.method === "DELETE" && profileMatch) {
-    const groupId = profileMatch[1];
-    groupProfileCache.delete(groupId);
-    await supabase.from("group_profiles").delete().eq("group_id", groupId);
-    await supabase.from("group_dispatch_samples").delete().eq("group_id", groupId);
-    return jsonResponse(res, 200, { ok: true, message: "Perfil resetado — próximos 3 disparos reaprendem o timing (p10=0, p90=30s por padrão)" });
-  }
-
-  if (req.method === "GET" && url.pathname === "/clock") {
-    return jsonResponse(res, 200, {
-      clock_offset_ms:        telegramClockOffsetMs,
-      clock_quality:          clockOffsetQuality,
-      estimated_one_way_rtt:  estimatedOneWayRttMs,
-      local_time:             new Date().toISOString(),
-    });
-  }
-
-  if (req.method === "POST" && url.pathname === "/clock/remeasure") {
-    const anyClient = [...clients.values()].find(c => c.connected);
-    if (!anyClient) return jsonResponse(res, 503, { error: "Sem client conectado" });
-    const newOffset = await measureTelegramClockOffset(anyClient);
-    telegramClockOffsetMs = newOffset;
-    return jsonResponse(res, 200, { ok: true, clock_offset_ms: newOffset, clock_quality: clockOffsetQuality, estimated_one_way_rtt: estimatedOneWayRttMs });
   }
 
   const listenMatch = url.pathname.match(/^\/groups\/([^/]+)\/listen$/);
@@ -2139,10 +1896,15 @@ const httpServer = http.createServer(async (req, res) => {
         try {
           const { data: grpRow } = await supabase
             .from("groups")
-            .select(`id, telegram_chat_id, group_type, group_members(id, message_text, position, is_active, accounts(id, name, phone_number, api_id, api_hash, session_string, is_active))`)
-            .eq("id", groupId).single();
+            .select(`
+              id, telegram_chat_id, group_type,
+              group_members(id, message_text, position, is_active,
+                accounts(id, name, phone_number, api_id, api_hash, session_string, is_active))
+            `)
+            .eq("id", groupId)
+            .single();
 
-          if (!grpRow) return;
+          if (!grpRow) { console.warn(`[listen-manual] Grupo ${groupId} não encontrado`); return; }
 
           const chatId  = String(grpRow.telegram_chat_id);
           const members: GroupMember[] = (grpRow.group_members ?? []).map((m: any) => ({
@@ -2151,7 +1913,10 @@ const httpServer = http.createServer(async (req, res) => {
           }));
 
           const firstMember = members.find(m => m.is_active && m.accounts?.is_active);
-          if (!firstMember?.accounts) return;
+          if (!firstMember?.accounts) {
+            console.warn(`[listen-manual] Sem conta ativa em ${groupId}`);
+            return;
+          }
 
           const account = accountCache.get(firstMember.accounts.id) ?? firstMember.accounts as unknown as Account;
           const client  = await getClient(account);
@@ -2161,6 +1926,7 @@ const httpServer = http.createServer(async (req, res) => {
           let lastSeenMsgId = 0;
 
           try { await resolvePeer(client, chatId, account.id); } catch {}
+          console.log(`[listen-manual] 👂 Aguardando OK em ${chatId} (grupo ${groupId})`);
 
           while (Date.now() < deadline && !ctrl.signal.aborted) {
             try {
@@ -2168,12 +1934,16 @@ const httpServer = http.createServer(async (req, res) => {
               const result = await client.invoke(
                 new Api.messages.GetHistory({
                   peer: peer as any, limit: 10,
-                  offsetDate: 0, offsetId: 0, maxId: 0, minId: 0, hash: bigInt(0), addOffset: 0,
+                  offsetDate: 0, offsetId: 0, maxId: 0, minId: 0,
+                  hash: bigInt(0), addOffset: 0,
                 })
               ) as any;
 
               const recentMsgs = (result.messages ?? []).filter(
-                (m: any) => (m.className === "Message" || m._ === "message") && m.date >= startUnix && m.id > lastSeenMsgId
+                (m: any) =>
+                  (m.className === "Message" || m._ === "message") &&
+                  m.date >= startUnix &&
+                  m.id > lastSeenMsgId
               );
               if (recentMsgs.length > 0) {
                 lastSeenMsgId = Math.max(lastSeenMsgId, ...recentMsgs.map((m: any) => m.id as number));
@@ -2185,28 +1955,41 @@ const httpServer = http.createServer(async (req, res) => {
               });
 
               if (gotSignal && !ctrl.signal.aborted) {
+                console.log(`[listen-manual] ✓ Sinal detectado para grupo ${groupId}`);
                 listenMap.delete(groupId);
                 await supabase.from("groups").update({ listener_session_id: null }).eq("id", groupId);
 
-                const { data: grpFull } = await supabase.from("groups").select("name, telegram_chat_name, user_id").eq("id", groupId).single();
+                const { data: grpFull } = await supabase
+                  .from("groups")
+                  .select("name, telegram_chat_name, user_id")
+                  .eq("id", groupId)
+                  .single();
 
                 const scheduleStub = {
-                  id: `manual-${groupId}-${Date.now()}`,
-                  user_id: grpFull?.user_id ?? "",
-                  group_id: groupId,
-                  cron_expression: "0 0 * * 0",
-                  next_run_at: new Date().toISOString(),
-                  retry_window_seconds: 60, retry_interval_seconds: 5, retry_interval_max_seconds: 30,
-                  retry_count: 0, retry_until: null, last_attempt_at: null,
+                  id:                         `manual-${groupId}-${Date.now()}`,
+                  user_id:                    grpFull?.user_id ?? "",
+                  group_id:                   groupId,
+                  cron_expression:            "0 0 * * 0",
+                  next_run_at:                new Date().toISOString(),
+                  retry_window_seconds:       60,
+                  retry_interval_seconds:     5,
+                  retry_interval_max_seconds: 30,
+                  retry_count:                0,
+                  retry_until:                null,
+                  last_attempt_at:            null,
                   groups: {
-                    id: groupId, name: grpFull?.name ?? groupId,
-                    telegram_chat_id: chatId, telegram_chat_name: grpFull?.telegram_chat_name ?? null,
-                    group_type: "open" as const, group_members: members,
+                    id:                 groupId,
+                    name:               grpFull?.name ?? groupId,
+                    telegram_chat_id:   chatId,
+                    telegram_chat_name: grpFull?.telegram_chat_name ?? null,
+                    group_type:         "open" as const,
+                    group_members:      members,
                   },
                 };
 
                 const dispatchedAt = new Date();
                 const results      = await dispatchToGroup(scheduleStub as any, scheduleStub.groups, new Set());
+
                 const sentForMonitor = results
                   .filter(r => r.status === "sent")
                   .map(r => ({ account_id: r.account_id, message_text: r.message_text ?? "" }))
@@ -2214,18 +1997,25 @@ const httpServer = http.createServer(async (req, res) => {
                 if (sentForMonitor.length > 0) {
                   monitorPositions(chatId, sentForMonitor, scheduleStub.id, dispatchedAt, "open").catch(() => {});
                 }
+
+                const sent = results.filter(r => r.status === "sent").length;
+                console.log(`[listen-manual] ✓ ${sent} mensagem(ns) enviada(s) para grupo ${groupId}`);
                 return;
               }
             } catch (err: any) {
               if (!ctrl.signal.aborted) await new Promise(r => setTimeout(r, 2_000));
             }
+
             if (!ctrl.signal.aborted) await new Promise(r => setTimeout(r, LISTEN_POLL_MS));
           }
 
-          if (!ctrl.signal.aborted) await supabase.from("groups").update({ listener_session_id: null }).eq("id", groupId);
+          if (!ctrl.signal.aborted) {
+            await supabase.from("groups").update({ listener_session_id: null }).eq("id", groupId);
+          }
           listenMap.delete(groupId);
+
         } catch (err: any) {
-          console.error(`[listen-manual] Erro para grupo ${groupId}:`, err.message);
+          console.error(`[listen-manual] Erro inesperado para grupo ${groupId}:`, err.message);
           listenMap.delete(groupId);
         }
       })();
@@ -2234,6 +2024,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
+  // POST /groups/:id/dispatch
   const dispatchMatch = url.pathname.match(/^\/groups\/([^/]+)\/dispatch$/);
   if (req.method === "POST" && dispatchMatch) {
     const groupId = dispatchMatch[1];
@@ -2243,7 +2034,7 @@ const httpServer = http.createServer(async (req, res) => {
       const raw = await new Promise<string>((resolve, reject) => {
         let data = "";
         req.on("data", chunk => { data += chunk; });
-        req.on("end", () => resolve(data));
+        req.on("end",  () => resolve(data));
         req.on("error", reject);
       });
       if (raw) body = JSON.parse(raw);
@@ -2254,17 +2045,28 @@ const httpServer = http.createServer(async (req, res) => {
     try {
       const { data, error } = await supabase
         .from("groups")
-        .select(`id, name, telegram_chat_id, telegram_chat_name, group_type, group_members(id, message_text, position, is_active, accounts(id, name, phone_number, api_id, api_hash, session_string, is_active))`)
-        .eq("id", groupId).single();
+        .select(`
+          id, name, telegram_chat_id, telegram_chat_name, group_type,
+          group_members(
+            id, message_text, position, is_active,
+            accounts(id, name, phone_number, api_id, api_hash, session_string, is_active)
+          )
+        `)
+        .eq("id", groupId)
+        .single();
 
-      if (error || !data) return jsonResponse(res, 404, { error: "Grupo não encontrado" });
+      if (error || !data) {
+        return jsonResponse(res, 404, { error: "Grupo não encontrado" });
+      }
 
-      const group   = data as unknown as Group;
+      const group = data as unknown as Group;
       const members = (group.group_members ?? [])
         .filter(m => m.is_active && m.accounts?.is_active && m.accounts?.session_string)
         .sort((a, b) => a.position - b.position);
 
-      if (members.length === 0) return jsonResponse(res, 200, { ok: true, sent: 0, failed: 0, results: [] });
+      if (members.length === 0) {
+        return jsonResponse(res, 200, { ok: true, sent: 0, failed: 0, results: [] });
+      }
 
       let sent = 0, failed = 0;
       const results: Array<{ account_id: string; status: string; error?: string }> = [];
@@ -2277,13 +2079,17 @@ const httpServer = http.createServer(async (req, res) => {
 
         try {
           const client = await getClient(account);
-          const text   = member.message_text ?? "";
+          const text = member.message_text ?? "";
 
           if (sendToSelf) {
+            // Envia para Saved Messages — aquece peer cache sem afetar o grupo real
+            const stableId = makeRandomId();
             await Promise.race([
               client.invoke(new Api.messages.SendMessage({
-                peer: new Api.InputPeerSelf(), message: text || "[teste de aquecimento]",
-                randomId: makeRandomId(), noWebpage: true,
+                peer:      new Api.InputPeerSelf(),
+                message:   text || "[teste de aquecimento]",
+                randomId:  stableId,
+                noWebpage: true,
               })),
               new Promise<never>((_, r) => setTimeout(() => r(new Error("TIMEOUT")), SEND_TIMEOUT_MS)),
             ]);
@@ -2294,14 +2100,17 @@ const httpServer = http.createServer(async (req, res) => {
 
           sent++;
           results.push({ account_id: account.id, status: "sent" });
+          console.log(`[dispatch-http] ✓ ${account.phone_number}${sendToSelf ? " (self)" : ""}`);
         } catch (err: any) {
           failed++;
           results.push({ account_id: account.id, status: "failed", error: err.message });
+          console.error(`[dispatch-http] ✗ ${account?.phone_number}: ${err.message}`);
         }
       }
 
       return jsonResponse(res, 200, { ok: true, sent, failed, results });
     } catch (err: any) {
+      console.error("[dispatch-http] Erro inesperado:", err.message);
       return jsonResponse(res, 500, { error: err.message });
     }
   }
@@ -2321,10 +2130,13 @@ async function shutdown() {
 
   for (const t of prefetchTimers.values()) clearTimeout(t);
   prefetchTimers.clear();
+
   for (const t of sniperTimers.values()) clearTimeout(t);
   sniperTimers.clear();
+
   for (const t of scheduledTimers.values()) clearTimeout(t);
   scheduledTimers.clear();
+
   for (const t of keepaliveTimers.values()) clearInterval(t);
   keepaliveTimers.clear();
 
@@ -2332,6 +2144,7 @@ async function shutdown() {
 
   await Promise.all([...clients.entries()].map(async ([id, client]) => {
     try { await client.disconnect(); } catch {}
+    console.log(`[client] Desconectado: ${id}`);
   }));
   clients.clear();
 
@@ -2344,29 +2157,20 @@ process.on("SIGINT",  shutdown);
    INICIALIZAÇÃO
    ───────────────────────────────────────────────────────────────────────────── */
 async function init(): Promise<void> {
-  console.log("[worker] Iniciando v20 — invokeDeadline = scheduledAt + p10 - halfRtt...");
+  console.log("[worker] Iniciando...");
   await prewarmAccounts();
   await reloadSchedules();
-
   setInterval(async () => {
     try {
-      await Promise.allSettled([reloadSchedules(), reconnectDeadClients()]);
+      await Promise.allSettled([
+        reloadSchedules(),
+        reconnectDeadClients(),
+      ]);
     } catch (err) {
       console.error("[reload] Erro no reload periódico:", err);
     }
   }, RELOAD_INTERVAL_MS);
-
-  setInterval(async () => {
-    const anyClient = [...clients.values()].find(c => c.connected);
-    if (!anyClient) return;
-    const newOffset = await measureTelegramClockOffset(anyClient);
-    if (newOffset !== telegramClockOffsetMs) {
-      console.log(`[clock] Offset atualizado: ${telegramClockOffsetMs}ms → ${newOffset}ms (${clockOffsetQuality}) — apenas diagnóstico`);
-      telegramClockOffsetMs = newOffset;
-    }
-  }, CLOCK_OFFSET_REFRESH_MS);
-
-  console.log("[worker] Pronto v20. invokeDeadline = scheduledAt + p10 - halfRtt.");
+  console.log("[worker] Pronto.");
 }
 
 init().catch(err => {
