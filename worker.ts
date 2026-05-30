@@ -1,7 +1,14 @@
-// worker-v20.ts — dispatch worker Telegram, timing adaptativo por grupo
+// worker-v21.ts — dispatch worker Telegram, timing adaptativo por grupo
 //
-// PATCH — Fase 2 paralela: todas as contas disparam simultaneamente
-// após confirmação da conta 1, minimizando delay entre mensagens.
+// PATCH v21:
+//  - Fase 2: cada conta agora tem seu próprio loop de retry (igual à Fase 1)
+//    com budget próprio de PHASE2_BUDGET_MS. Uma falha transiente/too_early
+//    não descarta mais a conta — ela continua tentando até o budget acabar.
+//  - Pre-warm de peers aguardado com timeout (PREWARM_PEER_TIMEOUT_MS) antes
+//    do disparo, garantindo que todas as contas estejam quentes no momento certo.
+//  - Token buckets isolados por (accountId+scheduleId) para múltiplos
+//    disparos simultâneos não se interferirem.
+//  - Fase 2 lança todas as contas simultaneamente logo após conta 1 confirmar.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -62,6 +69,15 @@ const SNIPER_PAUSE_EVERY_N          = 10;
 const SNIPER_PAUSE_MS               = 5;
 const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
 const SNIPER_DONE_BLOCK_TTL_MS      = 500;
+
+// v21: Fase 2 tem budget próprio — começa logo após conta 1 confirmar.
+// Suficiente para absorver flood waits curtos e transientes, sem segurar
+// o update do schedule por tempo demais.
+const PHASE2_BUDGET_MS              = 20_000;
+
+// v21: timeout para aguardar pre-warm de peers antes do disparo.
+// Se algum peer demorar mais que isso, o disparo não é bloqueado.
+const PREWARM_PEER_TIMEOUT_MS       = 300;
 
 const DEFAULT_P10_MS = 0;
 const DEFAULT_P90_MS = 30_000;
@@ -168,6 +184,7 @@ const sniperFiringNow       = new Set<string>();
 const connectingPromises    = new Map<string, Promise<TelegramClient>>();
 const groupProfileCache     = new Map<string, GroupBehaviorProfile>();
 const scheduleGroupMap      = new Map<string, string>();
+// v21: token buckets isolados por "accountId:scheduleId"
 const sniperTokenBuckets    = new Map<string, TokenBucket>();
 
 let telegramClockOffsetMs = 0;
@@ -282,22 +299,28 @@ function evictPeersForAccount(accountId: string): void {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    TOKEN BUCKET RATE LIMITER
+   v21: chave = "accountId:scheduleId" para isolamento entre disparos simultâneos
    ───────────────────────────────────────────────────────────────────────────── */
 
-function acquireTokenBucket(accountId: string): number {
+function makeBucketKey(accountId: string, scheduleId: string): string {
+  return `${accountId}:${scheduleId}`;
+}
+
+function acquireTokenBucket(accountId: string, scheduleId: string): number {
+  const key   = makeBucketKey(accountId, scheduleId);
   const now   = Date.now();
-  let bucket  = sniperTokenBuckets.get(accountId);
+  let bucket  = sniperTokenBuckets.get(key);
 
   if (!bucket) {
     bucket = { tokens: SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT, lastRefill: now };
-    sniperTokenBuckets.set(accountId, bucket);
+    sniperTokenBuckets.set(key, bucket);
   }
 
   const elapsed   = now - bucket.lastRefill;
   const newTokens = (elapsed / 1000) * SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT;
 
   if (newTokens >= 1) {
-    bucket.tokens    = Math.min(SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT, bucket.tokens + Math.floor(newTokens));
+    bucket.tokens     = Math.min(SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT, bucket.tokens + Math.floor(newTokens));
     bucket.lastRefill = now;
   }
 
@@ -308,6 +331,18 @@ function acquireTokenBucket(accountId: string): number {
 
   const msPerToken = 1000 / SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT;
   return Math.ceil(msPerToken - elapsed % msPerToken);
+}
+
+function resetTokenBucket(accountId: string, scheduleId: string): void {
+  const key = makeBucketKey(accountId, scheduleId);
+  sniperTokenBuckets.set(key, {
+    tokens:     SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT,
+    lastRefill: Date.now(),
+  });
+}
+
+function deleteTokenBucket(accountId: string, scheduleId: string): void {
+  sniperTokenBuckets.delete(makeBucketKey(accountId, scheduleId));
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -818,6 +853,94 @@ async function sniperAttemptOnce(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
+   v21: LOOP DE RETRY PARA CONTAS DA FASE 2
+   Mesmo comportamento da Fase 1, mas com budget menor (PHASE2_BUDGET_MS).
+   Lançado em paralelo para todas as contas simultaneamente.
+   ───────────────────────────────────────────────────────────────────────────── */
+async function sniperPhase2Loop(
+  member: GroupMember,
+  chatId: string,
+  scheduleId: string,
+  p90Deadline: number,
+  positionIndex: number,
+  totalMembers: number
+): Promise<{ sentAt: Date | null; error: string | undefined }> {
+  const account  = member.accounts!;
+  const text     = member.message_text ?? "";
+  const randomId = makeRandomId();
+  const budgetEnd = Date.now() + PHASE2_BUDGET_MS;
+
+  let attempt      = 0;
+  let tooEarlyCount = 0;
+
+  resetTokenBucket(account.id, scheduleId);
+
+  try {
+    const client = clients.get(account.id) ?? await getClient(account);
+
+    while (Date.now() < budgetEnd) {
+      attempt++;
+
+      const isZone3      = Date.now() > p90Deadline;
+      const waitForToken = acquireTokenBucket(account.id, scheduleId);
+      if (waitForToken > 0) await new Promise(r => setTimeout(r, waitForToken));
+
+      const result = await sniperAttemptOnce(client, account, chatId, text, randomId);
+
+      if (result.outcome === "sent") {
+        const sentAt = new Date(result.sentAt!);
+        console.log(
+          `[sniper] ✓ Conta ${positionIndex}/${totalMembers} ${account.phone_number} ` +
+          `enviou na tentativa ${attempt} tooEarly=${tooEarlyCount} (${sentAt.toISOString()})`
+        );
+        return { sentAt, error: undefined };
+      }
+
+      if (result.outcome === "too_early") {
+        tooEarlyCount++;
+        if (isZone3) {
+          await new Promise(r => setTimeout(r, SNIPER_LATE_ZONE_INTERVAL_MS));
+        } else {
+          await new Promise(r => setTimeout(r, getTooEarlyIntervalMs(tooEarlyCount)));
+        }
+        continue;
+      }
+
+      if (result.outcome === "fatal") {
+        console.error(`[sniper] Fase2 erro fatal ${account.phone_number}: ${result.errorCode}`);
+        return { sentAt: null, error: result.errorCode };
+      }
+
+      if (result.outcome === "flood") {
+        const waitMs = (result.floodWaitSecs ?? 5) * 1000;
+        if (waitMs < budgetEnd - Date.now() - 500) {
+          await new Promise(r => setTimeout(r, waitMs));
+          continue;
+        }
+        console.warn(`[sniper] Fase2 FloodWait excede budget para ${account.phone_number}`);
+        return { sentAt: null, error: result.errorCode };
+      }
+
+      // transient — pausa mínima e tenta de novo
+      if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
+        await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
+      } else {
+        await new Promise(r => setTimeout(r, isZone3 ? SNIPER_LATE_ZONE_INTERVAL_MS : SNIPER_TRANSIENT_INTERVAL_MS));
+      }
+    }
+
+    console.warn(
+      `[sniper] Fase2 budget esgotado para ${account.phone_number} ` +
+      `após ${attempt} tentativas tooEarly=${tooEarlyCount}`
+    );
+    return { sentAt: null, error: `PHASE2_BUDGET_EXCEEDED após ${attempt} tentativas` };
+
+  } catch (err: any) {
+    return { sentAt: null, error: String(err?.message ?? err) };
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
    SNIPER LOOP — GRUPOS FECHADOS
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperFireClosed(scheduleId: string): Promise<void> {
@@ -917,25 +1040,41 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       `(${msUntilDeadline > 0 ? "+" : ""}${Math.round(msUntilDeadline)}ms até deadline)`
     );
 
-    // ── PRE-WARM PARALELO ─────────────────────────────────────────────────
-    // Conecta e resolve peers de todas as contas em background enquanto
-    // a Zona 1 dorme. Quando a Fase 2 disparar em paralelo, tudo já está
-    // quente — sem roundtrips ao Telegram por conta.
-    if (members.length > 1 && msUntilDeadline > 50) {
-      Promise.allSettled(
-        members.slice(1).map(async m => {
-          if (!m.accounts) return;
-          try {
-            const cl = await getClient(m.accounts);
-            await resolvePeer(cl, chatId, m.accounts.id);
-          } catch {}
-        })
-      ).catch(() => {});
+    // ── PRE-WARM PARALELO com timeout ─────────────────────────────────────
+    // v21: aguarda conclusão (até PREWARM_PEER_TIMEOUT_MS) para garantir que
+    // clientes e peers estejam prontos antes do disparo, eliminando RTTs extras
+    // durante a Fase 2. Se o timeout expirar, prossegue mesmo assim.
+    if (members.length > 1) {
+      const prewarmDeadline = Math.min(
+        invokeDeadline - SNIPER_SPIN_MAX_MS - 10, // não atrasar o spin final
+        Date.now() + PREWARM_PEER_TIMEOUT_MS
+      );
+      const prewarmMs = Math.max(0, prewarmDeadline - Date.now());
+
+      if (prewarmMs > 10) {
+        await Promise.race([
+          Promise.allSettled(
+            members.slice(1).map(async m => {
+              if (!m.accounts) return;
+              try {
+                const cl = await getClient(m.accounts);
+                await resolvePeer(cl, chatId, m.accounts.id);
+              } catch {}
+            })
+          ),
+          new Promise<void>(r => setTimeout(r, prewarmMs)),
+        ]);
+        console.log(
+          `[sniper] pre-warm concluído para ${members.length - 1} contas ` +
+          `(budget=${prewarmMs}ms)`
+        );
+      }
     }
 
     // ── Zona 1: sleep até invokeDeadline ─────────────────────────────────
-    if (msUntilDeadline > SNIPER_SPIN_MAX_MS) {
-      const sleepMs = msUntilDeadline - SNIPER_SPIN_MAX_MS;
+    const msToDeadlineNow = invokeDeadline - Date.now();
+    if (msToDeadlineNow > SNIPER_SPIN_MAX_MS) {
+      const sleepMs = msToDeadlineNow - SNIPER_SPIN_MAX_MS;
       await new Promise(r => setTimeout(r, sleepMs));
     }
     while (Date.now() < invokeDeadline) { /* busy-spin de precisão */ }
@@ -946,10 +1085,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       `${vsScheduledAtDeadline >= 0 ? "+" : ""}${vsScheduledAtDeadline}ms vs scheduledAt`
     );
 
-    sniperTokenBuckets.set(firstAccount.id, {
-      tokens:     SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT,
-      lastRefill: Date.now(),
-    });
+    resetTokenBucket(firstAccount.id, scheduleId);
 
     // ── Fase 1: loop agressivo na primeira conta ──────────────────────────
     const results: DispatchResult[] = [];
@@ -964,7 +1100,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       const now_ms  = Date.now();
       const isZone3 = now_ms > p90Deadline;
 
-      const waitForToken = acquireTokenBucket(firstAccount.id);
+      const waitForToken = acquireTokenBucket(firstAccount.id, scheduleId);
       if (waitForToken > 0) {
         await new Promise(r => setTimeout(r, waitForToken));
       }
@@ -1070,55 +1206,49 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       return;
     }
 
-    // ── Fase 2: demais contas em PARALELO ────────────────────────────────
-    // Todas disparam simultaneamente logo após a conta 1 confirmar.
-    // Clientes e peers já estão quentes do pre-warm acima.
-    // Delay efetivo entre contas = diferença de RTT individual (~<10ms).
-    await Promise.allSettled(
-      members.slice(1).map(async (member, idx) => {
-        const account = member.accounts!;
-        const text    = member.message_text ?? "";
-        let   sentAt: Date | null = null;
-        let   error: string | undefined;
-
-        try {
-          const client         = clients.get(account.id) ?? await getClient(account);
-          const memberRandomId = makeRandomId();
-
-          sniperTokenBuckets.set(account.id, {
-            tokens:     SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT,
-            lastRefill: Date.now(),
-          });
-
-          const waitForToken = acquireTokenBucket(account.id);
-          if (waitForToken > 0) await new Promise(r => setTimeout(r, waitForToken));
-
-          const res = await sniperAttemptOnce(client, account, chatId, text, memberRandomId);
-          if (res.outcome === "sent") {
-            sentAt = new Date(res.sentAt!);
-            console.log(`[sniper] ✓ Conta ${idx + 2}/${members.length} ${account.phone_number} enviou`);
-            results.push({ account_id: account.id, message_text: member.message_text, status: "sent", retryable: false });
-          } else {
-            throw new Error(res.errorCode ?? res.outcome);
-          }
-        } catch (err: any) {
-          error = String(err?.message ?? "");
-          console.error(`[sniper] ✗ Conta ${idx + 2}/${members.length} ${account.phone_number}: ${error}`);
-          results.push({ account_id: account.id, message_text: member.message_text, status: "failed", retryable: isRetryableError(error), error });
-        }
-
-        supabase.from("dispatch_logs").insert({
-          user_id: schedule.user_id, group_id: group.id,
-          account_id: account.id, schedule_id: schedule.id,
-          status: sentAt ? "sent" : "failed", message_text: member.message_text,
-          position_rank: idx + 2, group_name_snapshot: group.name,
-          chat_name_snapshot: group.telegram_chat_name,
-          sent_at: sentAt ? sentAt.toISOString() : null, error_message: error ?? null,
-        }).then(({ error: e }) => {
-          if (e) console.error(`[sniper][log] Falha ao inserir log para ${account.id}:`, e.message);
-        });
-      })
+    // ── Fase 2: todas as demais contas em PARALELO com loop de retry ──────
+    // v21: cada conta roda sniperPhase2Loop — loop completo com too_early,
+    // transient, flood handling. Todas lançadas simultaneamente. Clientes
+    // e peers já aquecidos pelo pre-warm acima.
+    const phase2Results = await Promise.allSettled(
+      members.slice(1).map((member, idx) =>
+        sniperPhase2Loop(member, chatId, scheduleId, p90Deadline, idx + 2, members.length)
+      )
     );
+
+    for (let idx = 0; idx < members.slice(1).length; idx++) {
+      const member  = members[idx + 1];
+      const account = member.accounts!;
+      const settled = phase2Results[idx];
+
+      let sentAt: Date | null = null;
+      let error: string | undefined;
+
+      if (settled.status === "fulfilled") {
+        sentAt = settled.value.sentAt;
+        error  = settled.value.error;
+      } else {
+        error = String(settled.reason?.message ?? settled.reason);
+      }
+
+      if (sentAt) {
+        results.push({ account_id: account.id, message_text: member.message_text, status: "sent", retryable: false });
+      } else {
+        console.error(`[sniper] ✗ Conta ${idx + 2}/${members.length} ${account.phone_number}: ${error}`);
+        results.push({ account_id: account.id, message_text: member.message_text, status: "failed", retryable: isRetryableError(error ?? ""), error });
+      }
+
+      supabase.from("dispatch_logs").insert({
+        user_id: schedule.user_id, group_id: group.id,
+        account_id: account.id, schedule_id: schedule.id,
+        status: sentAt ? "sent" : "failed", message_text: member.message_text,
+        position_rank: idx + 2, group_name_snapshot: group.name,
+        chat_name_snapshot: group.telegram_chat_name,
+        sent_at: sentAt ? sentAt.toISOString() : null, error_message: error ?? null,
+      }).then(({ error: e }) => {
+        if (e) console.error(`[sniper][log] Falha ao inserir log para ${account.id}:`, e.message);
+      });
+    }
 
     // ── Fase 3: monitoramento de posições ────────────────────────────────
     const sentForMonitor = results
@@ -1134,8 +1264,11 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     await updateScheduleAfterDispatch(schedule, results, firstSentAt, "closed");
 
   } finally {
-    for (const m of (schedulePrefetchCache.get(scheduleId)?.groups?.group_members ?? [])) {
-      if (m.accounts?.id) sniperTokenBuckets.delete(m.accounts.id);
+    // Limpa token buckets de todos os membros deste schedule
+    const cachedSchedule = schedulePrefetchCache.get(scheduleId);
+    const membersForCleanup = cachedSchedule?.groups?.group_members ?? [];
+    for (const m of membersForCleanup) {
+      if (m.accounts?.id) deleteTokenBucket(m.accounts.id, scheduleId);
     }
     sniperFiringNow.delete(scheduleId);
     firingNow.add(scheduleId);
@@ -2209,7 +2342,7 @@ process.on("SIGINT",  shutdown);
    INICIALIZAÇÃO
    ───────────────────────────────────────────────────────────────────────────── */
 async function init(): Promise<void> {
-  console.log("[worker] Iniciando v20 — Fase 2 paralela, pre-warm em background...");
+  console.log("[worker] Iniciando v21 — Fase 2 com loop de retry, pre-warm aguardado...");
   await prewarmAccounts();
   await reloadSchedules();
 
@@ -2231,7 +2364,7 @@ async function init(): Promise<void> {
     }
   }, CLOCK_OFFSET_REFRESH_MS);
 
-  console.log("[worker] Pronto. Fase 2 paralela ativa — delay entre contas = RTT individual.");
+  console.log("[worker] Pronto. Fase 2 com retry loop ativo — todas as contas disparam em paralelo com resiliência.");
 }
 
 init().catch(err => {
