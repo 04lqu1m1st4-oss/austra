@@ -38,52 +38,14 @@
 // SOLUÇÃO v20 — invokeDeadline = scheduledAt + p10 - halfRtt
 //
 //   p10 é o percentil 10 do histórico de quando o grupo REALMENTE abriu,
-//   medido como (sentAt - scheduledAt) em ms. Exemplos:
+//   medido como (sentAt - scheduledAt) em ms.
 //
-//     p10 = 0ms   → grupo nunca abre antes do horário → floor = scheduledAt - halfRtt
-//                   (pacote chega exatamente em scheduledAt)
-//
-//     p10 = -300ms → grupo historicamente abre 300ms antes → floor recuado para
-//                    scheduledAt - 300ms - halfRtt (pode tentar mais cedo)
-//
-//     p10 = +500ms → grupo lento → floor avançado para scheduledAt + 500ms - halfRtt
-//                    (não perde tempo tentando antes)
-//
-//   INVARIANTE DE SEGURANÇA:
-//     Para grupos sem perfil suficiente (< 3 amostras), p10 = 0.
-//     Isso garante que o sistema NUNCA envia antes do horário sem respaldo
-//     histórico real. O recuo do floor só acontece se os dados confirmam.
-//
-//   Eliminação do flag opens_early:
-//     O flag binário opens_early era frágil — classificava o grupo uma vez
-//     e aplicava uma estratégia fixa independente da variabilidade semana a
-//     semana. Com p10/p90 contínuos, o sistema se adapta automaticamente:
-//     se p10 migra de 0 para -200ms ao longo de 20 semanas, o floor recua
-//     gradualmente. Sem reclassificação manual, sem reset de perfil.
-//
-// ZONAS DO LOOP (substituem o loop único de 1ms flat):
-//
-//   ZONA 1 — Antes de invokeDeadline: sleep
-//     O sniper pode acordar SNIPER_BEFORE_MS antes, mas não tenta nada.
-//     Usa esse tempo para garantir conexão quente.
-//
-//   ZONA 2 — Entre p10 e p90 (zona de incerteza real): loop 1ms
-//     O grupo pode abrir a qualquer momento nesse intervalo.
-//     Loop agressivo faz sentido aqui.
-//
-//   ZONA 3 — Depois de p90 (atraso incomum): loop 50ms
-//     Algo está fora do padrão. Reduz pressão no rate limit enquanto aguarda.
-//
-// scheduleTimer — ajuste do wake-up para opens_early histórico:
-//   Se p10 < 0, o sniper precisa acordar mais cedo que SNIPER_BEFORE_MS.
-//   sniperDelay = effectiveDelay - SNIPER_BEFORE_MS - Math.max(0, -p10)
-//   Isso garante que o floor seja atingível sem correria de última hora.
-//
-// FIXES v13/v14/v16/v19 MANTIDOS:
-//   - Throttle progressivo suave (base 1ms, começa em 200 too_early)
-//   - Rate limit shield 25 req/s
-//   - SNIPER_TRANSIENT_INTERVAL_MS = 1ms
-//   - clockOffset medido e logado apenas para diagnóstico
+// PATCH — Pre-warm paralelo na Fase 2:
+//   Elimina delay de ~40ms entre envios causado por getClient sequencial
+//   e resolvePeer sem cache dentro de sniperAttemptOnce.
+//   Enquanto a Fase 1 ainda está no loop de tentativas, conecta todas as
+//   contas restantes e popula o peerCache em paralelo — de graça, sem
+//   custo de tempo. Quando a Fase 2 começa, tudo já está quente.
 
 
 import { createClient } from "@supabase/supabase-js";
@@ -119,11 +81,7 @@ const MONITOR_HISTORY_LIMIT         = 150;
 const OPEN_GROUP_LISTEN_TIMEOUT_MS  = 2 * 60 * 60_000;
 const SEND_RETRY_BACKOFF_MAX_MS     = 8_000;
 
-// Quanto antes do horário o sniper acorda — apenas para garantir conexão quente.
-// O invoke só começa em invokeDeadline = scheduledAt + p10 - halfRtt.
 const SNIPER_BEFORE_MS              = 100;
-
-// Busy-spin de precisão no busy-wait final
 const SNIPER_SPIN_MAX_MS            = 2;
 
 const GROUP_PROFILE_SAMPLE_SIZE     = 20;
@@ -132,15 +90,10 @@ const CLOCK_PROBE_COUNT             = 5;
 
 const SNIPER_SEND_TIMEOUT_MS        = 800;
 
-// Intervalo base do loop too_early (Zona 2) e transient
 const SNIPER_TOO_EARLY_BASE_INTERVAL_MS = 1;
 const SNIPER_TRANSIENT_INTERVAL_MS      = 1;
-
-// Intervalo do loop na Zona 3 (depois de p90 — atraso incomum)
 const SNIPER_LATE_ZONE_INTERVAL_MS      = 50;
 
-// Throttle progressivo — só entra depois de muitas tentativas too_early para
-// não prejudicar grupos que abrem logo após o horário
 const TOO_EARLY_THROTTLE_STEPS: Array<[number, number]> = [
   [200,      2],
   [1000,     5],
@@ -148,7 +101,6 @@ const TOO_EARLY_THROTTLE_STEPS: Array<[number, number]> = [
   [Infinity, 15],
 ];
 
-// Rate limit shield: 25 req/s por conta
 const SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT = 25;
 
 const SNIPER_PAUSE_EVERY_N          = 10;
@@ -157,9 +109,6 @@ const SNIPER_INTER_ACCOUNT_DELAY_MS = 1;
 const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
 const SNIPER_DONE_BLOCK_TTL_MS      = 500;
 
-// Defaults para grupos sem perfil suficiente (< 3 amostras):
-//   p10 = 0  → floor = scheduledAt - halfRtt (nunca antes do horário)
-//   p90 = 30_000ms → Zona 3 só ativa depois de 30s de too_early
 const DEFAULT_P10_MS = 0;
 const DEFAULT_P90_MS = 30_000;
 
@@ -233,7 +182,6 @@ interface GroupBehaviorProfile {
   offset_p10_ms:           number;
   offset_p50_ms:           number;
   offset_p90_ms:           number;
-  // opens_early removido em v20 — substituído por p10/p90 contínuos
   min_safe_guard_ms:       number;
   sample_count:            number;
   open_at_start_ratio:     number;
@@ -356,21 +304,11 @@ function getTooEarlyIntervalMs(tooEarlyCount: number): number {
   return 15;
 }
 
-/**
- * Retorna o p10 efetivo do grupo.
- * INVARIANTE DE SEGURANÇA: retorna DEFAULT_P10_MS (0) se não há perfil
- * suficiente, garantindo que o floor nunca recue sem respaldo histórico.
- */
 function getEffectiveP10(profile: GroupBehaviorProfile | undefined): number {
   if (!profile || profile.sample_count < 3) return DEFAULT_P10_MS;
   return profile.offset_p10_ms;
 }
 
-/**
- * Retorna o p90 efetivo do grupo.
- * Sem perfil suficiente, usa DEFAULT_P90_MS (30s) para cobrir o range
- * completo sem assumir nada sobre o comportamento do grupo.
- */
 function getEffectiveP90(profile: GroupBehaviorProfile | undefined): number {
   if (!profile || profile.sample_count < 3) return DEFAULT_P90_MS;
   return profile.offset_p90_ms;
@@ -599,7 +537,6 @@ async function persistGroupDispatchSample(
     const medianTooEarlyCount    = sortedTooEarly[Math.floor(n / 2)] ?? 0;
     const estimatedOpenDelayMs   = medianTooEarlyCount * SNIPER_TOO_EARLY_BASE_INTERVAL_MS;
 
-    // min_safe_guard_ms mantido para compatibilidade com versões anteriores
     const min_safe_guard_ms = p10 < 0
       ? Math.max(-30_000, p10 - 50)
       : Math.max(0, estimatedOpenDelayMs - 20);
@@ -928,21 +865,6 @@ async function sniperAttemptOnce(
 
 /* ─────────────────────────────────────────────────────────────────────────────
    SNIPER LOOP — GRUPOS FECHADOS
-   ═══════════════════════════════════════════════════════════════════════════
-   FILOSOFIA v20:
-     invokeDeadline = scheduledAt + p10 - halfRtt
-
-     p10 é o percentil 10 do histórico real de quando o grupo abriu.
-     Sem perfil suficiente, p10 = 0 → deadline = scheduledAt - halfRtt.
-
-     INVARIANTE: o sistema NUNCA envia antes do horário sem respaldo histórico.
-     O recuo do floor só acontece se os dados confirmam que o grupo já abriu
-     antes em semanas anteriores.
-
-   ZONAS DO LOOP:
-     Zona 1 → antes de invokeDeadline: sleep (conexão quente, sem tentativas)
-     Zona 2 → [p10, p90]: loop agressivo 1ms (zona de incerteza real)
-     Zona 3 → depois de p90: loop 50ms (atraso incomum, reduz pressão)
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperFireClosed(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -1022,14 +944,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     const hasProfile = (profile?.sample_count ?? 0) >= 3;
 
     // ── invokeDeadline (v20): scheduledAt + p10 - halfRtt ────────────────
-    //
-    // INVARIANTE DE SEGURANÇA:
-    //   p10 = 0 para grupos sem perfil → deadline = scheduledAt - halfRtt
-    //   O pacote chega ao Telegram exatamente em scheduledAt.
-    //
-    //   p10 < 0 apenas se o histórico real confirma abertura antecipada.
-    //   p10 > 0 se o grupo consistentemente abre depois do horário.
-    //
     const invokeDeadline  = scheduledAt + p10 - estimatedOneWayRttMs;
     const p90Deadline     = scheduledAt + p90;
     const msUntilDeadline = invokeDeadline - Date.now();
@@ -1049,8 +963,25 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       `(${msUntilDeadline > 0 ? "+" : ""}${Math.round(msUntilDeadline)}ms até deadline)`
     );
 
+    // ── PRE-WARM PARALELO (patch anti-delay) ─────────────────────────────
+    // Enquanto ainda temos tempo antes de invokeDeadline, conecta e resolve
+    // peers de todas as contas restantes em paralelo.
+    // Quando a Fase 2 começar, getClient() e resolvePeer() retornam do cache
+    // instantaneamente — eliminando o delay de ~40ms por conta.
+    if (members.length > 1 && msUntilDeadline > 50) {
+      Promise.allSettled(
+        members.slice(1).map(async m => {
+          if (!m.accounts) return;
+          try {
+            const cl = await getClient(m.accounts);
+            await resolvePeer(cl, chatId, m.accounts.id);
+          } catch {}
+        })
+      ).catch(() => {});
+      // Não aguarda — roda em background enquanto Zona 1 dorme
+    }
+
     // ── Zona 1: sleep até invokeDeadline ─────────────────────────────────
-    // Usa o tempo para garantir conexão quente. Sem tentativas.
     if (msUntilDeadline > SNIPER_SPIN_MAX_MS) {
       const sleepMs = msUntilDeadline - SNIPER_SPIN_MAX_MS;
       await new Promise(r => setTimeout(r, sleepMs));
@@ -1079,9 +1010,8 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     while (Date.now() < budgetEnd) {
       attempt++;
 
-      // Determina a zona atual para ajustar o intervalo
       const now_ms  = Date.now();
-      const isZone3 = now_ms > p90Deadline; // depois de p90 — atraso incomum
+      const isZone3 = now_ms > p90Deadline;
 
       // Rate limit shield
       const waitForToken = acquireTokenBucket(firstAccount.id);
@@ -1122,13 +1052,11 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         tooEarlyCount++;
 
         if (isZone3) {
-          // Zona 3: atraso incomum — reduz pressão no rate limit
           if (tooEarlyCount % 50 === 0) {
             console.log(`[sniper] ⏳ too_early×${tooEarlyCount} — Zona 3 (p90+${Date.now() - p90Deadline}ms) → ${SNIPER_LATE_ZONE_INTERVAL_MS}ms`);
           }
           await new Promise(r => setTimeout(r, SNIPER_LATE_ZONE_INTERVAL_MS));
         } else {
-          // Zona 2: incerteza real — loop agressivo com throttle progressivo
           const intervalMs = getTooEarlyIntervalMs(tooEarlyCount);
           if (tooEarlyCount % 200 === 0) {
             console.log(`[sniper] ⏳ too_early×${tooEarlyCount} — Zona 2 — intervalo: ${intervalMs}ms`);
@@ -1160,7 +1088,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         }
       }
 
-      // transient: 1ms base (Zona 2) ou 50ms (Zona 3)
+      // transient
       if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
         await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
       } else {
@@ -1193,6 +1121,8 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     }
 
     // ── Fase 2: demais contas em sequência ───────────────────────────────
+    // Neste ponto getClient() e resolvePeer() já estão quentes para todas
+    // as contas (pre-warm paralelo acima). Delay efetivo: ~1ms por conta.
     for (let i = 1; i < members.length; i++) {
       await new Promise(r => setTimeout(r, SNIPER_INTER_ACCOUNT_DELAY_MS));
 
@@ -1203,7 +1133,8 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       let   error: string | undefined;
 
       try {
-        const client         = await getClient(account);
+        // Usa cliente já quente do pre-warm; reconecta apenas se necessário
+        const client         = clients.get(account.id) ?? await getClient(account);
         const memberRandomId = makeRandomId();
 
         sniperTokenBuckets.set(account.id, {
@@ -1636,18 +1567,6 @@ async function fireSchedule(scheduleId: string): Promise<void> {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    TIMER DE PRECISÃO + PRE-FETCH + SNIPER
-   ═══════════════════════════════════════════════════════════════════════════
-   v20: o sniperDelay é ajustado para garantir que o sniper acorde cedo o
-   suficiente quando p10 < 0 (grupo que historicamente abre antes do horário).
-
-   sniperDelay = effectiveDelay - SNIPER_BEFORE_MS - Math.max(0, -p10)
-
-   Exemplos:
-     p10 = 0    → sniperDelay = effectiveDelay - 100ms (comportamento padrão)
-     p10 = -300ms → sniperDelay = effectiveDelay - 100ms - 300ms = effectiveDelay - 400ms
-                    O sniper acorda 400ms antes e usa invokeDeadline = scheduledAt - 300ms - halfRtt
-     p10 = +500ms → sniperDelay = effectiveDelay - 100ms (sem ajuste negativo)
-                    O sniper acorda normalmente e espera dentro do sniperFireClosed
    ───────────────────────────────────────────────────────────────────────────── */
 function scheduleTimer(
   scheduleId: string,
@@ -1705,7 +1624,6 @@ function scheduleTimer(
     const profile         = resolvedGroupId ? groupProfileCache.get(resolvedGroupId) : undefined;
     const p10             = getEffectiveP10(profile);
 
-    // Acorda mais cedo se p10 < 0 (grupo que historicamente abre antes do horário)
     const extraLeadMs       = Math.max(0, -p10);
     const totalSniperLeadMs = SNIPER_BEFORE_MS + extraLeadMs;
 
@@ -2344,7 +2262,7 @@ process.on("SIGINT",  shutdown);
    INICIALIZAÇÃO
    ───────────────────────────────────────────────────────────────────────────── */
 async function init(): Promise<void> {
-  console.log("[worker] Iniciando v20 — invokeDeadline = scheduledAt + p10 - halfRtt...");
+  console.log("[worker] Iniciando v20 + patch anti-delay Fase 2...");
   await prewarmAccounts();
   await reloadSchedules();
 
@@ -2366,7 +2284,7 @@ async function init(): Promise<void> {
     }
   }, CLOCK_OFFSET_REFRESH_MS);
 
-  console.log("[worker] Pronto v20. invokeDeadline = scheduledAt + p10 - halfRtt.");
+  console.log("[worker] Pronto v20 + patch anti-delay. invokeDeadline = scheduledAt + p10 - halfRtt.");
 }
 
 init().catch(err => {
