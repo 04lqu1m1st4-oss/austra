@@ -1,14 +1,17 @@
-// worker-v21.ts — dispatch worker Telegram, timing adaptativo por grupo
+// worker-v22.ts — dispatch worker Telegram, todas as contas em loop paralelo
 //
-// PATCH v21:
-//  - Fase 2: cada conta agora tem seu próprio loop de retry (igual à Fase 1)
-//    com budget próprio de PHASE2_BUDGET_MS. Uma falha transiente/too_early
-//    não descarta mais a conta — ela continua tentando até o budget acabar.
-//  - Pre-warm de peers aguardado com timeout (PREWARM_PEER_TIMEOUT_MS) antes
-//    do disparo, garantindo que todas as contas estejam quentes no momento certo.
-//  - Token buckets isolados por (accountId+scheduleId) para múltiplos
-//    disparos simultâneos não se interferirem.
-//  - Fase 2 lança todas as contas simultaneamente logo após conta 1 confirmar.
+// PATCH v22 — "Cirúrgico":
+//  - SharedGate: contas 2..N entram em loop ativo JUNTO com a conta 1.
+//    Elas ficam em spin de `resolvePeer` + preparação, bloqueadas num
+//    Promise.race([gate, budget]) antes do invoke real.
+//  - Quando conta 1 detecta que o grupo abriu (1º "sent" OU acumulou
+//    GATE_OPEN_TOO_EARLY_THRESHOLD too_early consecutivos), ela resolve a gate
+//    imediatamente — todas as outras invocam sem delay adicional.
+//  - Token buckets isolados por (accountId+scheduleId) mantidos.
+//  - Pre-warm ainda roda (peers e clients aquecidos), mas a gate elimina
+//    o overhead de "esperar conta 1 confirmar, depois lançar Fase 2".
+//  - Fase 2 não existe mais como conceito separado: é um loop unificado
+//    onde conta 1 lidera e as demais seguem via gate.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -70,13 +73,14 @@ const SNIPER_PAUSE_MS               = 5;
 const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
 const SNIPER_DONE_BLOCK_TTL_MS      = 500;
 
-// v21: Fase 2 tem budget próprio — começa logo após conta 1 confirmar.
-// Suficiente para absorver flood waits curtos e transientes, sem segurar
-// o update do schedule por tempo demais.
-const PHASE2_BUDGET_MS              = 20_000;
+// v22: gate abre quando conta 1 acumula este número de too_early consecutivos
+// (indica que o grupo está prestes a abrir — contas 2..N devem invocar agora)
+const GATE_OPEN_TOO_EARLY_THRESHOLD = 50;
 
-// v21: timeout para aguardar pre-warm de peers antes do disparo.
-// Se algum peer demorar mais que isso, o disparo não é bloqueado.
+// v22: budget para contas 2..N após a gate abrir
+const FOLLOWER_BUDGET_MS            = 20_000;
+
+// v22: timeout do pre-warm de peers antes do disparo
 const PREWARM_PEER_TIMEOUT_MS       = 300;
 
 const DEFAULT_P10_MS = 0;
@@ -166,6 +170,27 @@ interface TokenBucket {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
+   SHARED GATE — sincroniza disparo de contas 2..N com conta 1
+   ───────────────────────────────────────────────────────────────────────────── */
+class SharedGate {
+  private _resolve!: () => void;
+  readonly promise: Promise<void>;
+  private _opened = false;
+
+  constructor() {
+    this.promise = new Promise<void>(resolve => { this._resolve = resolve; });
+  }
+
+  open(): void {
+    if (this._opened) return;
+    this._opened = true;
+    this._resolve();
+  }
+
+  get opened(): boolean { return this._opened; }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
    ESTADO GLOBAL
    ───────────────────────────────────────────────────────────────────────────── */
 
@@ -184,7 +209,6 @@ const sniperFiringNow       = new Set<string>();
 const connectingPromises    = new Map<string, Promise<TelegramClient>>();
 const groupProfileCache     = new Map<string, GroupBehaviorProfile>();
 const scheduleGroupMap      = new Map<string, string>();
-// v21: token buckets isolados por "accountId:scheduleId"
 const sniperTokenBuckets    = new Map<string, TokenBucket>();
 
 let telegramClockOffsetMs = 0;
@@ -299,7 +323,7 @@ function evictPeersForAccount(accountId: string): void {
 
 /* ─────────────────────────────────────────────────────────────────────────────
    TOKEN BUCKET RATE LIMITER
-   v21: chave = "accountId:scheduleId" para isolamento entre disparos simultâneos
+   chave = "accountId:scheduleId" para isolamento entre disparos simultâneos
    ───────────────────────────────────────────────────────────────────────────── */
 
 function makeBucketKey(accountId: string, scheduleId: string): string {
@@ -334,8 +358,7 @@ function acquireTokenBucket(accountId: string, scheduleId: string): number {
 }
 
 function resetTokenBucket(accountId: string, scheduleId: string): void {
-  const key = makeBucketKey(accountId, scheduleId);
-  sniperTokenBuckets.set(key, {
+  sniperTokenBuckets.set(makeBucketKey(accountId, scheduleId), {
     tokens:     SNIPER_MAX_REQ_PER_SECOND_PER_ACCOUNT,
     lastRefill: Date.now(),
   });
@@ -736,7 +759,7 @@ async function resolvePeer(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   ENVIO COM RETRY INTERNO
+   ENVIO COM RETRY INTERNO (grupos abertos)
    ───────────────────────────────────────────────────────────────────────────── */
 async function sendMessage(
   client: TelegramClient,
@@ -853,14 +876,16 @@ async function sniperAttemptOnce(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   v21: LOOP DE RETRY PARA CONTAS DA FASE 2
-   Mesmo comportamento da Fase 1, mas com budget menor (PHASE2_BUDGET_MS).
-   Lançado em paralelo para todas as contas simultaneamente.
+   v22: LOOP DE CONTA SEGUIDORA (contas 2..N)
+   Aguarda a gate abrir, depois entra em loop agressivo igual à conta 1.
+   A gate é resolvida pela conta 1 assim que ela envia OU acumula
+   GATE_OPEN_TOO_EARLY_THRESHOLD too_early (grupo está prestes a abrir).
    ───────────────────────────────────────────────────────────────────────────── */
-async function sniperPhase2Loop(
+async function followerLoop(
   member: GroupMember,
   chatId: string,
   scheduleId: string,
+  gate: SharedGate,
   p90Deadline: number,
   positionIndex: number,
   totalMembers: number
@@ -868,20 +893,34 @@ async function sniperPhase2Loop(
   const account  = member.accounts!;
   const text     = member.message_text ?? "";
   const randomId = makeRandomId();
-  const budgetEnd = Date.now() + PHASE2_BUDGET_MS;
-
-  let attempt      = 0;
-  let tooEarlyCount = 0;
 
   resetTokenBucket(account.id, scheduleId);
 
   try {
+    // Garante cliente conectado e peer resolvido ANTES da gate — já feito no
+    // pre-warm, mas garantimos aqui sem bloquear o disparo principal.
     const client = clients.get(account.id) ?? await getClient(account);
+
+    // Aguarda gate ou budget
+    const budgetEnd = Date.now() + FOLLOWER_BUDGET_MS;
+    await Promise.race([
+      gate.promise,
+      new Promise<void>(r => setTimeout(r, FOLLOWER_BUDGET_MS)),
+    ]);
+
+    if (Date.now() >= budgetEnd) {
+      return { sentAt: null, error: "FOLLOWER_GATE_TIMEOUT" };
+    }
+
+    // Gate aberta — entra em loop agressivo imediatamente
+    let attempt       = 0;
+    let tooEarlyCount = 0;
 
     while (Date.now() < budgetEnd) {
       attempt++;
 
-      const isZone3      = Date.now() > p90Deadline;
+      const isZone3 = Date.now() > p90Deadline;
+
       const waitForToken = acquireTokenBucket(account.id, scheduleId);
       if (waitForToken > 0) await new Promise(r => setTimeout(r, waitForToken));
 
@@ -898,16 +937,12 @@ async function sniperPhase2Loop(
 
       if (result.outcome === "too_early") {
         tooEarlyCount++;
-        if (isZone3) {
-          await new Promise(r => setTimeout(r, SNIPER_LATE_ZONE_INTERVAL_MS));
-        } else {
-          await new Promise(r => setTimeout(r, getTooEarlyIntervalMs(tooEarlyCount)));
-        }
+        await new Promise(r => setTimeout(r, isZone3 ? SNIPER_LATE_ZONE_INTERVAL_MS : getTooEarlyIntervalMs(tooEarlyCount)));
         continue;
       }
 
       if (result.outcome === "fatal") {
-        console.error(`[sniper] Fase2 erro fatal ${account.phone_number}: ${result.errorCode}`);
+        console.error(`[sniper] Follower erro fatal ${account.phone_number}: ${result.errorCode}`);
         return { sentAt: null, error: result.errorCode };
       }
 
@@ -917,11 +952,11 @@ async function sniperPhase2Loop(
           await new Promise(r => setTimeout(r, waitMs));
           continue;
         }
-        console.warn(`[sniper] Fase2 FloodWait excede budget para ${account.phone_number}`);
+        console.warn(`[sniper] Follower FloodWait excede budget para ${account.phone_number}`);
         return { sentAt: null, error: result.errorCode };
       }
 
-      // transient — pausa mínima e tenta de novo
+      // transient
       if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
         await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
       } else {
@@ -930,10 +965,10 @@ async function sniperPhase2Loop(
     }
 
     console.warn(
-      `[sniper] Fase2 budget esgotado para ${account.phone_number} ` +
+      `[sniper] Follower budget esgotado para ${account.phone_number} ` +
       `após ${attempt} tentativas tooEarly=${tooEarlyCount}`
     );
-    return { sentAt: null, error: `PHASE2_BUDGET_EXCEEDED após ${attempt} tentativas` };
+    return { sentAt: null, error: `FOLLOWER_BUDGET_EXCEEDED após ${attempt} tentativas` };
 
   } catch (err: any) {
     return { sentAt: null, error: String(err?.message ?? err) };
@@ -941,7 +976,7 @@ async function sniperPhase2Loop(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   SNIPER LOOP — GRUPOS FECHADOS
+   SNIPER LOOP — GRUPOS FECHADOS (v22: loop unificado com SharedGate)
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperFireClosed(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -1020,7 +1055,6 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     const p90        = getEffectiveP90(profile);
     const hasProfile = (profile?.sample_count ?? 0) >= 3;
 
-    // ── invokeDeadline: scheduledAt + p10 - halfRtt ───────────────────────
     const invokeDeadline  = scheduledAt + p10 - estimatedOneWayRttMs;
     const p90Deadline     = scheduledAt + p90;
     const msUntilDeadline = invokeDeadline - Date.now();
@@ -1041,12 +1075,10 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     );
 
     // ── PRE-WARM PARALELO com timeout ─────────────────────────────────────
-    // v21: aguarda conclusão (até PREWARM_PEER_TIMEOUT_MS) para garantir que
-    // clientes e peers estejam prontos antes do disparo, eliminando RTTs extras
-    // durante a Fase 2. Se o timeout expirar, prossegue mesmo assim.
+    // Garante clients e peers quentes antes do disparo.
     if (members.length > 1) {
       const prewarmDeadline = Math.min(
-        invokeDeadline - SNIPER_SPIN_MAX_MS - 10, // não atrasar o spin final
+        invokeDeadline - SNIPER_SPIN_MAX_MS - 10,
         Date.now() + PREWARM_PEER_TIMEOUT_MS
       );
       const prewarmMs = Math.max(0, prewarmDeadline - Date.now());
@@ -1085,7 +1117,20 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       `${vsScheduledAtDeadline >= 0 ? "+" : ""}${vsScheduledAtDeadline}ms vs scheduledAt`
     );
 
+    // ── SharedGate — sincroniza todas as contas ───────────────────────────
+    // v22: criamos a gate ANTES de lançar os followers.
+    // A conta 1 abre a gate quando:
+    //   (a) consegue enviar — followers invocam imediatamente
+    //   (b) acumula GATE_OPEN_TOO_EARLY_THRESHOLD too_early — grupo está
+    //       iminente, followers devem começar a tentar agora
+    const gate = new SharedGate();
+
     resetTokenBucket(firstAccount.id, scheduleId);
+
+    // ── Lança followers em paralelo AGORA (antes de conta 1 enviar) ───────
+    const followerPromises = members.slice(1).map((member, idx) =>
+      followerLoop(member, chatId, scheduleId, gate, p90Deadline, idx + 2, members.length)
+    );
 
     // ── Fase 1: loop agressivo na primeira conta ──────────────────────────
     const results: DispatchResult[] = [];
@@ -1127,6 +1172,9 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
           status: "sent", retryable: false,
         });
 
+        // Abre gate — followers invocam imediatamente
+        gate.open();
+
         persistGroupDispatchSample(group.id, vsHorarioMs, tooEarlyCount).catch(e =>
           console.warn("[profiles] Erro ao persistir amostra:", e.message)
         );
@@ -1136,6 +1184,16 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
       if (result.outcome === "too_early") {
         tooEarlyCount++;
+
+        // v22: abre gate quando acumula muitos too_early — grupo está
+        // prestes a abrir, followers devem começar a tentar já
+        if (!gate.opened && tooEarlyCount >= GATE_OPEN_TOO_EARLY_THRESHOLD) {
+          console.log(
+            `[sniper] 🔓 Gate aberta antecipadamente após ${tooEarlyCount} too_early ` +
+            `— followers entram em loop agora`
+          );
+          gate.open();
+        }
 
         if (isZone3) {
           if (tooEarlyCount % 50 === 0) {
@@ -1158,6 +1216,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
           account_id: firstAccount.id, message_text: firstMember.message_text,
           status: "failed", retryable: false, error: result.errorCode,
         });
+        gate.open(); // libera followers para tentar
         await updateScheduleAfterDispatch(schedule, results, now, "closed");
         return;
       }
@@ -1181,6 +1240,9 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
         await new Promise(r => setTimeout(r, isZone3 ? SNIPER_LATE_ZONE_INTERVAL_MS : SNIPER_TRANSIENT_INTERVAL_MS));
       }
     }
+
+    // Garante que gate abre mesmo se conta 1 falhou (followers tentam mesmo assim)
+    gate.open();
 
     // Log da primeira conta
     supabase.from("dispatch_logs").insert({
@@ -1206,20 +1268,13 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       return;
     }
 
-    // ── Fase 2: todas as demais contas em PARALELO com loop de retry ──────
-    // v21: cada conta roda sniperPhase2Loop — loop completo com too_early,
-    // transient, flood handling. Todas lançadas simultaneamente. Clientes
-    // e peers já aquecidos pelo pre-warm acima.
-    const phase2Results = await Promise.allSettled(
-      members.slice(1).map((member, idx) =>
-        sniperPhase2Loop(member, chatId, scheduleId, p90Deadline, idx + 2, members.length)
-      )
-    );
+    // ── Aguarda followers ─────────────────────────────────────────────────
+    const followerSettled = await Promise.allSettled(followerPromises);
 
     for (let idx = 0; idx < members.slice(1).length; idx++) {
       const member  = members[idx + 1];
       const account = member.accounts!;
-      const settled = phase2Results[idx];
+      const settled = followerSettled[idx];
 
       let sentAt: Date | null = null;
       let error: string | undefined;
@@ -1264,7 +1319,7 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
     await updateScheduleAfterDispatch(schedule, results, firstSentAt, "closed");
 
   } finally {
-    // Limpa token buckets de todos os membros deste schedule
+    // Limpa token buckets
     const cachedSchedule = schedulePrefetchCache.get(scheduleId);
     const membersForCleanup = cachedSchedule?.groups?.group_members ?? [];
     for (const m of membersForCleanup) {
@@ -1465,7 +1520,7 @@ function startGroupListener(schedule: Schedule, group: Group, account: Account):
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   DESPACHO PARA O GRUPO
+   DESPACHO PARA O GRUPO (grupos abertos)
    ───────────────────────────────────────────────────────────────────────────── */
 async function dispatchToGroup(
   schedule: Schedule,
@@ -2342,7 +2397,7 @@ process.on("SIGINT",  shutdown);
    INICIALIZAÇÃO
    ───────────────────────────────────────────────────────────────────────────── */
 async function init(): Promise<void> {
-  console.log("[worker] Iniciando v21 — Fase 2 com loop de retry, pre-warm aguardado...");
+  console.log("[worker] Iniciando v22 — SharedGate: todas as contas em loop paralelo simultâneo...");
   await prewarmAccounts();
   await reloadSchedules();
 
@@ -2364,7 +2419,7 @@ async function init(): Promise<void> {
     }
   }, CLOCK_OFFSET_REFRESH_MS);
 
-  console.log("[worker] Pronto. Fase 2 com retry loop ativo — todas as contas disparam em paralelo com resiliência.");
+  console.log("[worker] Pronto. SharedGate ativa — followers disparam sem esperar conta 1 confirmar.");
 }
 
 init().catch(err => {
