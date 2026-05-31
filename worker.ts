@@ -1,6 +1,3 @@
-Aqui está o arquivo completo com apenas o `monitorPositions` alterado:
-
-```typescript
 // worker-flat.ts — dispatch worker Telegram, sem camadas de abstração
 //
 // Fix v1: firingNow Set previne duplo disparo quando reloadSchedules
@@ -142,6 +139,16 @@ Aqui está o arquivo completo com apenas o `monitorPositions` alterado:
 //     no Telegram) e conta quantas mensagens têm id < id_da_sua_mensagem + 1.
 //     Janela ajustada para scheduledAt - 5s (era -15s) para não poluir com
 //     mensagens velhas demais.
+//
+// Fix v12.1 — monitorPositions: diagnóstico de janela vazia + retry para fechado:
+//   BUG #J — monitor abortava na 1ª tentativa sem mensagens na janela:
+//     Em grupos fechados, se GetHistory retornava histórico mas nenhuma mensagem
+//     passava pelo filtro date >= windowStartUnix, o monitor abortava imediatamente.
+//     Causas possíveis: drift de clock entre servidor e Telegram, ou o date da
+//     mensagem no Telegram sendo ligeiramente anterior ao dispatchedAt registrado.
+//     SOLUÇÃO: tenta até 3 vezes com MONITOR_POLL_MS entre elas antes de abortar.
+//     Log diagnóstico na 3ª tentativa mostra unix do mais recente vs windowStartUnix
+//     para calibração futura.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -955,7 +962,7 @@ async function getAlreadySentIds(schedule: Schedule): Promise<Set<string>> {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   MONITORAMENTO DE POSIÇÃO (v12: posição real via message_id do Telegram)
+   MONITORAMENTO DE POSIÇÃO (v12.1: posição real via message_id + retry para janela vazia)
    ───────────────────────────────────────────────────────────────────────────── */
 async function monitorPositions(
   telegramChatId: string,
@@ -975,15 +982,21 @@ async function monitorPositions(
   // Janela: dispatchedAt - 5s para capturar quem chegou um pouco antes sem poluir
   const windowStartUnix = Math.floor((dispatchedAt.getTime() - 5_000) / 1000);
   const deadline        = Date.now() + (groupType === "closed"
-    ? MONITOR_DELAY_CLOSED_MS + 10_000
+    ? MONITOR_DELAY_CLOSED_MS + 30_000  // 30s de budget extra para grupo fechado (era 10s)
     : MONITOR_MAX_OPEN_MS);
   const ourTexts = new Set(sentMembers.map(m => m.message_text).filter(Boolean));
 
   if (groupType === "closed") await new Promise(r => setTimeout(r, MONITOR_DELAY_CLOSED_MS));
 
-  console.log(`[monitor] Iniciando para schedule ${scheduleId} (${groupType})`);
+  console.log(
+    `[monitor] Iniciando para schedule ${scheduleId} (${groupType}) — ` +
+    `windowStart unix=${windowStartUnix} (${new Date(windowStartUnix * 1000).toISOString()})`
+  );
+
+  let attempt = 0;
 
   while (Date.now() < deadline) {
+    attempt++;
     try {
       const peer   = await resolvePeer(client, telegramChatId, account.id);
       const result = await client.invoke(
@@ -995,16 +1008,35 @@ async function monitorPositions(
         })
       ) as any;
 
+      // Todas as mensagens retornadas (sem filtro ainda)
+      const allMsgs: Array<{ id: number; message: string; date: number }> =
+        (result.messages ?? []).filter(
+          (m: any) => m._ === "message" || m.className === "Message"
+        );
+
+      console.log(
+        `[monitor] attempt ${attempt}: ${allMsgs.length} msgs no histórico, ` +
+        `mais recente unix=${allMsgs[0]?.date ?? "n/a"}`
+      );
+
       // Filtra mensagens na janela e ordena por message_id crescente
       // (id menor = chegou primeiro no Telegram — ordem real de chegada)
-      const windowMsgs: Array<{ id: number; message: string; date: number }> =
-        (result.messages ?? [])
-          .filter((m: any) => m._ === "message" && m.date >= windowStartUnix)
-          .sort((a: any, b: any) => a.id - b.id);
+      const windowMsgs = allMsgs
+        .filter((m) => m.date >= windowStartUnix)
+        .sort((a, b) => a.id - b.id);
+
+      console.log(`[monitor] ${windowMsgs.length} mensagens na janela`);
 
       if (windowMsgs.length === 0) {
-        if (groupType === "closed") {
-          console.warn("[monitor] Sem mensagens na janela (grupo fechado) — abortando");
+        if (groupType === "closed" && attempt >= 3) {
+          // Log diagnóstico: mostra o date mais recente vs nossa janela
+          const mostRecentDate = allMsgs[0]?.date ?? 0;
+          console.warn(
+            `[monitor] Sem mensagens na janela após ${attempt} tentativas (grupo fechado) — abortando. ` +
+            `Mais recente no histórico: unix=${mostRecentDate} ` +
+            `(${mostRecentDate ? new Date(mostRecentDate * 1000).toISOString() : "n/a"}), ` +
+            `windowStart: unix=${windowStartUnix} (${new Date(windowStartUnix * 1000).toISOString()})`
+          );
           return;
         }
         await new Promise(r => setTimeout(r, MONITOR_POLL_MS));
@@ -1016,15 +1048,31 @@ async function monitorPositions(
         continue;
       }
 
+      // Para grupo fechado: se nossas mensagens ainda não aparecem na janela, retry
+      if (groupType === "closed" && !windowMsgs.some(m => ourTexts.has(m.message))) {
+        if (attempt >= 3) {
+          console.warn(
+            `[monitor] Nossas mensagens não encontradas na janela após ${attempt} tentativas — abortando. ` +
+            `Textos esperados: ${[...ourTexts].map(t => `"${t.slice(0, 30)}"`).join(", ")}`
+          );
+          return;
+        }
+        await new Promise(r => setTimeout(r, MONITOR_POLL_MS));
+        continue;
+      }
+
       const cutoff = new Date(dispatchedAt.getTime() - 60_000).toISOString();
       await Promise.allSettled(sentMembers.map(sm => {
         if (!sm.message_text) return;
 
         // Acha o message_id da nossa mensagem pelo texto
         const ourMsg = windowMsgs.find(m => m.message === sm.message_text);
-        if (!ourMsg) return;
+        if (!ourMsg) {
+          console.warn(`[monitor] Mensagem de ${sm.account_id} não encontrada na janela`);
+          return;
+        }
 
-        // Posição real = quantas mensagens (de qualquer pessoa) têm id < id_da_nossa + 1
+        // Posição real = quantas mensagens (de qualquer pessoa) têm id < id_da_nossa
         // Inclui mensagens de terceiros que chegaram antes
         const realPosition = windowMsgs.filter(m => m.id < ourMsg.id).length + 1;
 
@@ -2223,4 +2271,3 @@ init().catch(err => {
   console.error("[worker] Falha na inicialização:", err);
   process.exit(1);
 });
-```
