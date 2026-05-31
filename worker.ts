@@ -104,6 +104,14 @@
 //     scheduledAt. Se não passou, dorme o tempo restante. O invoke nunca
 //     acontece antes do horário agendado.
 //     Métrica de sucesso: [sniper][timing] vs horário sempre >= 0ms.
+//
+// Fix v10 (2025-05) — H3: fase 2 paralela:
+//   BUG #H3 — fase 2 serial: contas 2..N chegavam escalonadas (~50ms cada):
+//     A fase 2 do sniperFireClosed() agora dispara todas as contas em
+//     Promise.allSettled() simultâneo. Cada conta corre de forma independente:
+//     getClient + sniperSendOnce + insert no dispatch_log.
+//     Resultado: conta 2, 3, …N chegam ao Telegram quase no mesmo instante
+//     que a conta 1, em vez de escalonadas em intervalos de ~50ms.
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -142,7 +150,6 @@ const SNIPER_SEND_TIMEOUT_MS        = 800;
 const SNIPER_ATTEMPT_INTERVAL_MS    = 1;
 const SNIPER_PAUSE_EVERY_N          = 10;
 const SNIPER_PAUSE_MS               = 5;
-const SNIPER_INTER_ACCOUNT_DELAY_MS = 1;
 const SNIPER_BUDGET_MS              = RETRY_BUDGET_MS;
 const SNIPER_DONE_BLOCK_TTL_MS      = 500;
 
@@ -808,56 +815,68 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       return;
     }
 
-    // ── FASE 2: demais contas em sequência com delay de 1ms ──────────────
-    for (let i = 1; i < members.length; i++) {
-      await new Promise(r => setTimeout(r, SNIPER_INTER_ACCOUNT_DELAY_MS));
+    // ── FASE 2: demais contas em paralelo (H3 FIX) ───────────────────────
+    // Todas as contas 2..N disparam simultaneamente via Promise.allSettled.
+    // Cada tarefa é independente: getClient + sniperSendOnce + insert no log.
+    // FIX #2 mantido: falha aqui é sempre não-retryable (fase 1 já enviou).
+    if (members.length > 1) {
+      const phase2Results = await Promise.allSettled(
+        members.slice(1).map(async (member, idx) => {
+          const i       = idx + 1; // posição real na lista de members
+          const account = member.accounts!;
+          const text    = member.message_text ?? "";
+          let   sentAt: Date | null = null;
+          let   error: string | undefined;
 
-      const member  = members[i];
-      const account = member.accounts!;
-      const text    = member.message_text ?? "";
-      let   sentAt: Date | null = null;
-      let   error: string | undefined;
+          try {
+            const client       = await getClient(account);
+            const memberRandomId = makeRandomId();
+            await sniperSendOnce(client, account, chatId, text, memberRandomId);
+            sentAt = new Date();
+            console.log(`[sniper] ✓ Conta ${i + 1}/${members.length} ${account.phone_number} enviou`);
+            results.push({
+              account_id:   account.id,
+              message_text: member.message_text,
+              status:       "sent",
+              retryable:    false,
+            });
+          } catch (err: any) {
+            error = String(err?.message ?? "");
+            console.error(`[sniper] ✗ Conta ${i + 1}/${members.length} ${account.phone_number}: ${error}`);
+            // FIX #2: fase 1 já enviou — falha na fase 2 não gera retry do ciclo inteiro.
+            results.push({
+              account_id:   account.id,
+              message_text: member.message_text,
+              status:       "failed",
+              retryable:    false,
+              error,
+            });
+          }
 
-      try {
-        const client = await getClient(account);
-        const memberRandomId = makeRandomId();
-        await sniperSendOnce(client, account, chatId, text, memberRandomId);
-        sentAt = new Date();
-        console.log(`[sniper] ✓ Conta ${i + 1}/${members.length} ${account.phone_number} enviou`);
-        results.push({
-          account_id:   account.id,
-          message_text: member.message_text,
-          status:       "sent",
-          retryable:    false,
-        });
-      } catch (err: any) {
-        error = String(err?.message ?? "");
-        console.error(`[sniper] ✗ Conta ${i + 1}/${members.length} ${account.phone_number}: ${error}`);
-        // FIX #2: fase 1 já enviou — falha na fase 2 não gera retry do ciclo inteiro.
-        // Marca como não-retryable para que updateScheduleAfterDispatch avance o schedule.
-        results.push({
-          account_id:   account.id,
-          message_text: member.message_text,
-          status:       "failed",
-          retryable:    false,
-          error,
-        });
-      }
+          // Insert de log em background — não bloqueia o paralelo
+          supabase.from("dispatch_logs").insert({
+            user_id:             schedule.user_id,
+            group_id:            group.id,
+            account_id:          account.id,
+            schedule_id:         schedule.id,
+            status:              sentAt ? "sent" : "failed",
+            message_text:        member.message_text,
+            position_rank:       i + 1,
+            group_name_snapshot: group.name,
+            chat_name_snapshot:  group.telegram_chat_name,
+            sent_at:             sentAt ? sentAt.toISOString() : null,
+            error_message:       error ?? null,
+          }).then(({ error: e }) => {
+            if (e) console.error(`[sniper][log] Falha ao inserir log para ${account.id}:`, e.message);
+          });
+        })
+      );
 
-      supabase.from("dispatch_logs").insert({
-        user_id:             schedule.user_id,
-        group_id:            group.id,
-        account_id:          account.id,
-        schedule_id:         schedule.id,
-        status:              sentAt ? "sent" : "failed",
-        message_text:        member.message_text,
-        position_rank:       i + 1,
-        group_name_snapshot: group.name,
-        chat_name_snapshot:  group.telegram_chat_name,
-        sent_at:             sentAt ? sentAt.toISOString() : null,
-        error_message:       error ?? null,
-      }).then(({ error: e }) => {
-        if (e) console.error(`[sniper][log] Falha ao inserir log para ${account.id}:`, e.message);
+      // Log de rejeições inesperadas (não devem acontecer — erros são capturados internamente)
+      phase2Results.forEach((r, idx) => {
+        if (r.status === "rejected") {
+          console.error(`[sniper][fase2] Promise inesperadamente rejeitada para membro ${idx + 2}:`, r.reason);
+        }
       });
     }
 
