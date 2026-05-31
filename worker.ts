@@ -112,6 +112,23 @@
 //     getClient + sniperSendOnce + insert no dispatch_log.
 //     Resultado: conta 2, 3, …N chegam ao Telegram quase no mesmo instante
 //     que a conta 1, em vez de escalonadas em intervalos de ~50ms.
+//
+// Fix v11 (2025-05) — loop unificado: todas as contas em paralelo desde o início:
+//   BUG #H4 — conta 2 ainda aguardava ACK da conta 1 antes de disparar:
+//     Medição real: conta 1 chegou em +57ms, conta 2 em +102ms (delta=45ms).
+//     O delta era exatamente o RTT da conta 1 — conta 2 só disparava após
+//     firstSentAt ser definido (fim da fase 1).
+//
+//   SOLUÇÃO — sniperFireClosed() reescrito com loop único unificado:
+//     - Todas as N contas disparam sniperSendOnce em paralelo a cada iteração
+//     - Cada conta tem estado próprio: pending | sent | fatal
+//     - Conta que confirma sent ou erro fatal sai do loop imediatamente
+//     - Contas ainda pending continuam tentando na próxima iteração (1ms)
+//     - Loop encerra quando todas pararam (sent/fatal) ou budget esgotou
+//     - Guard de scheduledAt mantido: nenhuma conta invoca antes do horário
+//     - FloodWait por conta: a conta afetada pausa individualmente
+//     - updateScheduleAfterDispatch roda uma única vez no final
+//     - Resultado esperado: todas as contas chegam ao DC Telegram no mesmo ms
 
 import { createClient } from "@supabase/supabase-js";
 import { TelegramClient, Api } from "telegram";
@@ -247,7 +264,6 @@ const SCHEDULE_SELECT = `
    HELPERS PUROS
    ───────────────────────────────────────────────────────────────────────────── */
 
-// FIX #1: AUTH_KEY_DUPLICATED adicionado à lista de erros permanentes (não retryable).
 function isRetryableError(msg: string): boolean {
   const u = msg.toUpperCase();
   return !u.includes("AUTH_KEY_UNREGISTERED") &&
@@ -609,7 +625,7 @@ async function sniperSendOnce(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   SNIPER LOOP — GRUPOS FECHADOS
+   SNIPER LOOP — GRUPOS FECHADOS (v11: loop unificado, todas as contas em paralelo)
    ───────────────────────────────────────────────────────────────────────────── */
 async function sniperFireClosed(scheduleId: string): Promise<void> {
   if (sniperFiringNow.has(scheduleId)) {
@@ -671,113 +687,158 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
 
     const chatId    = group.telegram_chat_id;
     const budgetEnd = Date.now() + SNIPER_BUDGET_MS;
-    const results:  DispatchResult[] = [];
 
-    console.log(`[sniper] 🎯 Iniciando loop agressivo para schedule ${scheduleId} — ${members.length} conta(s)`);
+    console.log(`[sniper] 🎯 Loop unificado para schedule ${scheduleId} — ${members.length} conta(s) em paralelo`);
 
-    // ── FASE 1: loop agressivo na primeira conta ──────────────────────────
-    const firstMember  = members[0];
-    const firstAccount = firstMember.accounts!;
-    const firstText    = firstMember.message_text ?? "";
+    // ── Estado por conta ─────────────────────────────────────────────────
+    type AccountState = "pending" | "sent" | "fatal";
 
-    let firstClient: TelegramClient;
-    try {
-      firstClient = await getClient(firstAccount);
-    } catch (err: any) {
-      console.error(`[sniper] Falha ao conectar ${firstAccount.phone_number}: ${err.message}`);
-      results.push({
-        account_id:   firstAccount.id,
-        message_text: firstMember.message_text,
-        status:       "failed",
-        retryable:    isRetryableError(err.message),
-        error:        err.message,
-      });
-      await updateScheduleAfterDispatch(schedule, results, now, "closed");
-      return;
+    interface SlotState {
+      member:       typeof members[number];
+      account:      Account;
+      state:        AccountState;
+      randomId:     bigInt.BigInteger;
+      client:       TelegramClient | null;
+      sentAt:       Date | null;
+      error:        string | undefined;
+      attempts:     number;
+      floodUntil:   number;           // timestamp até onde esta conta está em FloodWait
     }
 
-    let attempt        = 0;
-    let firstSentAt: Date | null = null;
-    const firstRandomId = makeRandomId();
+    // Pré-conecta todos os clientes antes do loop agressivo
+    const slots: SlotState[] = await Promise.all(
+      members.map(async (member) => {
+        const account = member.accounts!;
+        let client: TelegramClient | null = null;
+        let state: AccountState = "pending";
+        let error: string | undefined;
+
+        try {
+          client = await getClient(account);
+        } catch (err: any) {
+          error = String(err?.message ?? "");
+          state = "fatal";
+          console.error(`[sniper] Falha ao conectar ${account.phone_number}: ${error}`);
+        }
+
+        return {
+          member,
+          account,
+          state,
+          randomId:   makeRandomId(),   // randomId estável por conta, reutilizado nos retries
+          client,
+          sentAt:     null,
+          error,
+          attempts:   0,
+          floodUntil: 0,
+        } satisfies SlotState;
+      })
+    );
+
+    // ── Loop unificado ────────────────────────────────────────────────────
+    let globalAttempt = 0;
 
     while (Date.now() < budgetEnd) {
-      attempt++;
+      const pendingSlots = slots.filter(s => s.state === "pending");
+      if (pendingSlots.length === 0) break;
 
-      // FIX #3: guard de scheduledAt — nunca invocar antes do horário agendado.
+      globalAttempt++;
+
+      // Guard de scheduledAt: nenhuma conta invoca antes do horário agendado.
+      // Só precisa verificar uma vez por iteração — todas as contas compartilham o mesmo alvo.
       const msUntilScheduled = scheduledAt - Date.now();
       if (msUntilScheduled > 0) {
-        console.log(`[sniper] ⏳ Aguardando scheduledAt (faltam ${msUntilScheduled}ms) — tentativa ${attempt}`);
+        if (globalAttempt === 1) {
+          console.log(`[sniper] ⏳ Aguardando scheduledAt (faltam ${msUntilScheduled}ms)`);
+        }
         await new Promise(r => setTimeout(r, msUntilScheduled));
         if (Date.now() >= budgetEnd) break;
       }
 
-      try {
-        await sniperSendOnce(firstClient, firstAccount, chatId, firstText, firstRandomId);
-        firstSentAt = new Date();
+      const now2 = Date.now();
 
-        const invokeRttMs = firstSentAt.getTime() - sniperEnteredAt;
-        const vsHorarioMs = firstSentAt.getTime() - scheduledAt;
-        console.log(`[sniper][timing] invoke RTT: ${invokeRttMs}ms (tempo real do MTProto+network)`);
-        console.log(`[sniper][timing] vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms (negativo=antes, positivo=atrasado) tentativa=${attempt}`);
+      // Dispara todas as contas pending em paralelo (exceto as em FloodWait)
+      await Promise.allSettled(
+        pendingSlots.map(async (slot) => {
+          // Pula contas ainda em cooldown de FloodWait
+          if (slot.floodUntil > now2) return;
 
-        console.log(`[sniper] ✓ Primeira conta ${firstAccount.phone_number} enviou na tentativa ${attempt} (${firstSentAt.toISOString()})`);
-        results.push({
-          account_id:   firstAccount.id,
-          message_text: firstMember.message_text,
-          status:       "sent",
-          retryable:    false,
-        });
-        break;
-      } catch (err: any) {
-        const errMsg = String(err?.message ?? "");
-        const isFatal =
-          errMsg.includes("AUTH_KEY_UNREGISTERED") ||
-          errMsg.includes("AUTH_KEY_DUPLICATED")   ||
-          errMsg.includes("USER_DEACTIVATED")      ||
-          errMsg.includes("SESSION_REVOKED");
+          slot.attempts++;
 
-        if (isFatal) {
-          console.error(`[sniper] Erro fatal na conta ${firstAccount.phone_number}: ${errMsg}`);
-          results.push({
-            account_id:   firstAccount.id,
-            message_text: firstMember.message_text,
-            status:       "failed",
-            retryable:    false,
-            error:        errMsg,
-          });
-          await updateScheduleAfterDispatch(schedule, results, now, "closed");
-          return;
-        }
+          try {
+            await sniperSendOnce(slot.client!, slot.account, chatId, slot.member.message_text ?? "", slot.randomId);
 
-        const isFlood =
-          err?.seconds != null ||
-          err?.constructor?.name === "FloodWaitError" ||
-          /flood/i.test(errMsg);
+            slot.sentAt = new Date();
+            slot.state  = "sent";
 
-        if (isFlood) {
-          const waitSecs = typeof err.seconds === "number"
-            ? err.seconds
-            : parseInt(errMsg.match(/(\d+)/)?.[1] ?? "5", 10);
-          const waitMs = waitSecs * 1000;
-          console.warn(`[sniper] FloodWait ${waitSecs}s — pausando loop (budget restante: ${Math.round((budgetEnd - Date.now()) / 1000)}s)`);
-          if (waitMs < budgetEnd - Date.now() - 500) {
-            await new Promise(r => setTimeout(r, waitMs));
-            continue;
-          } else {
-            console.warn(`[sniper] FloodWait ${waitSecs}s excede budget — encerrando loop`);
-            break;
+            const invokeRttMs = slot.sentAt.getTime() - sniperEnteredAt;
+            const vsHorarioMs = slot.sentAt.getTime() - scheduledAt;
+            console.log(
+              `[sniper][timing] ${slot.account.phone_number} — ` +
+              `invoke RTT: ${invokeRttMs}ms | ` +
+              `vs horário: ${vsHorarioMs > 0 ? "+" : ""}${vsHorarioMs}ms | ` +
+              `tentativa: ${slot.attempts}`
+            );
+            console.log(`[sniper] ✓ ${slot.account.phone_number} enviou`);
+
+          } catch (err: any) {
+            const errMsg = String(err?.message ?? "");
+
+            // Erro fatal — para de tentar esta conta
+            const isFatal =
+              errMsg.includes("AUTH_KEY_UNREGISTERED") ||
+              errMsg.includes("AUTH_KEY_DUPLICATED")   ||
+              errMsg.includes("USER_DEACTIVATED")      ||
+              errMsg.includes("SESSION_REVOKED");
+
+            if (isFatal) {
+              slot.state = "fatal";
+              slot.error = errMsg;
+              console.error(`[sniper] ✗ Fatal ${slot.account.phone_number}: ${errMsg}`);
+              return;
+            }
+
+            // FloodWait — agenda cooldown individual para esta conta
+            const isFlood =
+              err?.seconds != null ||
+              err?.constructor?.name === "FloodWaitError" ||
+              /flood/i.test(errMsg);
+
+            if (isFlood) {
+              const waitSecs = typeof err.seconds === "number"
+                ? err.seconds
+                : parseInt(errMsg.match(/(\d+)/)?.[1] ?? "5", 10);
+              const waitMs = waitSecs * 1000;
+
+              if (now2 + waitMs < budgetEnd - 500) {
+                slot.floodUntil = now2 + waitMs;
+                console.warn(`[sniper] FloodWait ${waitSecs}s — ${slot.account.phone_number} pausará individualmente`);
+              } else {
+                slot.state = "fatal";
+                slot.error = `FLOOD_WAIT_${waitSecs}_EXCEEDS_BUDGET`;
+                console.warn(`[sniper] FloodWait ${waitSecs}s excede budget — ${slot.account.phone_number} marcada fatal`);
+              }
+              return;
+            }
+
+            // Peer inválido — limpa cache
+            if (
+              errMsg.includes("PEER_ID_INVALID") ||
+              errMsg.includes("CHANNEL_INVALID") ||
+              errMsg.includes("CHANNEL_PRIVATE")
+            ) {
+              peerCache.delete(`${slot.account.id}:${chatId}`);
+            }
+
+            // Erro transitório — continua tentando na próxima iteração
+            // (sem log verboso para não poluir durante grupo fechado)
           }
-        }
+        })
+      );
 
-        if (
-          errMsg.includes("PEER_ID_INVALID") ||
-          errMsg.includes("CHANNEL_INVALID") ||
-          errMsg.includes("CHANNEL_PRIVATE")
-        ) {
-          peerCache.delete(`${firstAccount.id}:${chatId}`);
-        }
-
-        if (attempt % SNIPER_PAUSE_EVERY_N === 0) {
+      // Pausa mínima entre iterações (idêntico ao comportamento anterior)
+      if (slots.some(s => s.state === "pending")) {
+        if (globalAttempt % SNIPER_PAUSE_EVERY_N === 0) {
           await new Promise(r => setTimeout(r, SNIPER_PAUSE_MS));
         } else {
           await new Promise(r => setTimeout(r, SNIPER_ATTEMPT_INTERVAL_MS));
@@ -785,114 +846,83 @@ async function sniperFireClosed(scheduleId: string): Promise<void> {
       }
     }
 
-    // Log da primeira conta em background
-    supabase.from("dispatch_logs").insert({
-      user_id:             schedule.user_id,
-      group_id:            group.id,
-      account_id:          firstAccount.id,
-      schedule_id:         schedule.id,
-      status:              firstSentAt ? "sent" : "failed",
-      message_text:        firstMember.message_text,
-      position_rank:       1,
-      group_name_snapshot: group.name,
-      chat_name_snapshot:  group.telegram_chat_name,
-      sent_at:             firstSentAt ? firstSentAt.toISOString() : null,
-      error_message:       firstSentAt ? null : `BUDGET_EXCEEDED após ${attempt} tentativas`,
-    }).then(({ error: e }) => {
-      if (e) console.error(`[sniper][log] Falha ao inserir log para ${firstAccount.id}:`, e.message);
+    // ── Coleta resultados finais ──────────────────────────────────────────
+    const results: DispatchResult[] = slots.map(slot => {
+      if (slot.state === "sent") {
+        return {
+          account_id:   slot.account.id,
+          message_text: slot.member.message_text,
+          status:       "sent",
+          retryable:    false,
+        };
+      }
+
+      const timedOut = slot.state === "pending"; // ainda pending = budget esgotou
+      const errMsg   = timedOut
+        ? `SNIPER_BUDGET_EXCEEDED após ${slot.attempts} tentativas`
+        : (slot.error ?? "FATAL_ERROR");
+
+      if (timedOut) {
+        console.warn(`[sniper] Budget esgotado para ${slot.account.phone_number} após ${slot.attempts} tentativas`);
+      }
+
+      // Determina retryable:
+      // - Se pelo menos 1 conta enviou, as demais são não-retryable (evita re-disparo do ciclo)
+      // - Se nenhuma enviou, respeita isRetryableError
+      const anySent   = slots.some(s => s.state === "sent");
+      const retryable = anySent ? false : (!timedOut ? isRetryableError(errMsg) : true);
+
+      return {
+        account_id:   slot.account.id,
+        message_text: slot.member.message_text,
+        status:       "failed",
+        retryable,
+        error:        errMsg,
+      };
     });
 
-    if (!firstSentAt) {
-      console.warn(`[sniper] Budget esgotado para schedule ${scheduleId} após ${attempt} tentativas`);
-      results.push({
-        account_id:   firstAccount.id,
-        message_text: firstMember.message_text,
-        status:       "failed",
-        retryable:    true,
-        error:        `SNIPER_BUDGET_EXCEEDED após ${attempt} tentativas`,
-      });
-      await updateScheduleAfterDispatch(schedule, results, now, "closed");
-      return;
-    }
-
-    // ── FASE 2: demais contas em paralelo (H3 FIX) ───────────────────────
-    // Todas as contas 2..N disparam simultaneamente via Promise.allSettled.
-    // Cada tarefa é independente: getClient + sniperSendOnce + insert no log.
-    // FIX #2 mantido: falha aqui é sempre não-retryable (fase 1 já enviou).
-    if (members.length > 1) {
-      const phase2Results = await Promise.allSettled(
-        members.slice(1).map(async (member, idx) => {
-          const i       = idx + 1; // posição real na lista de members
-          const account = member.accounts!;
-          const text    = member.message_text ?? "";
-          let   sentAt: Date | null = null;
-          let   error: string | undefined;
-
-          try {
-            const client       = await getClient(account);
-            const memberRandomId = makeRandomId();
-            await sniperSendOnce(client, account, chatId, text, memberRandomId);
-            sentAt = new Date();
-            console.log(`[sniper] ✓ Conta ${i + 1}/${members.length} ${account.phone_number} enviou`);
-            results.push({
-              account_id:   account.id,
-              message_text: member.message_text,
-              status:       "sent",
-              retryable:    false,
-            });
-          } catch (err: any) {
-            error = String(err?.message ?? "");
-            console.error(`[sniper] ✗ Conta ${i + 1}/${members.length} ${account.phone_number}: ${error}`);
-            // FIX #2: fase 1 já enviou — falha na fase 2 não gera retry do ciclo inteiro.
-            results.push({
-              account_id:   account.id,
-              message_text: member.message_text,
-              status:       "failed",
-              retryable:    false,
-              error,
-            });
-          }
-
-          // Insert de log em background — não bloqueia o paralelo
-          supabase.from("dispatch_logs").insert({
-            user_id:             schedule.user_id,
-            group_id:            group.id,
-            account_id:          account.id,
-            schedule_id:         schedule.id,
-            status:              sentAt ? "sent" : "failed",
-            message_text:        member.message_text,
-            position_rank:       i + 1,
-            group_name_snapshot: group.name,
-            chat_name_snapshot:  group.telegram_chat_name,
-            sent_at:             sentAt ? sentAt.toISOString() : null,
-            error_message:       error ?? null,
-          }).then(({ error: e }) => {
-            if (e) console.error(`[sniper][log] Falha ao inserir log para ${account.id}:`, e.message);
-          });
-        })
-      );
-
-      // Log de rejeições inesperadas (não devem acontecer — erros são capturados internamente)
-      phase2Results.forEach((r, idx) => {
-        if (r.status === "rejected") {
-          console.error(`[sniper][fase2] Promise inesperadamente rejeitada para membro ${idx + 2}:`, r.reason);
-        }
+    // ── Log de dispatch para todas as contas ─────────────────────────────
+    // Dispara em background — não bloqueia o caminho crítico
+    for (const [i, slot] of slots.entries()) {
+      const result = results[i];
+      supabase.from("dispatch_logs").insert({
+        user_id:             schedule.user_id,
+        group_id:            group.id,
+        account_id:          slot.account.id,
+        schedule_id:         schedule.id,
+        status:              result.status,
+        message_text:        slot.member.message_text,
+        position_rank:       i + 1,
+        group_name_snapshot: group.name,
+        chat_name_snapshot:  group.telegram_chat_name,
+        sent_at:             slot.sentAt ? slot.sentAt.toISOString() : null,
+        error_message:       result.error ?? null,
+      }).then(({ error: e }) => {
+        if (e) console.error(`[sniper][log] Falha ao inserir log para ${slot.account.id}:`, e.message);
       });
     }
 
-    // ── FASE 3: monitoramento de posições ─────────────────────────────────
-    const sentForMonitor = results
-      .filter(r => r.status === "sent")
-      .map(r => ({ account_id: r.account_id, message_text: r.message_text ?? "" }))
-      .filter(r => r.message_text);
+    // ── Monitoramento de posições ─────────────────────────────────────────
+    const sentSlots = slots.filter(s => s.state === "sent");
+    const firstSentAt = sentSlots.length > 0
+      ? sentSlots.reduce((min, s) => s.sentAt! < min ? s.sentAt! : min, sentSlots[0].sentAt!)
+      : null;
 
-    if (sentForMonitor.length > 0) {
-      monitorPositions(chatId, sentForMonitor, scheduleId, firstSentAt, "closed")
-        .catch(err => console.error("[sniper][monitor] Erro:", err.message));
+    if (sentSlots.length > 0 && firstSentAt) {
+      const sentForMonitor = sentSlots.map(s => ({
+        account_id:   s.account.id,
+        message_text: s.member.message_text ?? "",
+      })).filter(s => s.message_text);
+
+      if (sentForMonitor.length > 0) {
+        monitorPositions(chatId, sentForMonitor, scheduleId, firstSentAt, "closed")
+          .catch(err => console.error("[sniper][monitor] Erro:", err.message));
+      }
     }
 
-    // ── FASE 4: atualiza schedule no banco ────────────────────────────────
-    await updateScheduleAfterDispatch(schedule, results, firstSentAt, "closed");
+    // ── Atualiza schedule no banco ────────────────────────────────────────
+    const dispatchNow = firstSentAt ?? now;
+    await updateScheduleAfterDispatch(schedule, results, dispatchNow, "closed");
 
   } finally {
     sniperFiringNow.delete(scheduleId);
